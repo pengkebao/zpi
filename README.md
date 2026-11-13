@@ -1,92 +1,79 @@
-# zpi
+# zpi — pi 的 Zig 实现
 
-pi-zig 即zig版pi
+纯 Zig（仅 std，零第三方依赖）实现的终端编程智能体，行为对齐 [pi](https://pi.dev) 1.5.0。
 
-## Getting started
+## 特性
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+**智能体内核**
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- OpenAI 兼容 SSE 流式协议（text / thinking / tool_calls 增量）
+- 工具：shell、read、edit（diff 预览）、glob 匹配、选区截断
+- 会话持久化、上下文压缩（compaction）、成本/缓存命中率统计
 
-## Add your files
+**TUI**
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+- 差分帧渲染：DECSTBM 原生滚动 + 垂直位移检测（逐行校验，失败自动回退全量重绘）
+- 屏幕层合成：滚动条、`Jump to latest message` 提示、搜索浮层
+- 流式 Markdown **块级增量渲染**（段间拼接与全量渲染逐字节一致，帧成本与流长度解耦）
+- 工具/思考块折叠展开（ctrl+O / ctrl+T）、补全菜单、`/` 命令
+- 滚动体验：follow-end 钉底、滚轮加速度计、滚动条拖拽映射、到底惰性（no-op 拉拽零字节）
+
+**快捷键**：Enter 提交 · ctrl+O 展开工具输出 · ctrl+T 隐藏 thinking · ctrl+end 回到最新 · ctrl+C 清空/退出 · `/help` 查看全部
+
+## 构建
+
+```bash
+zig build          # Zig 0.17.0
+./zig-out/bin/rpi  # 运行
+```
+
+## 测试与基准
+
+```bash
+zig test test_ui.zig              # 181 个 UI/逻辑测试
+zig test leak_g2.zig              # 153 个泄漏回归测试
+zig run bench_scroll.zig -O ReleaseFast   # 滚动帧基准
+zig run bench_stream.zig -O ReleaseFast   # 流式帧基准
+zig run bench_markdown.zig -O ReleaseFast # markdown 渲染基准
+```
+
+## 配置
+
+智能体目录：环境变量 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`。
+
+`models.json` — 自定义提供方/模型：
+
+```json
+{
+  "providers": {
+    "my-provider": {
+      "baseUrl": "https://api.example.com/v1",
+      "api": "openai-completions",
+      "apiKey": "sk-...",
+      "models": [{ "id": "my-model", "name": "My Model",
+                   "contextWindow": 128000, "maxTokens": 8192, "reasoning": true }]
+    }
+  }
+}
+```
+
+`settings.json` — 默认模型与行为开关：
+
+```json
+{ "defaultProvider": "my-provider", "defaultModel": "my-model" }
+```
+
+apiKey 支持 字面量 / `$ENV_VAR` / `!command` 三种写法；凭据回退顺序：models.json apiKey → auth.json → 内置环境变量。内置提供方（如 zai-coding-cn）凭据来自 auth.json / 环境变量。
+
+## 架构
 
 ```
-cd existing_repo
-git remote add origin http://git.yumakeji.cn/pengkebao/zpi.git
-git branch -M main
-git push -uf origin main
+src/
+├── main.zig            入口（REPL / 单条 -p 模式）
+├── core/               智能体循环、会话、配置、压缩、存储
+├── ai/openai.zig       OpenAI 兼容 SSE 客户端
+├── tools/              shell / read / edit / match / selection / truncate
+└── ui/                 TUI：差分渲染、markdown、滚动视图、编辑器、搜索、补全
 ```
 
-## Integrate with your tools
-
-- [ ] [Set up project integrations](http://git.yumakeji.cn/pengkebao/zpi/-/settings/integrations)
-
-## Collaborate with your team
-
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Automatically merge when pipeline succeeds](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing(SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thank you to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+设计决策与演进记录见 [PLAN.md](PLAN.md)。
