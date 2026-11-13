@@ -140,37 +140,40 @@ pub const OpenAiProvider = struct {
             return if (retryable) .retryable_status else .fatal_status;
         }
 
-        // Parse SSE stream
-        var rbuf: [4096]u8 = undefined;
+        // Parse SSE stream. Line-oriented on purpose: each line is yielded the
+        // moment it lands in the read buffer, so deltas flow at packet cadence.
+        // (readAllocShort(dest, 4096) filled its whole destination before
+        // returning — only EOF returns short — batching ~70-100 ms of deltas
+        // into one lump per read; streaming text arrived in visible jumps
+        // even though the socket delivered smoothly.)
+        // takeDelimiterInclusive consumes the newline; takeDelimiterExclusive
+        // leaves it at the head of the buffer, so the next call returns an
+        // empty slice forever (busy loop).
+        var rbuf: [16384]u8 = undefined;
         var reader = response.reader(&rbuf);
-        var buf = std.array_list.Managed(u8).init(self.alloc);
-        defer buf.deinit();
         var done = false;
         while (!done) {
             if (session.isAborted()) return .ok;
-            const chunk = reader.readAllocShort(self.alloc, 4096) catch break;
-            if (chunk.len == 0) break;
-            buf.appendSlice(chunk) catch return .transport_error;
-            self.alloc.free(chunk);
-
-            // Process all complete lines in buf
-            var pos: usize = 0;
-            while (std.mem.indexOfScalarPos(u8, buf.items, pos, '\n')) |nl_pos| {
-                const line = std.mem.trim(u8, buf.items[pos..nl_pos], " \r");
-                pos = nl_pos + 1;
-
-                if (line.len == 0) continue;
-                if (!std.mem.startsWith(u8, line, "data:")) continue;
-                const data = std.mem.trim(u8, line["data:".len..], " \r\n");
-                if (std.mem.eql(u8, data, "[DONE]")) { done = true; break; }
-                self.parseChunk(data, session) catch continue;
+            const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => break,
+                error.StreamTooLong => {
+                    // Pathological over-long line: drop the buffered bytes
+                    // and resync at the next newline; the garbage tail of the
+                    // line is skipped by parseChunk's catch.
+                    reader.toss(reader.end - reader.seek);
+                    continue;
+                },
+            };
+            const trimmed = std.mem.trim(u8, line, " \r\n");
+            if (trimmed.len == 0) continue;
+            if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
+            const data = std.mem.trim(u8, trimmed["data:".len..], " \r\n");
+            if (std.mem.eql(u8, data, "[DONE]")) {
+                done = true;
+                break;
             }
-            // Remove processed bytes from the front (was resize(pos), which
-            // kept the processed prefix and replayed it on every read).
-            if (pos > 0) {
-                std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - pos], buf.items[pos..]);
-                buf.resize(buf.items.len - pos) catch return .transport_error;
-            }
+            self.parseChunk(data, session) catch continue;
         }
         return .ok;
     }

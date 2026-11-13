@@ -1672,10 +1672,18 @@ pub const TUI = struct {
             const truncated = truncateToWidth(self.alloc, self.doc_lines.items[idx], self.width) catch return error.OutOfMemory;
             frame.append(self.alloc, truncated) catch return error.OutOfMemory;
         }
-        for (live) |l| {
-            if (frame.items.len >= transcript_h) break;
-            const dup = self.alloc.dupe(u8, l) catch continue;
-            frame.append(self.alloc, dup) catch self.alloc.free(dup);
+        // The window may start INSIDE the live block (committed rows shorter
+        // than scroll_top while streaming): skip to the window's offset, or
+        // the viewport would pin to the oldest live rows and the growing
+        // tail would stay invisible until the turn commits.
+        var live_skip: usize = 0;
+        if (start > self.doc_lines.items.len) live_skip = start - self.doc_lines.items.len;
+        if (live_skip < live.len) {
+            for (live[live_skip..]) |l| {
+                if (frame.items.len >= transcript_h) break;
+                const dup = self.alloc.dupe(u8, l) catch continue;
+                frame.append(self.alloc, dup) catch self.alloc.free(dup);
+            }
         }
         while (frame.items.len < transcript_h) {
             const blank = self.alloc.dupe(u8, "") catch return;
@@ -3369,18 +3377,31 @@ pub const TUI = struct {
     }
 
     /// Spinner thread main loop: sleep, then tick + redraw under the mutex.
+    ///
+    /// While working we paint on a fixed 22 ms clock (≈45 fps ceiling; pi
+    /// throttles every message_update to 16 ms — a fixed cadence is robust
+    /// to the bursty arrival pattern of SSE chunks, where a dirty-flag
+    /// scheme phases in and out of 80 ms sleeps). The paint work itself
+    /// (markdown tail re-render + diff) lands the effective rate near 30 fps. No-change frames write zero bytes (diff
+    /// early-return + cursor-park dedup), so idle stretches stay silent. The
+    /// spinner glyph still advances on its own 80 ms clock.
     fn spinnerLoop(t: *TUI) void {
         const io = std.Io.Threaded.global_single_threaded.io();
+        var last_glyph_advance: i64 = 0;
         while (true) {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(80), .real) catch break;
             t.render_mutex.lock(io) catch break;
             if (t.spinner_stop) {
                 t.render_mutex.unlock(io);
                 break;
             }
-            t.spinner_frame = (t.spinner_frame + 1) % spinner.SPINNER_FRAMES.len;
+            const now = ss.nowMs(io);
+            if (now - last_glyph_advance >= 80) {
+                t.spinner_frame = (t.spinner_frame + 1) % spinner.SPINNER_FRAMES.len;
+                last_glyph_advance = now;
+            }
             t.redrawLocked();
             t.render_mutex.unlock(io);
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(22), .real) catch break;
         }
     }
 
