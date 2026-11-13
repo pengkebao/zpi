@@ -1,0 +1,17 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+*.o
+
+# OS / editor droppings
+.DS_Store
+
+# Local tool state
+.mimosa/
+.zcode/
+
+# Scratch / leftovers
+width_test_tmp.zig
+main
+test_read
+test_repl
