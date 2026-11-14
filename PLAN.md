@@ -176,11 +176,12 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
 | stdio server 接入（tools/call 全链路） | ✅ | ✅ | initialize 握手→tools/list→注册为 `mcp__<server>__<tool>`→tools/call；E2E 验证 |
-| streamable HTTP + OAuth | ✅ | ❌ | 配置项已识别（标注 "not supported yet"），传输待实现 |
+| streamable HTTP + bearer 认证 | ✅ | ✅ | POST JSON-RPC（application/json + SSE 双格式解析）、`Mcp-Session-Id` 捕获回传、`Authorization: Bearer`（来自 login 或配置）；E2E 验证（含需鉴权服务器） |
 | mcp.json（用户/项目，项目覆盖 user 同名项） | ✅ | ✅ | `<base>/mcp.json` + `.pi/mcp.json`，同名项目覆盖 |
-| `/mcp` 管理、exposure 模式（直接/codemode/deferred） | ✅ | ⚠️ | `/mcp` 列出服务器状态/工具数/来源；exposure 模式待做 |
-| `pi mcp add/remove/list/login/logout` | ✅ | ⚠️ | `rpi mcp list` 可用；add/remove/login/logout 待做 |
-| MCP resources（list/read） | ✅ | ❌ | 待做 |
+| `/mcp` 管理、exposure 模式 | ✅ | ✅ | `/mcp` 列出状态/工具数/来源/错误；exposure：`hidden` 抑制工具注册，其余（codemode/deferred/direct）直接注册 |
+| `rpi mcp add/remove/list/login/logout` | ✅ | ✅ | add（stdio/http，--local/--env/--cwd/--description/--exposure/-- 参数）；remove；list；login/logout（`mcp-auth.json` 存 bearer token，纯 std 近似 pi 的浏览器 OAuth） |
+| MCP resources（list/read） | ✅ | ✅ | 三个全局工具 `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource`，跨服务器聚合 + cursor；E2E 验证 |
+| OAuth 浏览器流程 | ✅ | ❌ | 以 login 存 token 近似（无浏览器）；完整 OAuth 待做 |
 
 ### 11. 配置与安全
 
@@ -405,11 +406,12 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 
 ### Phase J — MCP 客户端（~2k 行）
 - [x] J1a JSON-RPC over stdio；tools/list、tools/call（全链路 E2E 验证）
-- [ ] J1b resources/list、resources/read
-- [ ] J2 streamable HTTP + bearer/OAuth（OAuth 可裁剪）
+- [x] J1b resources/list、resources/read（全局工具聚合 + cursor，E2E 验证）
+- [x] J2 streamable HTTP + bearer 认证（SSE/JSON 双解析、session-id、Bearer；E2E 含需鉴权服务器）
 - [x] J3 mcp.json 加载（用户/项目覆盖规则）+ `/mcp` 状态列出
-- [ ] J4 `pi mcp add/remove/login/logout` 子命令（list 已完成）
-- [ ] J5 exposure 模式 + 与 --tools 过滤的交互语义
+- [x] J4 `rpi mcp add/remove/list/login/logout` 子命令（login/logout 存 `mcp-auth.json`）
+- [x] J5 exposure 模式（hidden 抑制；其余直接注册）
+- [ ] J6 OAuth 浏览器流程（以 login 存 token 近似；完整 OAuth 待做）
 
 ### Phase K — JSON/RPC 模式与分发（~2k 行）
 - [ ] K1 `--mode json`：事件全集（agent_start/turn_*/message_*/tool_*/compaction/...）
@@ -461,7 +463,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | /compact [hint] | ✓ | ✓ | 已实现（runCompaction + auto-compact 阈值） |
 | /changelog | ✓ | — | 无版本日志体系，不适用 |
 | /export /copy /share | ✓ | /copy 未做 | 缺口（copy/export 低成本可加） |
-| /themes /settings /skills /trust /login /logout /scoped-models /mcp | ✓ | — | /settings ✅、/skills（`/skill:name`）✅；/themes /trust /login /logout /scoped-models /mcp 暂缓（依赖主题/trust/扩展体系） |
+| /themes /settings /skills /trust /login /logout /scoped-models /mcp | ✓ | — | /settings ✅、/skills（`/skill:name`）✅、/mcp ✅；/themes /trust /login /logout /scoped-models 暂缓（依赖主题/trust/扩展体系） |
 | /bug /debug /clone /import /reload /fork-easter-eggs | ✓ | — | 暂缓 |
 
 ### 全局键位（主界面）

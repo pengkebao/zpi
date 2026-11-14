@@ -119,6 +119,81 @@ test "loadConfig missing files is empty" {
     try std.testing.expectEqual(@as(usize, 0), cfgs.len);
 }
 
+test "parseEntry reads exposure + description" {
+    const alloc = std.testing.allocator;
+    var p = std.json.parseFromSlice(std.json.Value, alloc,
+        "{\"command\":\"node\",\"args\":[\"a.js\"],\"exposure\":\"hidden\",\"description\":\"d\"}", .{}) catch return error.Parse;
+    defer p.deinit();
+    const cfg = mcp.parseEntry(alloc, "s1", p.value, "user") catch return error.Parse;
+    defer mcp.freeConfig(alloc, cfg);
+    try std.testing.expectEqualStrings("hidden", cfg.exposure orelse "");
+    try std.testing.expectEqualStrings("d", cfg.description orelse "");
+    // exposure absent → null (implicit codemode: tools registered)
+    var p2 = std.json.parseFromSlice(std.json.Value, alloc, "{\"command\":\"node\"}", .{}) catch return error.Parse;
+    defer p2.deinit();
+    const cfg2 = mcp.parseEntry(alloc, "s2", p2.value, "user") catch return error.Parse;
+    defer mcp.freeConfig(alloc, cfg2);
+    try std.testing.expect(cfg2.exposure == null);
+}
+
+test "addServer/removeServer round-trip" {
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "/tmp/rpi-mcp-addtest/mcp.json";
+    _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/rpi-mcp-addtest") catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/rpi-mcp-addtest") catch {};
+    const initial = "{\"mcpServers\":{\"a\":{\"command\":\"node\",\"args\":[\"a.js\"]}}}";
+    try writeStr(io, path, initial);
+    // add server b
+    const replaced = mcp.addServer(alloc, io, path, "b", "{\"command\":\"python\",\"args\":[\"-m\",\"srv\"]}") catch return error.FileError;
+    try std.testing.expect(!replaced);
+    var entries = try mcp.readServerEntries(alloc, io, path);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    // remove a
+    const removed = try mcp.removeServer(alloc, io, path, "a");
+    try std.testing.expect(removed);
+    for (entries) |e| {
+        alloc.free(e.name);
+        alloc.free(e.entry_json);
+    }
+    alloc.free(entries);
+    entries = try mcp.readServerEntries(alloc, io, path);
+    defer {
+        for (entries) |e| {
+            alloc.free(e.name);
+            alloc.free(e.entry_json);
+        }
+        alloc.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("b", entries[0].name);
+}
+
+test "auth token store/read/remove" {
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "/tmp/rpi-mcp-authtest/mcp-auth.json";
+    _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/rpi-mcp-authtest") catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/rpi-mcp-authtest") catch {};
+    const replaced = mcp.storeAuthToken(alloc, io, path, "s1", "tok-1") catch return error.FileError;
+    try std.testing.expect(!replaced);
+    const t1 = mcp.readAuthToken(alloc, io, path, "s1") orelse return error.NotFound;
+    defer alloc.free(t1);
+    try std.testing.expectEqualStrings("tok-1", t1);
+    // store a second server
+    _ = mcp.storeAuthToken(alloc, io, path, "s2", "tok-2") catch return error.FileError;
+    const t2 = mcp.readAuthToken(alloc, io, path, "s2") orelse return error.NotFound;
+    defer alloc.free(t2);
+    try std.testing.expectEqualStrings("tok-2", t2);
+    // remove s1; s2 must survive
+    const removed = mcp.removeAuthToken(alloc, io, path, "s1") catch return error.FileError;
+    try std.testing.expect(removed);
+    try std.testing.expect(mcp.readAuthToken(alloc, io, path, "s1") == null);
+    const t2b = mcp.readAuthToken(alloc, io, path, "s2") orelse return error.NotFound;
+    defer alloc.free(t2b);
+    try std.testing.expectEqualStrings("tok-2", t2b);
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 fn findCfg(cfgs: []const mcp.ServerConfig, name: []const u8) ?mcp.ServerConfig {

@@ -25,6 +25,248 @@ fn getCwdAlloc(alloc: std.mem.Allocator) ![]u8 {
 
 /// Split a comma-separated list into trimmed, non-empty substrings.
 /// Substrings point into `s`; the returned outer slice is owned.
+/// Append `,"key":"val"` (or `"key":"val"` if first) to a JSON object being
+/// built in `entry`.
+fn putJsonStr(alloc: std.mem.Allocator, entry: *std.array_list.Managed(u8), first: *bool, key: []const u8, val: []const u8) !void {
+    if (!first.*) entry.append(',') catch return error.OutOfMemory;
+    const k = try jstr(alloc, key);
+    defer alloc.free(k);
+    const v = try jstr(alloc, val);
+    defer alloc.free(v);
+    entry.appendSlice(k) catch return error.OutOfMemory;
+    entry.append(':') catch return error.OutOfMemory;
+    entry.appendSlice(v) catch return error.OutOfMemory;
+    first.* = false;
+}
+
+/// `"escaped"` — a JSON string literal (owned).
+fn jstr(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+    out.append('"') catch return error.OutOfMemory;
+    for (s) |c| {
+        switch (c) {
+            '"' => out.appendSlice("\\\"") catch return error.OutOfMemory,
+            '\\' => out.appendSlice("\\\\") catch return error.OutOfMemory,
+            '\n' => out.appendSlice("\\n") catch return error.OutOfMemory,
+            '\r' => out.appendSlice("\\r") catch return error.OutOfMemory,
+            '\t' => out.appendSlice("\\t") catch return error.OutOfMemory,
+            else => out.append(c) catch return error.OutOfMemory,
+        }
+    }
+    out.append('"') catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// `rpi mcp add <name> [options] (-- <command> [args...] | --url <url>)`.
+fn mcpAdd(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, argv: []const []const u8) !void {
+    const base = try config.baseDir(alloc, environ);
+    defer alloc.free(base);
+    const cwd = getCwdAlloc(alloc) catch "";
+    defer if (cwd.len > 0) alloc.free(cwd);
+
+    var i: usize = 3; // after "mcp add"
+    var local = false;
+    var url: ?[]const u8 = null;
+    var cwd_opt: ?[]const u8 = null;
+    var desc: ?[]const u8 = null;
+    var exposure: ?[]const u8 = null;
+    var envs = std.array_list.Managed([]const u8).init(alloc);
+    defer envs.deinit();
+    var name: ?[]const u8 = null;
+    var cmd_args = std.array_list.Managed([]const u8).init(alloc);
+    defer cmd_args.deinit();
+    var seen_ddash = false;
+
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (seen_ddash) {
+            cmd_args.append(a) catch return error.OutOfMemory;
+            continue;
+        }
+        if (name == null and !isMcpAddOpt(a)) {
+            name = a;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--")) { seen_ddash = true; continue; }
+        if (std.mem.eql(u8, a, "-l") or std.mem.eql(u8, a, "--local")) { local = true; continue; }
+        if (i + 1 >= argv.len) return error.MissingValue;
+        if (std.mem.eql(u8, a, "--url")) { url = argv[i + 1]; i += 1; continue; }
+        if (std.mem.eql(u8, a, "--env")) { try envs.append(argv[i + 1]); i += 1; continue; }
+        if (std.mem.eql(u8, a, "--cwd")) { cwd_opt = argv[i + 1]; i += 1; continue; }
+        if (std.mem.eql(u8, a, "--description")) { desc = argv[i + 1]; i += 1; continue; }
+        if (std.mem.eql(u8, a, "--exposure")) { exposure = argv[i + 1]; i += 1; continue; }
+        return error.UnknownOption;
+    }
+
+    if (name == null) return error.MissingName;
+    const n = name.?;
+    if ((url != null) == (cmd_args.items.len > 0)) return error.NeedUrlOrCommand;
+
+    // Build the entry JSON object.
+    var entry = std.array_list.Managed(u8).init(alloc);
+    defer entry.deinit();
+    entry.append('{') catch return error.OutOfMemory;
+    var first = true;
+    if (url) |u| {
+        try putJsonStr(alloc, &entry, &first, "url", u);
+    } else {
+        try putJsonStr(alloc, &entry, &first, "command", cmd_args.items[0]);
+        if (cmd_args.items.len > 1) {
+            if (!first) entry.append(',') catch return error.OutOfMemory;
+            entry.appendSlice("\"args\":[") catch return error.OutOfMemory;
+            var af = true;
+            for (cmd_args.items[1..]) |arg| {
+                if (!af) entry.append(',') catch return error.OutOfMemory;
+                const s = try jstr(alloc, arg);
+                defer alloc.free(s);
+                entry.appendSlice(s) catch return error.OutOfMemory;
+                af = false;
+            }
+            entry.appendSlice("]") catch return error.OutOfMemory;
+            first = false;
+        }
+    }
+    if (envs.items.len > 0) {
+        if (!first) entry.append(',') catch return error.OutOfMemory;
+        entry.appendSlice("\"env\":{") catch return error.OutOfMemory;
+        var ef = true;
+        for (envs.items) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return error.BadEnv;
+            const k = pair[0..eq];
+            const v = pair[eq + 1 ..];
+            if (!ef) entry.append(',') catch return error.OutOfMemory;
+            const kj = try jstr(alloc, k);
+            defer alloc.free(kj);
+            const vj = try jstr(alloc, v);
+            defer alloc.free(vj);
+            entry.appendSlice(kj) catch return error.OutOfMemory;
+            entry.append(':') catch return error.OutOfMemory;
+            entry.appendSlice(vj) catch return error.OutOfMemory;
+            ef = false;
+        }
+        entry.appendSlice("}") catch return error.OutOfMemory;
+        first = false;
+    }
+    if (cwd_opt) |c| try putJsonStr(alloc, &entry, &first, "cwd", c);
+    if (desc) |d| try putJsonStr(alloc, &entry, &first, "description", d);
+    if (exposure) |e| try putJsonStr(alloc, &entry, &first, "exposure", e);
+    entry.append('}') catch return error.OutOfMemory;
+    const entry_json = entry.toOwnedSlice() catch return error.OutOfMemory;
+    defer alloc.free(entry_json);
+
+    const path = if (local)
+        try std.fmt.allocPrint(alloc, "{s}/.pi/mcp.json", .{cwd})
+    else
+        try std.fmt.allocPrint(alloc, "{s}/mcp.json", .{base});
+    defer alloc.free(path);
+    if (local) {
+        _ = std.Io.Dir.cwd().createDirPath(io, ".pi") catch {};
+    }
+    const replaced = try mcp.addServer(alloc, io, path, n, entry_json);
+    const scope = if (local) "project" else "global";
+    std.debug.print("{s} {s} MCP server \"{s}\" in {s}.\n", .{ if (replaced) "Replaced" else "Added", scope, n, path });
+    std.debug.print("Check it with: rpi mcp list\n", .{});
+}
+
+/// `rpi mcp login <server>` — store a bearer token (pure-std approximation of
+/// pi's browser OAuth flow: the user pastes the token).
+fn mcpLogin(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, argv: []const []const u8) !void {
+    const base = try config.baseDir(alloc, environ);
+    defer alloc.free(base);
+    const auth_path = try std.fmt.allocPrint(alloc, "{s}/mcp-auth.json", .{base});
+    defer alloc.free(auth_path);
+    var i: usize = 3;
+    var name: ?[]const u8 = null;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (std.mem.eql(u8, a, "-l") or std.mem.eql(u8, a, "--local")) continue;
+        if (name == null) { name = a; continue; }
+        return error.ExtraArgs;
+    }
+    if (name == null) return error.MissingName;
+    std.debug.print("Paste the bearer token for MCP server \"{s}\" (empty to cancel): ", .{name.?});
+    const stdin = std.Io.File.stdin();
+    var line = std.array_list.Managed(u8).init(alloc);
+    defer line.deinit();
+    var b: [1]u8 = undefined;
+    while (true) {
+        const n = stdin.readStreaming(io, &.{&b}) catch break;
+        if (n == 0) break;
+        if (b[0] == '\n') break;
+        line.append(b[0]) catch return error.OutOfMemory;
+    }
+    const token = std.mem.trim(u8, line.items, " \r\n\t");
+    if (token.len == 0) {
+        std.debug.print("\ncancelled\n", .{});
+        return;
+    }
+    const token_owned = alloc.dupe(u8, token) catch return error.OutOfMemory;
+    defer alloc.free(token_owned);
+    const replaced = try mcp.storeAuthToken(alloc, io, auth_path, name.?, token_owned);
+    std.debug.print("{s} token for MCP server \"{s}\".\n", .{ if (replaced) "Replaced" else "Stored", name.? });
+}
+
+/// `rpi mcp logout <server>` — remove a stored bearer token.
+fn mcpLogout(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, argv: []const []const u8) !void {
+    const base = try config.baseDir(alloc, environ);
+    defer alloc.free(base);
+    const auth_path = try std.fmt.allocPrint(alloc, "{s}/mcp-auth.json", .{base});
+    defer alloc.free(auth_path);
+    var i: usize = 3;
+    var name: ?[]const u8 = null;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (std.mem.eql(u8, a, "-l") or std.mem.eql(u8, a, "--local")) continue;
+        if (name == null) { name = a; continue; }
+        return error.ExtraArgs;
+    }
+    if (name == null) return error.MissingName;
+    const removed = try mcp.removeAuthToken(alloc, io, auth_path, name.?);
+    if (removed) {
+        std.debug.print("Removed token for MCP server \"{s}\".\n", .{name.?});
+    } else {
+        std.debug.print("No stored token for MCP server \"{s}\".\n", .{name.?});
+    }
+}
+
+/// `rpi mcp remove <name> [-l]`.
+fn mcpRemove(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, argv: []const []const u8) !void {
+    const base = try config.baseDir(alloc, environ);
+    defer alloc.free(base);
+    const cwd = getCwdAlloc(alloc) catch "";
+    defer if (cwd.len > 0) alloc.free(cwd);
+    var i: usize = 3;
+    var local = false;
+    var name: ?[]const u8 = null;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (std.mem.eql(u8, a, "-l") or std.mem.eql(u8, a, "--local")) { local = true; continue; }
+        if (name == null) { name = a; continue; }
+        return error.ExtraArgs;
+    }
+    if (name == null) return error.MissingName;
+    const path = if (local)
+        try std.fmt.allocPrint(alloc, "{s}/.pi/mcp.json", .{cwd})
+    else
+        try std.fmt.allocPrint(alloc, "{s}/mcp.json", .{base});
+    defer alloc.free(path);
+    const removed = try mcp.removeServer(alloc, io, path, name.?);
+    const scope = if (local) "project" else "global";
+    if (removed) {
+        std.debug.print("Removed {s} MCP server \"{s}\" from {s}.\n", .{ scope, name.?, path });
+    } else {
+        std.debug.print("No {s} MCP server named \"{s}\" in {s}.\n", .{ scope, name.?, path });
+    }
+}
+
+fn isMcpAddOpt(a: []const u8) bool {
+    return std.mem.eql(u8, a, "-l") or std.mem.eql(u8, a, "--local") or
+        std.mem.eql(u8, a, "--url") or std.mem.eql(u8, a, "--env") or
+        std.mem.eql(u8, a, "--cwd") or std.mem.eql(u8, a, "--description") or
+        std.mem.eql(u8, a, "--exposure") or std.mem.eql(u8, a, "--");
+}
+
 fn splitComma(alloc: std.mem.Allocator, s: []const u8) ![]const []const u8 {
     var list = std.array_list.Managed([]const u8).init(alloc);
     errdefer list.deinit();
@@ -67,6 +309,7 @@ pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
 
     installSignalHandlers();
+
 
     var argv = std.array_list.Managed([]const u8).init(alloc);
     defer {
@@ -224,7 +467,31 @@ pub fn main(init: std.process.Init) !void {
             }
             return;
         }
-        std.debug.print("usage: rpi mcp list\n", .{});
+        if (std.mem.eql(u8, sub, "add")) {
+            return mcpAdd(alloc, io, init.minimal.environ, argv.items) catch |e| {
+                std.debug.print("error: {s}\n", .{@errorName(e)});
+                return error.McpCli;
+            };
+        }
+        if (std.mem.eql(u8, sub, "remove")) {
+            return mcpRemove(alloc, io, init.minimal.environ, argv.items) catch |e| {
+                std.debug.print("error: {s}\n", .{@errorName(e)});
+                return error.McpCli;
+            };
+        }
+        if (std.mem.eql(u8, sub, "login")) {
+            return mcpLogin(alloc, io, init.minimal.environ, argv.items) catch |e| {
+                std.debug.print("error: {s}\n", .{@errorName(e)});
+                return error.McpCli;
+            };
+        }
+        if (std.mem.eql(u8, sub, "logout")) {
+            return mcpLogout(alloc, io, init.minimal.environ, argv.items) catch |e| {
+                std.debug.print("error: {s}\n", .{@errorName(e)});
+                return error.McpCli;
+            };
+        }
+        std.debug.print("usage: rpi mcp <list|add|remove|login|logout>\n", .{});
         return;
     }
 
@@ -377,9 +644,13 @@ pub fn main(init: std.process.Init) !void {
         defer mcp.freeConfigs(alloc, cfgs);
         const mgr = alloc.create(mcp.Manager) catch break :blk;
         mgr.* = mcp.Manager.init(alloc, io);
-        mgr.connectAll(cfgs);
+        const auth_path = std.fmt.allocPrint(alloc, "{s}/mcp-auth.json", .{cfg.base_dir}) catch break :blk;
+        defer alloc.free(auth_path);
+        mgr.auth_path = auth_path;
         mcp.Manager.setGlobal(mgr);
+        mgr.connectAll(cfgs);
         _ = mgr.registerTools(&registry);
+        _ = mcp.registerResourceTools(mgr, &registry);
         mcp_mgr = mgr;
     }
     defer if (mcp_mgr) |m| {
