@@ -3947,6 +3947,7 @@ pub const TUI = struct {
         for (mgr.servers.items) |srv| {
             // state (pi describeState)
             var desc = std.array_list.Managed(u8).init(self.alloc);
+            defer desc.deinit();
             if (!srv.enabled) {
                 desc.appendSlice("disabled") catch break;
             } else if (srv.connected) {

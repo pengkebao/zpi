@@ -136,7 +136,11 @@ pub const Server = struct {
             self.alloc.free(h.value);
         }
         self.alloc.free(self.headers);
+        if (self.command) |c| self.alloc.free(c);
+        if (self.url) |u| self.alloc.free(u);
+        if (self.description) |d| self.alloc.free(d);
         std.http.Client.deinit(&self.http_client);
+        self.alloc.free(self.source);
         self.alloc.free(self.name);
     }
 };
@@ -164,7 +168,6 @@ pub const Manager = struct {
             s.deinit();
             self.alloc.destroy(s);
         }
-        self.alloc.free(self.servers.items);
         self.servers.deinit();
     }
 
@@ -176,13 +179,20 @@ pub const Manager = struct {
             // Each Server is heap-allocated so the pointers stored in
             // self.servers stay valid for the whole session.
             const srv = self.alloc.create(Server) catch continue;
+            // tools is always a heap slice (even when empty) so deinit can free it.
+            const empty_tools = self.alloc.alloc(McpTool, 0) catch {
+                self.alloc.destroy(srv);
+                continue;
+            };
             srv.* = .{
                 .alloc = self.alloc,
                 .io = self.io,
                 .name = self.alloc.dupe(u8, cfg.name) catch {
+                    self.alloc.free(empty_tools);
                     self.alloc.destroy(srv);
                     continue;
                 },
+                .tools = empty_tools,
                 .kind = cfg.kind,
                 .command = if (cfg.command) |c| self.alloc.dupe(u8, c) catch null else null,
                 .url = if (cfg.url) |u| self.alloc.dupe(u8, u) catch null else null,
@@ -324,7 +334,12 @@ fn connectStdio(self: *Server, cfg: ServerConfig) !void {
         return e;
     };
     defer self.alloc.free(list_res);
-    self.tools = parseTools(self.alloc, self.name, list_res) catch &[_]McpTool{};
+    const new_tools = parseTools(self.alloc, self.name, list_res) catch {
+        teardownProcess(self);
+        return error.ToolsParse;
+    };
+    self.alloc.free(self.tools); // free the initial empty slice
+    self.tools = new_tools;
     self.connected = true;
 }
 
@@ -385,7 +400,9 @@ fn connectHttp(self: *Server, cfg: ServerConfig) !void {
     // 3) tools/list
     const list_res = httpRequest(self, "tools/list", "{}") catch return;
     defer self.alloc.free(list_res);
-    self.tools = parseTools(self.alloc, self.name, list_res) catch &[_]McpTool{};
+    const new_tools = parseTools(self.alloc, self.name, list_res) catch return;
+    self.alloc.free(self.tools); // free the initial empty slice
+    self.tools = new_tools;
     self.connected = true;
 }
 
@@ -856,15 +873,15 @@ fn parseServerInfo(alloc: std.mem.Allocator, result_json: []const u8) ?[]u8 {
 
 /// Parse the `tools/list` result into owned McpTool entries.
 pub fn parseTools(alloc: std.mem.Allocator, server_name: []const u8, result_json: []const u8) ![]McpTool {
-    var p = std.json.parseFromSlice(std.json.Value, alloc, result_json, .{}) catch return &[_]McpTool{};
+    var p = std.json.parseFromSlice(std.json.Value, alloc, result_json, .{}) catch return alloc.alloc(McpTool, 0);
     defer p.deinit();
     const obj = switch (p.value) {
         .object => |o| o,
-        else => return &[_]McpTool{},
+        else => return alloc.alloc(McpTool, 0),
     };
-    const tools_arr = switch (obj.get("tools") orelse return &[_]McpTool{}) {
+    const tools_arr = switch (obj.get("tools") orelse return alloc.alloc(McpTool, 0)) {
         .array => |a| a,
-        else => return &[_]McpTool{},
+        else => return alloc.alloc(McpTool, 0),
     };
     var out = std.array_list.Managed(McpTool).init(alloc);
     defer out.deinit();
@@ -1589,11 +1606,19 @@ pub fn freeConfig(alloc: std.mem.Allocator, cfg: ServerConfig) void {
 }
 
 /// Owned copy of an EnvVar list (empty list → empty slice, no alloc).
+/// Duplicate an EnvVar list. Always returns a heap-allocated slice (even
+/// when empty) so the caller can free it unconditionally.
 fn dupEnvVars(alloc: std.mem.Allocator, src: []const EnvVar) []EnvVar {
-    if (src.len == 0) return &[_]EnvVar{};
     var out = std.array_list.Managed(EnvVar).init(alloc);
+    defer out.deinit();
     for (src) |e| {
-        out.append(.{ .key = alloc.dupe(u8, e.key) catch return &[_]EnvVar{}, .value = alloc.dupe(u8, e.value) catch return &[_]EnvVar{} }) catch return &[_]EnvVar{};
+        const key = alloc.dupe(u8, e.key) catch break;
+        const value = alloc.dupe(u8, e.value) catch {
+            alloc.free(key);
+            break;
+        };
+        out.append(.{ .key = key, .value = value }) catch break;
     }
-    return out.toOwnedSlice() catch &[_]EnvVar{};
+    // toOwnedSlice transfers the backing array; deinit is then a no-op.
+    return out.toOwnedSlice() catch return alloc.alloc(EnvVar, 0) catch return &[_]EnvVar{};
 }
