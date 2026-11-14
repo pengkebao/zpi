@@ -389,7 +389,9 @@ fn parseCsi(params: []const u8, ss3: bool) ?Key {
         const is_alt = modifier & 2 != 0;
         const is_ctrl = modifier & 4 != 0;
         // Enter (13) / KP_Enter (57414): shift → newline, else submit.
+        // alt → alt+enter (steering follow-up submit; pi: app.message.followUp).
         if (k.codepoint == 13 or k.codepoint == 57414) {
+            if (is_alt) return .{ .char = .{ .c = '\r', .ctrl = false, .alt = true } };
             return if (is_shift) .shift_enter else .enter;
         }
         if (k.codepoint == 27) return .escape;
@@ -593,14 +595,15 @@ pub fn isDeviceAttributesReply(seq: []const u8) bool {
 /// on terminals without Kitty/shift+enter support it is the only way to
 /// insert a line break. pi maps `\n` to enter when Kitty is inactive.
 pub fn parseSequence(seq: []const u8, kitty_active: bool) ?Key {
-    _ = kitty_active; // ESC CR means alt+enter in both terminal modes
     if (seq.len == 1 and seq[0] == '\n') {
         return .shift_enter; // Ctrl+J / terminal shift+enter mapping: newline
     }
     if (seq.len == 2 and seq[0] == 27 and seq[1] == '\r') {
-        // ESC CR is alt+enter in both modes: kitty terminals report
-        // shift+enter as CSI 13;2u (handled in parseCsi), so the legacy
-        // ESC CR pair can only be alt here (pi: app.message.followUp).
+        // Dual-mode: with the kitty protocol negotiated, alt+enter arrives
+        // as CSI 13;3u (handled in parseCsi), so a bare ESC CR here is
+        // shift+enter (search "previous"); without kitty, terminals send
+        // ESC CR for alt+enter and \n / CSI 13;2u for shift+enter.
+        if (kitty_active) return .shift_enter;
         return .{ .char = .{ .c = '\r', .ctrl = false, .alt = true } };
     }
     if (std.mem.eql(u8, seq, "\x1bOM")) return .enter; // numpad enter
@@ -928,11 +931,16 @@ test "parseSequence legacy mappings depend on kitty state" {
     // without shift+enter support it is the only newline key).
     try expectKey(parseSequence("\n", true), .shift_enter);
     try expectKey(parseSequence("\n", false), .shift_enter);
-    // ESC CR is alt+enter in both modes (kitty terminals report shift+enter
-    // as CSI 13;2u, which parseCsi handles separately).
+    // ESC CR: shift+enter when kitty active (alt+enter comes as CSI 13;3u
+    // then), alt+enter otherwise (steering follow-up submit).
+    try expectKey(parseSequence("\x1b\r", true), .shift_enter);
     const alt_enter: Key = .{ .char = .{ .c = '\r', .ctrl = false, .alt = true } };
-    try expectKey(parseSequence("\x1b\r", true), alt_enter);
     try expectKey(parseSequence("\x1b\r", false), alt_enter);
+    // Kitty shift+enter (CSI 13;2u) and alt+enter (CSI 13;3u): plain CSI
+    // routes through parseKey — but parseSequence's ESC CR check does not
+    // see these (they carry the full CSI form, not the legacy pair).
+    try expectKey(parseSequence("\x1b[13;2u", true), .shift_enter);
+    try expectKey(parseSequence("\x1b[13;3u", true), alt_enter);
     // Numpad enter is always enter.
     try expectKey(parseSequence("\x1bOM", true), .enter);
     try expectKey(parseSequence("\x1bOM", false), .enter);
