@@ -43,7 +43,7 @@ pub fn visualWidth(s: []const u8) u32 {
 }
 
 /// Number of bytes in a UTF-8 sequence given its leading byte (0xC0..0xF7).
-fn utf8Len(lead: u8) usize {
+pub fn utf8Len(lead: u8) usize {
     return if (lead < 0xE0) 2 else if (lead < 0xF0) 3 else 4;
 }
 

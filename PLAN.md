@@ -133,7 +133,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | 全屏模式（alt-screen、固定编辑器/页脚、滚动区） | ✅ | ✅ | ScrollView 模型（wheel 加速/Ctrl+End 饱和、内容锚定）、滚动条（悬停/拖动/1s 隐藏）、Jump to latest 标签、PageUp/Down/Ctrl+Home/End、Ctrl+↑/↓ 用户消息跳转、Ctrl+Shift+F 搜索（语料/高亮/导航/浮框）；差分渲染 + DECSTBM 原生滚动 + 位移检测校验；到底惰性（no-op 拉拽零字节）；流式帧固定 22ms 节奏 |
 | regular 模式（终端原生 scrollback） | ✅ | ❌ | |
 | 多行编辑器（Shift+Enter、历史、光标移动） | ✅ | ✅ | Shift+Enter/ctrl+j（Kitty 协议）、Ctrl+↑/↓ 输入历史、全光标移动 |
-| `/` 命令菜单 + 模糊搜索 | ✅ | ✅ | 13 条命令（/help /clear /exit /model /think /session /name /new /tree /fork /resume /compact /hotkeys）+ `/` 补全菜单 + 模型名补全 |
+| `/` 命令菜单 + 模糊搜索 | ✅ | ✅ | **pi SelectList 全面复刻**（对照 pi editor.js/autocomplete.js/select-list.js）：`→ ` 选中前缀 + 两列布局（主列 = clamp(最宽名+2, 12, 32)（slash layout）/默认 32，desc 右列 muted、选中整行 accent）；菜单**渲染在输入框下方**（pi editor.render：bottom border 之后）；窗口 5 行居中（pi autocompleteMaxVisible 默认 5）+ `(sel/total)` muted 滚动指示；up/down **环绕循环** + pgup/pgdn 按页（pi getSelectPageIndex）；命令名显示**不带 `/`**；pi fuzzy.js 完整移植（`src/ui/fuzzy.zig`：贪心字符对齐打分（连续 -5、间隙 +2、词首 -10、位置 +0.1、全等 -100、字母数字交换 +5；token 按空格/斜杠拆分、全 token 必须命中、升序稳定）；`skill:` 条目裸名匹配 + 全名兜底（pi bareNameMatches/fullNameOnlyMatches）；初始选中 = exact > startsWith（pi getBestAutocompleteMatchIndex）；条目 = 内置命令 + **动态条目**（prompt templates + `skill:<name>`，desc 带 `[u]`/`[p]` scope tag，pi prefixAutocompleteDescription；/reload 刷新）；models 补全显示 id、值 = provider/id（pi label/value 分离）；enter（takes_arg）= 补全 `/name ` 后菜单切参数模式（pi selector UI 等价）；`/model` 无参 = 打开模型补全菜单（pi opens selector UI）|
 | `/model`（Ctrl+L）、`/thinking`（Shift+Tab 循环） | ✅ | ✅ | /model 模糊匹配切换 + ctrl+p/shift+ctrl+p 循环 + ctrl+l 列表；/think + shift+tab 档位循环；全屏 selector 🚧 |
 | `/hotkeys` | ✅ | ✅ | |
 | `/settings` 对话框、`/debug` | ✅ | ✅ | /settings：模态选择器（菜单基建复用，Up/Down/Enter/Esc）——Auto-compact 开关、reserve/keepRecent tokens 档位循环、Default model 循环；Enter 生效并**保真写回 settings.json**（未知字段保留）；/debug：终端尺寸 + 全部渲染行（含可见宽度）+ 会话消息 JSONL → /tmp/rpi-debug-*.log |
@@ -178,7 +178,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | stdio server 接入（tools/call 全链路） | ✅ | ✅ | initialize 握手→tools/list→注册为 `mcp__<server>__<tool>`→tools/call；E2E 验证 |
 | streamable HTTP + bearer 认证 | ✅ | ✅ | POST JSON-RPC（application/json + SSE 双格式解析）、`Mcp-Session-Id` 捕获回传、`Authorization: Bearer`（来自 login 或配置）；E2E 验证（含需鉴权服务器） |
 | mcp.json（用户/项目，项目覆盖 user 同名项） | ✅ | ✅ | `<base>/mcp.json` + `.pi/mcp.json`，同名项目覆盖 |
-| `/mcp` 管理、exposure 模式 | ✅ | ✅ | `/mcp` 列出状态/工具数/来源/错误；exposure：`hidden` 抑制工具注册，其余（codemode/deferred/direct）直接注册 |
+| `/mcp` 管理、exposure 模式 | ✅ | ✅ | **pi McpManagerView 复刻**（交互式管理器，替代旧文本列表）：servers 菜单（attention 排序：failed > disabled > connected；desc = `state · exposure · scope`，pi describeState/exposureOf）→ server 菜单（Enable/Tools/Reconnect/Exposure/Disable，按状态裁剪）→ tools 列表（首行 description）/ exposure 四值选择（✓ 当前值）；写回 mcp.json（`setEntryField`：**自有 arena 统一 parse+put+stringify**，修混用分配器 free-after-resize panic）；enable = reconnect + re-register（`Manager.rememberConfigs` 保存启动配置副本供 respawn）；disable = teardown + 注销工具；工具重注册 = `registerToolsInto`（单服务器，exposure 语义同 registerTools）；ESC 逐级返回 |
 | `rpi mcp add/remove/list/login/logout` | ✅ | ✅ | add（stdio/http，--local/--env/--cwd/--description/--exposure/-- 参数）；remove；list；login/logout（`mcp-auth.json` 存 bearer token，纯 std 近似 pi 的浏览器 OAuth） |
 | MCP resources（list/read） | ✅ | ✅ | 三个全局工具 `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource`，跨服务器聚合 + cursor；E2E 验证 |
 | OAuth 浏览器流程 | ✅ | ❌ | 以 login 存 token 近似（无浏览器）；完整 OAuth 待做 |
@@ -408,7 +408,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 - [x] J1a JSON-RPC over stdio；tools/list、tools/call（全链路 E2E 验证）
 - [x] J1b resources/list、resources/read（全局工具聚合 + cursor，E2E 验证）
 - [x] J2 streamable HTTP + bearer 认证（SSE/JSON 双解析、session-id、Bearer；E2E 含需鉴权服务器）
-- [x] J3 mcp.json 加载（用户/项目覆盖规则）+ `/mcp` 状态列出
+- [x] J3 mcp.json 加载（用户/项目覆盖规则）+ `/mcp` 状态列出（后升级为 pi McpManagerView 交互式管理器：servers→server→tools/exposure 三层菜单 + enable/disable/reconnect 写回，见矩阵）
 - [x] J4 `rpi mcp add/remove/list/login/logout` 子命令（login/logout 存 `mcp-auth.json`）
 - [x] J5 exposure 模式（pi 四值：`direct` 直接声明；`codemode`（默认）/`deferred` 注册但**不声明**，由 tool_search 装载；`hidden` 不注册；`toolExposure` 单工具覆盖待 I 阶段）。rpi 适配：codemode 服务器自动激活 `tool_search`（pi 激活 codemode 脚本工具；rpi 无 codemode 以 tool_search 兜底）
 - [x] J7 `tool_search` 工具（pi BM25 同款：分词=camelCase 拆分+停用词+naive 单数化（Intl.Segmenter 的 ASCII 近似）；k1=1.2 b=0.75；name 权重 3 / namespace 0.5（namespace=MCP 服务器 description）；exact-name 查询最优先、coverage 次之、score 再次、并列保持文档序）。注册即 inactive；激活路径：`--tools tool_search`、`+tool_search`、defaultTools 设置、搜索性 MCP 服务器自动激活。装载=翻 active 位，下一轮请求即声明（E2E 双轮验证）

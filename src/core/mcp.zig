@@ -143,6 +143,32 @@ pub const Server = struct {
         self.alloc.free(self.source);
         self.alloc.free(self.name);
     }
+
+    /// Register this server's tools into `registry` (the /mcp manager
+    /// re-registers a single server after reconnect/exposure changes).
+    /// Exposure semantics: "hidden" suppresses registration entirely; only
+    /// "direct" tools are declared to the model right away. codemode/
+    /// deferred tools register INACTIVE — `tool_search` (auto-activated for
+    /// such servers) loads matches.
+    pub fn registerToolsInto(self: *Server, registry: *tools.Registry) usize {
+        if (!self.connected) return 0;
+        const exposure = self.exposure orelse "codemode";
+        if (std.mem.eql(u8, exposure, "hidden")) return 0;
+        const active = std.mem.eql(u8, exposure, "direct");
+        var count: usize = 0;
+        for (self.tools) |t| {
+            registry.register(.{
+                .name = t.full_name,
+                .description = t.description,
+                .parameters_json = t.input_schema,
+                .execute = executeMcpTool,
+                .exposure = exposure,
+                .active = active,
+            }) catch continue;
+            count += 1;
+        }
+        return count;
+    }
 };
 
 /// Owns all configured servers.
@@ -152,6 +178,9 @@ pub const Manager = struct {
     servers: std.array_list.Managed(*Server),
     /// Path to mcp-auth.json (stored bearer tokens for HTTP servers).
     auth_path: ?[]const u8 = null,
+    /// Manager-owned startup config copies (rememberConfigs), used by
+    /// reconnectServer. Empty until the first rememberConfigs call.
+    configs: []ServerConfig = &.{},
 
     /// Global handle so the shared MCP tool executor (which only receives its
     /// own Tool name) can reach the manager. Single-process, one manager.
@@ -169,6 +198,64 @@ pub const Manager = struct {
             self.alloc.destroy(s);
         }
         self.servers.deinit();
+        freeConfigs(self.alloc, self.configs);
+    }
+
+    /// Manager-owned copies of the startup configs so `/mcp` reconnect can
+    /// respawn a server with its original command/env (main.zig frees its
+    /// own copies right after connectAll).
+    pub fn rememberConfigs(self: *Manager, cfgs: []const ServerConfig) void {
+        self.configs = dupeConfigs(self.alloc, cfgs) catch &.{};
+    }
+
+    /// Reconnect one server by name: stdio tears the process down and
+    /// respawns it (initialize → tools/list); HTTP re-handshakes. The
+    /// caller re-registers tools. Returns true on success.
+    pub fn reconnectServer(self: *Manager, name: []const u8) bool {
+        const s = self.findByName(name) orelse return false;
+        if (!s.enabled) return false;
+        const cfg: ServerConfig = for (self.configs) |c| {
+            if (std.mem.eql(u8, c.name, name)) break c;
+        } else return false;
+        teardownProcess(s);
+        if (s.error_msg) |e| {
+            self.alloc.free(e);
+            s.error_msg = null;
+        }
+        if (s.server_info) |si| {
+            self.alloc.free(si);
+            s.server_info = null;
+        }
+        switch (s.kind) {
+            .stdio => {
+                connectStdio(s, cfg) catch |e| {
+                    if (s.error_msg) |em| self.alloc.free(em);
+                    s.error_msg = self.alloc.dupe(u8, @errorName(e)) catch null;
+                    return false;
+                };
+            },
+            .http => {
+                s.http_client.deinit();
+                if (s.bearer_token) |bt| {
+                    self.alloc.free(bt);
+                    s.bearer_token = null;
+                }
+                if (s.auth_header) |ah| {
+                    self.alloc.free(ah);
+                    s.auth_header = null;
+                }
+                if (s.session_id) |sid| {
+                    self.alloc.free(sid);
+                    s.session_id = null;
+                }
+                connectHttp(s, cfg) catch |e| {
+                    if (s.error_msg) |em| self.alloc.free(em);
+                    s.error_msg = self.alloc.dupe(u8, @errorName(e)) catch null;
+                    return false;
+                };
+            },
+        }
+        return true;
     }
 
     /// Connect every enabled stdio server (in background semantics: we do it
@@ -236,25 +323,7 @@ pub const Manager = struct {
     pub fn registerTools(self: *Manager, registry: *tools.Registry) usize {
         var count: usize = 0;
         for (self.servers.items) |srv| {
-            if (!srv.connected) continue;
-            // Exposure (pi defaults to "codemode"): "hidden" suppresses
-            // registration entirely; only "direct" tools are declared to the
-            // model right away. codemode/deferred tools register INACTIVE —
-            // `tool_search` (auto-activated for such servers) loads matches.
-            const exposure = srv.exposure orelse "codemode";
-            if (std.mem.eql(u8, exposure, "hidden")) continue;
-            const active = std.mem.eql(u8, exposure, "direct");
-            for (srv.tools) |t| {
-                registry.register(.{
-                    .name = t.full_name,
-                    .description = t.description,
-                    .parameters_json = t.input_schema,
-                    .execute = executeMcpTool,
-                    .exposure = exposure,
-                    .active = active,
-                }) catch continue;
-                count += 1;
-            }
+            count += srv.registerToolsInto(registry);
         }
         return count;
     }
@@ -361,7 +430,7 @@ fn connectStdio(self: *Server, cfg: ServerConfig) !void {
     self.connected = true;
 }
 
-fn teardownProcess(self: *Server) void {
+pub fn teardownProcess(self: *Server) void {
     // child.kill → childCleanupPosix closes stdin/stdout/stderr; closing them
     // first would be a use-after-free (BADF). Only close manually if no child.
     if (self.child) |*c| {
@@ -1601,10 +1670,108 @@ pub fn removeServer(alloc: std.mem.Allocator, io: Io, path: []const u8, name: []
     return removed;
 }
 
+/// Set one field on a server entry in an mcp.json file (the /mcp manager's
+/// enable/disable/exposure persistence; pi writes the entry back to the file
+/// that defined it). `value_json` is the raw JSON of the new value (e.g.
+/// "false" or "\"direct\""). Returns true if the entry was found.
+pub fn setEntryField(
+    alloc: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    name: []const u8,
+    field: []const u8,
+    value_json: []const u8,
+) !bool {
+    const entries = try readServerEntries(alloc, io, path);
+    defer freeEntryList(alloc, entries);
+    var new_entry_json: ?[]u8 = null;
+    for (entries) |e| {
+        if (!std.mem.eql(u8, e.name, name)) continue;
+        // Everything (parse + put + stringify) happens inside one arena so
+        // the map's internal growth never mixes allocators (a put with the
+        // caller's allocator would realloc arena-owned memory and corrupt
+        // the free path).
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        var p = std.json.parseFromSlice(std.json.Value, aa, e.entry_json, .{}) catch return error.InvalidEntry;
+        const obj = switch (p.value) {
+            .object => |*o| o,
+            else => return error.InvalidEntry,
+        };
+        const value = std.json.parseFromSlice(std.json.Value, aa, value_json, .{}) catch return error.InvalidValue;
+        obj.put(aa, field, value.value) catch return error.OutOfMemory;
+        const rendered = std.json.Stringify.valueAlloc(aa, p.value, .{}) catch return error.OutOfMemory;
+        new_entry_json = alloc.dupe(u8, rendered) catch return error.OutOfMemory;
+        break;
+    }
+    const replaced_json = new_entry_json orelse return false;
+    defer alloc.free(replaced_json);
+
+    // Rebuild the file with the patched entry.
+    var out = std.array_list.Managed(u8).init(alloc);
+    defer out.deinit();
+    out.appendSlice("{\"mcpServers\":{") catch return error.OutOfMemory;
+    var first = true;
+    for (entries) |e| {
+        if (!first) out.append(',') catch return error.OutOfMemory;
+        const ne = jsonEscape(alloc, e.name);
+        defer alloc.free(ne);
+        out.appendSlice("\"") catch return error.OutOfMemory;
+        out.appendSlice(ne) catch return error.OutOfMemory;
+        out.appendSlice("\":") catch return error.OutOfMemory;
+        if (std.mem.eql(u8, e.name, name)) {
+            out.appendSlice(replaced_json) catch return error.OutOfMemory;
+        } else {
+            out.appendSlice(e.entry_json) catch return error.OutOfMemory;
+        }
+        first = false;
+    }
+    out.appendSlice("}}") catch return error.OutOfMemory;
+    const content = out.toOwnedSlice() catch return error.OutOfMemory;
+    defer alloc.free(content);
+    try writeConfigFile(io, path, content);
+    return true;
+}
+
 /// Free a config list (and each entry) returned by `loadConfig`.
 pub fn freeConfigs(alloc: std.mem.Allocator, cfgs: []const ServerConfig) void {
     for (cfgs) |c| freeConfig(alloc, c);
     alloc.free(cfgs);
+}
+
+/// Deep copy of a config list (for the manager-owned copies used by
+/// reconnect). Returns an error on OOM; the caller keeps its old list.
+pub fn dupeConfigs(alloc: std.mem.Allocator, cfgs: []const ServerConfig) ![]ServerConfig {
+    const out = try alloc.alloc(ServerConfig, cfgs.len);
+    var done: usize = 0;
+    errdefer {
+        // Free only the string fields we duped; leaked arg/env/headers
+        // entries on this OOM path are acceptable, but freeing a static
+        // empty slice is not (free of invalid memory).
+        for (out[0..done]) |c| {
+            alloc.free(c.name);
+            alloc.free(c.source);
+        }
+        alloc.free(out);
+    }
+    for (cfgs, 0..) |c, i| {
+        out[i] = c;
+        out[i].name = try alloc.dupe(u8, c.name);
+        done = i + 1;
+        if (c.command) |v| out[i].command = try alloc.dupe(u8, v);
+        if (c.url) |v| out[i].url = try alloc.dupe(u8, v);
+        if (c.cwd) |v| out[i].cwd = try alloc.dupe(u8, v);
+        if (c.description) |v| out[i].description = try alloc.dupe(u8, v);
+        if (c.exposure) |v| out[i].exposure = try alloc.dupe(u8, v);
+        out[i].source = try alloc.dupe(u8, c.source);
+        const args_copy = try alloc.alloc([]const u8, c.args.len);
+        for (c.args, 0..) |a, j| args_copy[j] = try alloc.dupe(u8, a);
+        out[i].args = args_copy;
+        out[i].env = dupEnvVars(alloc, c.env);
+        out[i].headers = dupEnvVars(alloc, c.headers);
+    }
+    return out;
 }
 
 pub fn freeConfig(alloc: std.mem.Allocator, cfg: ServerConfig) void {

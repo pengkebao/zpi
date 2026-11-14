@@ -16,6 +16,7 @@ const ss = @import("../core/session_store.zig");
 const shell = @import("../tools/shell.zig");
 const clipboard = @import("../core/clipboard.zig");
 const ptmod = @import("../core/prompt_template.zig");
+const fuzzy = @import("fuzzy.zig");
 const compact = @import("../core/compaction.zig");
 const skills = @import("../core/skills.zig");
 const sp = @import("../core/system_prompt.zig");
@@ -123,8 +124,11 @@ pub const MousePoint = struct { col: usize, row: usize };
 
 pub const TUI = struct {
     // ---- Completion menu types (G4) ----
-    const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null };
-    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel };
+    /// One completion-menu row. `value` is the completion text without the
+    /// leading slash (pi item.value: label may differ, e.g. models show the
+    /// id but complete to "provider/id"); empty = use `name`.
+    const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null, value: []const u8 = "" };
+    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
     /// Selector row capacity (sessions/tree/fork pickers).
     const SEL_MAX = 64;
@@ -396,7 +400,10 @@ pub const TUI = struct {
 
     // ---- Completion menu state (G4) ----
     menu_mode: MenuMode = .hidden,
-    menu_items: [16]MenuEntry = undefined,
+    /// Filtered candidates in ranked order (pi fuzzyFilter output; the
+    /// render window shows `autocompleteMaxVisible` of them, centered on
+    /// the selection). 64 covers COMMANDS + prompt templates + skills.
+    menu_items: [64]MenuEntry = undefined,
     /// Storage for formatted settings descriptions (menu_items' desc points here).
     settings_desc_buf: [16][64]u8 = undefined,
     // ---- @file completion menu state ----
@@ -421,12 +428,64 @@ pub const TUI = struct {
     sel_filter_len: usize = 0,
     /// First visible menu row (viewport follows menu_selected).
     menu_view_start: usize = 0,
+    /// Dynamic slash commands (pi: prompt templates + `skill:<name>` appear
+    /// in the `/` menu next to the built-ins, description prefixed with a
+    /// source tag like `[u]` user / `[p]` project). Owned; refreshed on
+    /// startup and /reload.
+    slash_extras: std.ArrayListUnmanaged(SlashExtra) = .empty,
+    /// Server the /mcp detail/exposure/tools menus act on (static copy; MCP
+    /// server names are manager-owned and stable for the session).
+    mcp_server_name: [64]u8 = undefined,
+    mcp_server_name_len: usize = 0,
+
+    const SlashExtra = struct { name: []u8, desc: []u8 };
 
     fn commandTakesArg(name: []const u8) bool {
         for (COMMANDS) |c| {
             if (std.mem.eql(u8, c.name, name)) return c.takes_arg;
         }
         return false;
+    }
+
+    /// Rebuild slash_extras from prompt templates + skills (pi
+    /// createBaseAutocompleteProvider: templates then skills, tagged by
+    /// scope). Best-effort: discovery failures leave the list empty.
+    fn refreshSlashExtras(self: *TUI) void {
+        for (self.slash_extras.items) |*e| {
+            self.alloc.free(e.name);
+            self.alloc.free(e.desc);
+        }
+        self.slash_extras.clearRetainingCapacity();
+        const agent_dir = self.agent_dir_for_templates();
+        const templates = ptmod.discover(self.alloc, self.io, agent_dir, self.cwd_abs);
+        defer ptmod.freeAll(self.alloc, templates);
+        for (templates) |t| {
+            const name = std.fmt.allocPrint(self.alloc, "/{s}", .{t.name}) catch continue;
+            const desc = std.fmt.allocPrint(self.alloc, "[{s}] {s}", .{ t.scope, t.description }) catch {
+                self.alloc.free(name);
+                continue;
+            };
+            self.slash_extras.append(self.alloc, .{ .name = name, .desc = desc }) catch {
+                self.alloc.free(name);
+                self.alloc.free(desc);
+            };
+        }
+        const skills_list = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir) catch return;
+        defer skills.freeAll(self.alloc, skills_list);
+        for (skills_list) |sk| {
+            // pi: skills come from user or project dirs; tag by which root
+            // owns the file (pi sourceInfo.scope: project = cwd, else user).
+            const scope: []const u8 = if (std.mem.startsWith(u8, sk.base_dir, self.cwd_abs)) "p" else "u";
+            const name = std.fmt.allocPrint(self.alloc, "/skill:{s}", .{sk.name}) catch continue;
+            const desc = std.fmt.allocPrint(self.alloc, "[{s}] {s}", .{ scope, sk.description }) catch {
+                self.alloc.free(name);
+                continue;
+            };
+            self.slash_extras.append(self.alloc, .{ .name = name, .desc = desc }) catch {
+                self.alloc.free(name);
+                self.alloc.free(desc);
+            };
+        }
     }
 
     /// Subsequence fuzzy match score; null = no match. Higher is better.
@@ -441,12 +500,28 @@ pub const TUI = struct {
         return null;
     }
 
+    /// Search text for a /-menu candidate (pi: item.value; `skill:` entries
+    /// also match by their bare skill name).
+    const SlashCtx = struct {
+        values: []const []const u8,
+
+        fn bare(self: @This(), i: usize) []const u8 {
+            const v = self.values[i];
+            if (std.mem.startsWith(u8, v, "skill:")) return v["skill:".len..];
+            return v;
+        }
+    };
+
+    fn slashBare(ctx: SlashCtx, i: usize) []const u8 {
+        return ctx.bare(i);
+    }
+
     /// Recompute the completion menu from the current editor text.
     pub fn updateMenu(self: *TUI) void {
-        // Modal dialogs (settings, session/tree/fork pickers) are not driven
-        // by editor text.
+        // Modal dialogs (settings, session/tree/fork pickers, the /mcp
+        // manager) are not driven by editor text.
         switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel => return,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure => return,
             else => {},
         }
         self.menu_len = 0;
@@ -458,53 +533,157 @@ pub const TUI = struct {
         defer self.alloc.free(text);
         const single_line = std.mem.indexOfScalar(u8, text, '\n') == null;
 
-        // Commands: "/query" with no space yet.
+        // Commands: "/query" with no space yet (pi slash autocomplete:
+        // fuzzy token filter over the command values; `skill:` entries also
+        // match by their bare skill name, with full-name-only matches
+        // appended after; ranked ascending by fuzzy score).
         if (single_line and text.len > 0 and text[0] == '/' and std.mem.indexOfScalar(u8, text, ' ') == null) {
             const query = text[1..];
-            var scored: [COMMANDS.len]struct { def: *const CommandDef, score: u32 } = undefined;
+            var values: [64][]const u8 = undefined;
             var n: usize = 0;
-            for (&COMMANDS) |*def| {
-                if (fuzzyScore(def.name[1..], query)) |score| {
-                    scored[n] = .{ .def = def, .score = score };
-                    n += 1;
+            for (COMMANDS) |c| {
+                if (n >= values.len) break;
+                self.menu_items[n] = .{ .name = c.name, .desc = c.desc, .value = c.name[1..] };
+                values[n] = c.name[1..];
+                n += 1;
+            }
+            for (self.slash_extras.items) |e| {
+                if (n >= values.len) break;
+                self.menu_items[n] = .{ .name = e.name, .desc = e.desc, .value = e.name[1..] };
+                values[n] = e.name[1..];
+                n += 1;
+            }
+            const ctx = SlashCtx{ .values = values[0..n] };
+            var combined: [64]usize = undefined;
+            var cap: usize = 0;
+            var bare_set: [64]bool = @splat(false);
+            // Pass 1: bare-name matching (skill: entries match without the prefix).
+            if (fuzzy.fuzzyFilter(self.alloc, n, query, ctx, slashBare) catch null) |bare| {
+                defer self.alloc.free(bare);
+                for (bare) |i| {
+                    if (cap >= combined.len) break;
+                    bare_set[i] = true;
+                    combined[cap] = i;
+                    cap += 1;
                 }
             }
-            // Sort by score desc (insertion sort; n is tiny).
-            var i: usize = 1;
-            while (i < n) : (i += 1) {
-                var j = i;
-                const cur = scored[i];
-                while (j > 0 and scored[j - 1].score < cur.score) : (j -= 1) {
-                    scored[j] = scored[j - 1];
+            // Pass 2: `skill:` entries the bare pass missed, matched by full
+            // name and appended after (pi fullNameOnlyMatches).
+            var skill_idx: [64]usize = undefined;
+            var skill_n: usize = 0;
+            for (0..n) |i| {
+                if (std.mem.startsWith(u8, values[i], "skill:") and !bare_set[i]) {
+                    skill_idx[skill_n] = i;
+                    skill_n += 1;
                 }
-                scored[j] = cur;
             }
-            const cap = @min(n, self.menu_items.len);
-            for (0..cap) |k| {
-                self.menu_items[k] = .{ .name = scored[k].def.name, .desc = scored[k].def.desc };
+            if (skill_n > 0) {
+                const SkillCtx = struct {
+                    vals: []const []const u8,
+                    idx: []const usize,
+                    fn get(c: @This(), i: usize) []const u8 {
+                        return c.vals[c.idx[i]];
+                    }
+                };
+                const sctx = SkillCtx{ .vals = values[0..n], .idx = skill_idx[0..skill_n] };
+                if (fuzzy.fuzzyFilter(self.alloc, skill_n, query, sctx, SkillCtx.get) catch null) |ranked| {
+                    defer self.alloc.free(ranked);
+                    for (ranked) |r| {
+                        if (cap >= combined.len) break;
+                        combined[cap] = skill_idx[r];
+                        cap += 1;
+                    }
+                }
             }
+            // Reorder menu_items into the ranked order.
+            var ordered: [64]MenuEntry = undefined;
+            for (0..cap) |k| ordered[k] = self.menu_items[combined[k]];
+            for (0..cap) |k| self.menu_items[k] = ordered[k];
             self.menu_len = cap;
+            // pi: the "/"-prefixed prefix never exact/prefix-matches a value,
+            // so the editor keeps the default selection (first row).
+            self.menu_selected = 0;
             self.menu_mode = if (cap > 0) .commands else .hidden;
             return;
         }
 
-        // Models: "/model <query>".
+        // Models: "/model <query>" (pi model argument completion: fuzzy
+        // token match over id/provider/"provider/id"/name; label = id,
+        // completion value = "provider/id", description = provider; initial
+        // selection = first exact/prefix value match).
         if (single_line and std.mem.startsWith(u8, text, "/model ")) {
             const query = std.mem.trim(u8, text["/model ".len..], " ");
             const cfg = self.cfg orelse {
                 self.menu_mode = .hidden;
                 return;
             };
-            var cap: usize = 0;
+            const total = @min(cfg.models.items.len, self.menu_items.len);
+            if (total == 0) {
+                self.menu_mode = .hidden;
+                return;
+            }
+            var values: [64][]const u8 = undefined;
+            var search_texts: [64][]const u8 = undefined;
+            var model_map: [64]usize = undefined;
+            var n: usize = 0;
+            var oom = false;
             for (cfg.models.items, 0..) |m, idx| {
-                if (cap >= self.menu_items.len) break;
-                // Match against name or provider.
-                const hit = fuzzyScore(m.name, query) orelse fuzzyScore(m.provider, query);
-                if (hit == null) continue;
-                self.menu_items[cap] = .{ .name = m.name, .desc = m.provider, .model_idx = idx };
-                cap += 1;
+                if (n >= total) break;
+                values[n] = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ m.provider, m.id }) catch {
+                    oom = true;
+                    break;
+                };
+                // pi getModelSearchText: id, provider, provider/id and the
+                // display name all participate in the token match.
+                search_texts[n] = std.fmt.allocPrint(self.alloc, "{s} {s} {s} {s}", .{ m.id, m.provider, values[n], m.name }) catch values[n];
+                model_map[n] = idx;
+                n += 1;
+            }
+            var cap: usize = 0;
+            defer {
+                // Null out refs into the temp strings freed below, then free them.
+                for (0..cap) |k| self.menu_items[k].value = "";
+                for (0..n) |i| {
+                    if (search_texts[i].ptr != values[i].ptr) self.alloc.free(search_texts[i]);
+                    self.alloc.free(values[i]);
+                }
+            }
+            if (!oom) {
+                const MCtx = struct {
+                    texts: []const []const u8,
+                    fn get(c: @This(), i: usize) []const u8 {
+                        return c.texts[i];
+                    }
+                };
+                const mctx = MCtx{ .texts = search_texts[0..n] };
+                if (fuzzy.fuzzyFilter(self.alloc, n, query, mctx, MCtx.get) catch null) |order| {
+                    defer self.alloc.free(order);
+                    var ordered: [64]MenuEntry = undefined;
+                    var ordered_map: [64]usize = undefined;
+                    for (order) |i| {
+                        if (cap >= ordered.len) break;
+                        const m = cfg.models.items[model_map[i]];
+                        ordered[cap] = .{ .name = m.id, .desc = m.provider, .model_idx = model_map[i], .value = values[i] };
+                        ordered_map[cap] = model_map[i];
+                        cap += 1;
+                    }
+                    for (0..cap) |k| {
+                        self.menu_items[k] = ordered[k];
+                        model_map[k] = ordered_map[k];
+                    }
+                }
             }
             self.menu_len = cap;
+            // pi editor rule: exact value match first, then first prefix hit.
+            const VCtx = struct {
+                vals: []const []const u8,
+                fn get(c: @This(), i: usize) []const u8 {
+                    return c.vals[i];
+                }
+            };
+            var vs: [64][]const u8 = undefined;
+            for (0..cap) |k| vs[k] = self.menu_items[k].value;
+            self.menu_selected = fuzzy.bestMatchIndex(cap, query, VCtx{ .vals = vs[0..cap] }, VCtx.get) orelse 0;
             self.menu_mode = if (cap > 0) .models else .hidden;
             return;
         }
@@ -527,10 +706,6 @@ pub const TUI = struct {
                         self.alloc.free(sup);
                         self.at_suppress = null;
                     }
-                    if (tok.len == 0 or fuzzyScore("", "") != null) {
-                        self.fillFileMenu(tok, at);
-                        return;
-                    }
                     self.fillFileMenu(tok, at);
                     return;
                 }
@@ -544,6 +719,10 @@ pub const TUI = struct {
     /// directory part (pi getBaseDirSuggestions), fuzzy filter, depth/length
     /// tie-breaks, cap 16. Directories render with a trailing '/' and
     /// complete with one (pi buildCompletionValue).
+    /// Fill the file menu for an "@query" token: base dir from the query's
+    /// directory part, pi fuzzyFilter over the entry names (ranked, stable),
+    /// top 16 into the static buffers. Directories render with a trailing
+    /// '/' and complete with one (pi buildCompletionValue).
     fn fillFileMenu(self: *TUI, query: []const u8, at_col: usize) void {
         self.menu_len = 0;
         self.menu_selected = 0;
@@ -567,75 +746,80 @@ pub const TUI = struct {
         };
         defer dir.close(self.io);
 
-        var candidates: [16]struct { src: usize, name_len: usize, path_len: usize, score: u32, is_dir: bool } = undefined;
-
+        const CAP = 64;
+        const Entry = struct { name_len: usize, path_len: usize, is_dir: bool };
+        var entries: [CAP]Entry = undefined;
+        var names: [CAP][]const u8 = undefined;
         var n: usize = 0;
         var it = dir.iterateAssumeFirstIteration();
         while (it.next(self.io) catch null) |entry| {
-            if (n >= candidates.len) break;
+            if (n >= CAP) break;
             const nm = entry.name;
             // Hidden files only surface when the query starts with '.'.
             if (nm.len > 0 and nm[0] == '.' and (name_part.len == 0 or name_part[0] != '.')) continue;
-            const score = if (name_part.len == 0)
-                @as(u32, 1)
-            else
-                fuzzyScore(nm, name_part) orelse continue;
             const with_slash: []const u8 = if (entry.kind == .directory) "/" else "";
-            const full_len = dir_part.len + nm.len + with_slash.len;
-            candidates[n] = .{
-                .src = n,
-                .name_len = @min(nm.len, self.file_names[0].len - 1),
-                .path_len = @min(full_len, self.file_paths[n].len - 1),
-                .score = score + (if (entry.kind == .directory) @as(u32, 10) else 0),
+            names[n] = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ nm, with_slash }) catch continue;
+            entries[n] = .{
+                .name_len = @min(names[n].len, self.file_names[0].len - 1),
+                .path_len = @min(dir_part.len + names[n].len, self.file_paths[0].len - 1),
                 .is_dir = entry.kind == .directory,
             };
-            const nb = self.file_names[n][0..candidates[n].name_len];
-            @memcpy(nb, nm[0..candidates[n].name_len]);
-            // Full relative path for insertion: dir_part ++ name (+ '/' for dirs).
-            const full = std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ dir_part, nm, with_slash }) catch continue;
-            defer self.alloc.free(full);
-            @memcpy(self.file_paths[n][0..candidates[n].path_len], full[0..candidates[n].path_len]);
             n += 1;
         }
         if (n == 0) {
             self.menu_mode = .hidden;
             return;
         }
-        // Sort: score desc, then path length asc (pi's tie-breaks).
-        var i: usize = 1;
-        while (i < n) : (i += 1) {
-            var j = i;
-            const cur = candidates[i];
-            while (j > 0 and candidates[j - 1].score < cur.score) : (j -= 1) {
-                candidates[j] = candidates[j - 1];
+        // pi fuzzyFilter over the display names (empty query keeps the
+        // readdir order); ranked ascending, stable.
+        const FCtx = struct {
+            nm: []const []const u8,
+            fn get(c: @This(), i: usize) []const u8 {
+                return c.nm[i];
             }
-            candidates[j] = cur;
-        }
-        // Reorder the parallel buffers to match.
+        };
+        const fctx = FCtx{ .nm = names[0..n] };
+        var cap: usize = 0;
+        const order: ?[]usize = fuzzy.fuzzyFilter(self.alloc, n, name_part, fctx, FCtx.get) catch null;
+        defer if (order) |o| self.alloc.free(o);
         var ordered_names: [16][160]u8 = undefined;
         var ordered_paths: [16][256]u8 = undefined;
         var ordered_lens: [16]usize = undefined;
         var ordered_at: [16]usize = undefined;
-        for (0..n) |k| {
-            const src = candidates[k].src;
-            const nl = candidates[k].name_len;
-            const pl = candidates[k].path_len;
-            @memcpy(ordered_names[k][0..nl], self.file_names[src][0..nl]);
-            @memcpy(ordered_paths[k][0..pl], self.file_paths[src][0..pl]);
-            ordered_lens[k] = pl;
-            ordered_at[k] = at_col;
+        if (order) |o| {
+            for (o) |i| {
+                if (cap >= self.menu_items.len) break;
+                const nm = names[i][0..@min(names[i].len, ordered_names[cap].len)];
+                @memcpy(ordered_names[cap][0..nm.len], nm);
+                const full = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ dir_part, nm }) catch continue;
+                defer self.alloc.free(full);
+                const pl = @min(full.len, ordered_paths[cap].len);
+                @memcpy(ordered_paths[cap][0..pl], full[0..pl]);
+                ordered_lens[cap] = pl;
+                ordered_at[cap] = at_col;
+                self.menu_items[cap] = .{ .name = ordered_names[cap][0..nm.len], .desc = ordered_paths[cap][0..pl] };
+                cap += 1;
+            }
+            // Free the temp entry names (menu_items points into the static buffers).
+            for (names[0..n]) |nm| self.alloc.free(nm);
+        } else {
+            for (names[0..n]) |nm| self.alloc.free(nm);
+            self.menu_mode = .hidden;
+            return;
+        }
+        if (cap == 0) {
+            self.menu_mode = .hidden;
+            return;
         }
         self.file_names = ordered_names;
         self.file_paths = ordered_paths;
         self.file_path_lens = ordered_lens;
         self.file_at_col = ordered_at;
-        for (0..n) |k| {
-            const nm = self.file_names[k][0..candidates[k].name_len];
-            const slash: []const u8 = if (candidates[k].is_dir) "/" else "";
-            self.menu_items[k] = .{ .name = nm, .desc = self.file_paths[k][0..candidates[k].path_len] };
-            _ = slash;
+        // Re-point menu_items at the (now stable) static buffers.
+        for (0..cap) |k| {
+            self.menu_items[k] = .{ .name = self.file_names[k][0..self.menu_items[k].name.len], .desc = self.file_paths[k][0..self.file_path_lens[k]] };
         }
-        self.menu_len = n;
+        self.menu_len = cap;
         self.menu_mode = .files;
     }
 
@@ -658,22 +842,117 @@ pub const TUI = struct {
 
     /// Render menu row `i` (owned, caller frees).
     /// Keep the menu viewport window such that menu_selected stays visible.
+    /// Visible window height for the current menu mode: pi's editor
+    /// autocomplete shows AUTOCOMPLETE_MAX_VISIBLE (default 5) rows centered
+    /// on the selection; modal pickers show up to 16.
+    fn menuMaxVisible(self: *const TUI) usize {
+        return switch (self.menu_mode) {
+            .commands, .models, .files => 5,
+            .mcp => @min(self.sel_len, 12),
+            else => @min(if (self.menu_len > 0) self.menu_len else 1, 16),
+        };
+    }
+
+    /// Keep the menu viewport window such that menu_selected stays visible
+    /// (pi SelectList.getVisibleRange: centered on the selection).
     fn updateMenuViewport(self: *TUI, menu_h: usize) void {
-        if (self.menu_selected < self.menu_view_start) self.menu_view_start = self.menu_selected;
-        if (self.menu_selected >= self.menu_view_start + menu_h) {
-            self.menu_view_start = self.menu_selected + 1 - menu_h;
+        const total = if (self.menu_len > 0) self.menu_len else 1;
+        if (menu_h >= total) {
+            self.menu_view_start = 0;
+            return;
         }
+        const half: usize = menu_h / 2;
+        var start: usize = if (self.menu_selected > half) self.menu_selected - half else 0;
+        if (start + menu_h > total) start = total - menu_h;
+        self.menu_view_start = start;
     }
 
-    fn menuLine(self: *TUI, v: usize) ![]u8 {
+    /// Truncate `s` to at most `max_w` visual columns into `buf` (no
+    /// allocation; pi truncateToWidth for the short menu labels). Returns a
+    /// prefix slice of `buf`.
+    fn truncInto(buf: []u8, s: []const u8, max_w: usize) []const u8 {
+        if (max_w == 0) return buf[0..0];
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < s.len and i < buf.len) {
+            const lead = s[i];
+            const n: usize = if (lead < 0x80) 1 else wmod.utf8Len(lead);
+            if (i + n > s.len) break;
+            const cw = wmod.visualWidth(s[i..i + n]);
+            if (w + cw > max_w) break;
+            @memcpy(buf[i..i + n], s[i..i + n]);
+            i += n;
+            w += cw;
+        }
+        return buf[0..i];
+    }
+
+    /// Render one visible menu row (pi SelectList.renderItem): `→ ` prefix
+    /// on the selected row, primary column clamped to [col_min, col_max]
+    /// (widest visible label + 2-space gap), description in the right column
+    /// (muted); the whole row is accent-colored when selected. Owned,
+    /// caller frees.
+    fn menuLine(self: *TUI, v: usize, width: usize, col_min: usize, col_max: usize) ![]u8 {
         const e = self.menu_items[v];
-        if (self.menu_view_start + v == self.menu_selected) {
-            return std.fmt.allocPrint(self.alloc, "\x1b[38;2;167;152;215m\x1b[1m❯ {s}\x1b[0m  \x1b[2m{s}\x1b[0m", .{ e.name, e.desc });
+        const selected = self.menu_view_start + v == self.menu_selected;
+        const prefix: []const u8 = if (selected) "\u{2192} " else "  ";
+        const name_full = if (e.name.len > 0 and e.name[0] == '/') e.name[1..] else e.name;
+        const accent = "\x1b[38;2;167;152;215m";
+        const reset = ansi.RESET;
+        const muted = FG_MUTED;
+        var name_buf: [192]u8 = undefined;
+        var desc_buf: [256]u8 = undefined;
+        var desc_sp_buf: [256]u8 = undefined;
+        // Two-column layout (pi: only with a description and width > 40, and
+        // only when at least MIN_DESCRIPTION_WIDTH (10) columns remain).
+        if (e.desc.len > 0 and width > 40) {
+            // Primary column = widest visible label + PRIMARY_COLUMN_GAP (2).
+            var widest: usize = 0;
+            for (0..self.menu_len) |k| {
+                const n = self.menu_items[k].name;
+                const w = if (n.len > 0 and n[0] == '/') n.len - 1 else n.len;
+                if (w + 2 > widest) widest = w + 2;
+            }
+            var col = widest;
+            if (col < col_min) col = col_min;
+            if (col > col_max) col = col_max;
+            const effective = @max(1, @min(col, width - prefix.len - 4));
+            const max_primary = @max(1, effective - 2);
+            const name = truncInto(&name_buf, name_full, max_primary);
+            const name_w = wmod.visualWidth(name);
+            const spacing = effective - @min(effective, name_w);
+            const desc_start = prefix.len + name_w + spacing;
+            const remaining = if (width > desc_start + 2) width - desc_start - 2 else 0;
+            if (remaining > 10) {
+                const desc = truncInto(&desc_buf, e.desc, remaining);
+                const desc_w = wmod.visualWidth(desc);
+                // spacing + desc in one muted run (pi: theme.description(spacing + desc))
+                const pad = @min(spacing + desc_w, desc_sp_buf.len);
+                var w: usize = 0;
+                for (0..spacing) |_| {
+                    if (w >= desc_sp_buf.len) break;
+                    desc_sp_buf[w] = ' ';
+                    w += 1;
+                }
+                @memcpy(desc_sp_buf[w..@min(w + desc_w, desc_sp_buf.len)], desc[0..@min(desc_w, desc_sp_buf.len - w)]);
+                _ = pad;
+                const styled_tail = desc_sp_buf[0..@min(w + desc_w, desc_sp_buf.len)];
+                if (selected) {
+                    return std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}{s}", .{ accent, prefix, name, muted, styled_tail, reset }) catch error.OutOfMemory;
+                }
+                return std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}{s}", .{ prefix, name, muted, styled_tail, reset, "" }) catch error.OutOfMemory;
+            }
         }
-        return std.fmt.allocPrint(self.alloc, "  {s}  \x1b[2m{s}\x1b[0m", .{ e.name, e.desc });
+        if (selected) {
+            return std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{ accent, prefix, name_full, reset }) catch error.OutOfMemory;
+        }
+        return std.fmt.allocPrint(self.alloc, "{s}{s}", .{ prefix, name_full }) catch error.OutOfMemory;
     }
 
-    /// Complete the editor text with the selected menu entry (Tab).
+    /// Complete the editor text with the selected menu entry (Tab, or Enter
+    /// on a takes_arg command). pi applyCompletion: a slash completion is
+    /// always "/value " with a trailing space; models complete to
+    /// "provider/id" (pi item.value) while displaying just the id.
     fn menuComplete(self: *TUI) void {
         if (self.menu_len == 0) return;
         if (self.menu_mode == .files) {
@@ -681,12 +960,22 @@ pub const TUI = struct {
             return;
         }
         const e = self.menu_items[self.menu_selected];
-        const text = if (self.menu_mode == .models)
-            std.fmt.allocPrint(self.alloc, "/model {s} ", .{e.name}) catch return
-        else if (commandTakesArg(e.name))
-            std.fmt.allocPrint(self.alloc, "{s} ", .{e.name}) catch return
-        else
-            self.alloc.dupe(u8, e.name) catch return;
+        var text: []u8 = undefined;
+        if (self.menu_mode == .models) {
+            var done = false;
+            if (e.model_idx) |idx| {
+                if (self.cfg) |cfg| {
+                    if (idx < cfg.models.items.len) {
+                        const m = cfg.models.items[idx];
+                        text = std.fmt.allocPrint(self.alloc, "/model {s}/{s} ", .{ m.provider, m.id }) catch return;
+                        done = true;
+                    }
+                }
+            }
+            if (!done) text = std.fmt.allocPrint(self.alloc, "/model {s} ", .{e.name}) catch return;
+        } else {
+            text = std.fmt.allocPrint(self.alloc, "{s} ", .{e.name}) catch return;
+        }
         defer self.alloc.free(text);
         self.editor.setText(text) catch return;
     }
@@ -698,21 +987,20 @@ pub const TUI = struct {
         switch (self.menu_mode) {
             .commands => {
                 if (commandTakesArg(e.name)) {
-                    const text = std.fmt.allocPrint(self.alloc, "{s} ", .{e.name}) catch return false;
-                    defer self.alloc.free(text);
-                    self.editor.setText(text) catch return false;
+                    // pi: a takes-arg command completes to "/name " and the
+                    // menu flips to its argument mode (pi opens the selector).
+                    self.menuComplete();
+                    self.updateMenu();
                     return false;
                 }
                 self.editor.clear() catch {};
                 return self.handleCommand(e.name);
             },
             .models => {
-                if (e.model_idx) |idx| {
-                    self.switchModel(idx) catch |err| {
-                        self.note("model switch failed: {s}", .{@errorName(err)});
-                    };
-                }
-                self.editor.clear() catch {};
+                // pi: an argument-completion Enter fills the value and closes
+                // the menu; the user submits again to execute.
+                self.menuComplete();
+                self.updateMenu();
                 return false;
             },
             .files => {
@@ -764,6 +1052,9 @@ pub const TUI = struct {
                 self.menu_mode = .hidden;
                 self.forkFromUserMessage(entry_id);
                 return false;
+            },
+            .mcp, .mcp_server, .mcp_tools, .mcp_exposure => {
+                return self.mcpMenuActivate();
             },
             .hidden => return false,
         }
@@ -854,7 +1145,7 @@ pub const TUI = struct {
 
     /// Clamp the viewport so menu_selected stays visible, then re-project.
     fn scrollSelMenu(self: *TUI) void {
-        const menu_h: usize = @min(self.sel_len, 16);
+        const menu_h: usize = self.menuMaxVisible();
         self.updateMenuViewport(menu_h);
         self.refreshSelMenu();
     }
@@ -1752,6 +2043,13 @@ pub const TUI = struct {
         };
     }
 
+    /// Late init for the parts that need the struct built (pi creates the
+    /// autocomplete provider right after session setup): dynamic slash
+    /// entries (templates + skills). Best-effort.
+    pub fn initLate(self: *TUI) void {
+        self.refreshSlashExtras();
+    }
+
     pub fn deinit(self: *TUI) void {
         self.stopWatch();
         // Join the spinner thread BEFORE any teardown: it may still be in the
@@ -1761,6 +2059,11 @@ pub const TUI = struct {
         self.restoreTerminal();
         keys.restoreWinchHandler();
         self.watch_captured.deinit(self.alloc);
+        for (self.slash_extras.items) |*e| {
+            self.alloc.free(e.name);
+            self.alloc.free(e.desc);
+        }
+        self.slash_extras.deinit(self.alloc);
         self.editor.deinit();
         self.stream_text.deinit();
         self.stream_thinking.deinit();
@@ -2004,7 +2307,7 @@ pub const TUI = struct {
         // Fixed bottom: menu (menu_h) + top border (1) + editor (editor_h) +
         // bottom border (1) + cwd (1) + status (1). The menu viewport shows
         // at most 16 rows (pi select-list maxVisible).
-        const menu_h: usize = if (self.menu_mode != .hidden) @min(self.menu_len, 16) else 0;
+        const menu_h: usize = if (self.menu_mode != .hidden) @min(self.menu_len, self.menuMaxVisible()) else 0;
         const fixed_bottom = editor_h + 4 + menu_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
@@ -2085,19 +2388,6 @@ pub const TUI = struct {
             }
         }
 
-        // 1.5 Completion menu rows (between transcript and input border).
-        // The viewport window follows menu_selected so long lists scroll.
-        if (menu_h > 0) {
-            self.updateMenuViewport(menu_h);
-            for (0..menu_h) |v| {
-                // menu_items is the projected window: window-relative index.
-                const ml_raw = self.menuLine(v) catch return;
-                const ml = truncateToWidth(self.alloc, ml_raw, self.width) catch return;
-                self.alloc.free(ml_raw);
-                frame.append(self.alloc, ml) catch return;
-            }
-        }
-
         // 2. Top border (shows spinner + "Working" when busy).
         const top_border = self.topBorderLine() catch return;
         frame.append(self.alloc, top_border) catch return;
@@ -2117,6 +2407,29 @@ pub const TUI = struct {
         // 4. Bottom border.
         const bottom_border = self.borderLine() catch return;
         frame.append(self.alloc, bottom_border) catch return;
+
+        // 4.5 Completion menu rows (pi editor.render: the autocomplete
+        // SelectList renders BELOW the input's bottom border). The window
+        // centers on menu_selected; a scroll indicator shows when the list
+        // has more rows (pi: "  (sel/total)" in muted).
+        if (menu_h > 0) {
+            const col_min: usize = if (self.menu_mode == .commands or self.menu_mode == .models) 12 else 32;
+            const col_max: usize = if (self.menu_mode == .commands or self.menu_mode == .models) 32 else 32;
+            self.updateMenuViewport(menu_h);
+            for (0..menu_h) |v| {
+                // menu_items is the projected window (modal pickers project
+                // their sel_rows through refreshSelMenu), so v is the
+                // window-relative index for both paths.
+                const ml_raw = self.menuLine(v, self.width, col_min, col_max) catch return;
+                const ml = truncateToWidth(self.alloc, ml_raw, self.width) catch return;
+                self.alloc.free(ml_raw);
+                frame.append(self.alloc, ml) catch return;
+            }
+            if (self.menu_len > menu_h) {
+                const indicator = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "  ({d}/{d})" ++ ansi.RESET, .{ self.menu_selected + 1, self.menu_len }) catch return;
+                frame.append(self.alloc, indicator) catch return;
+            }
+        }
 
         // 5. Cwd line (home-abbreviated), with the flash message on the
         // right (pi: the flash stack renders bottom-center; ours parks in
@@ -3923,61 +4236,337 @@ pub const TUI = struct {
             if (!s.disable_model_invocation) visible += 1;
         }
         self.note("Reloaded resources: {d} skill(s) advertised in the system prompt.", .{visible});
+        // Templates and skills may have changed on disk: refresh the dynamic
+        // `/` menu entries (pi rebuilds the autocomplete provider).
+        self.refreshSlashExtras();
     }
 
     /// /mcp — list configured MCP servers with their state (pi /mcp).
     /// Format matches pi's SelectList: `→ name<col> state · exposure · scope`.
     fn showMcpStatus(self: *TUI) void {
-        const mgr = mcp.Manager.getGlobal() orelse {
+        // pi /mcp opens the interactive manager (select a server → manage
+        // enable/tools/exposure/reconnect); the read-only listing is the
+        // empty state. Keep the text dump for "no servers" only.
+        const mgr = mcp.Manager.getGlobal();
+        if (mgr == null or mgr.?.servers.items.len == 0) {
             self.addMessage("No MCP servers configured.\nAdd entries to mcp.json under your agent dir or in .pi/mcp.json.");
             return;
+        }
+        self.openMcpManager();
+    }
+
+    // ---- /mcp manager (pi McpManagerView: servers → server → actions) ----
+
+    fn mcpSetServer(self: *TUI, name: []const u8) void {
+        // name may BE this very buffer (openMcpServerMenu(self.mcpServerName())) — skip the self-copy.
+        if (std.mem.eql(u8, self.mcpServerName(), name)) return;
+        const n = @min(name.len, self.mcp_server_name.len);
+        @memcpy(self.mcp_server_name[0..n], name[0..n]);
+        self.mcp_server_name_len = n;
+    }
+
+    fn mcpServerName(self: *TUI) []const u8 {
+        return self.mcp_server_name[0..self.mcp_server_name_len];
+    }
+
+    /// describeState (pi mcp extension): state · exposure · scope.
+    fn mcpServerDesc(self: *TUI, srv: *mcp.Server) []const u8 {
+        var desc = std.array_list.Managed(u8).init(self.alloc);
+        if (!srv.enabled) {
+            desc.appendSlice("disabled") catch return "?";
+        } else if (srv.connected) {
+            const s = std.fmt.allocPrint(self.alloc, "connected · {d} tool{s}", .{ srv.tools.len, if (srv.tools.len == 1) "" else "s" }) catch return "connected";
+            desc.appendSlice(s) catch {};
+            self.alloc.free(s);
+        } else if (srv.error_msg) |e| {
+            desc.appendSlice("failed: ") catch {};
+            desc.appendSlice(e) catch {};
+        } else {
+            desc.appendSlice("starting") catch {};
+        }
+        desc.appendSlice(" · ") catch {};
+        desc.appendSlice(srv.exposure orelse "codemode") catch {};
+        desc.appendSlice(" · ") catch {};
+        desc.appendSlice(if (std.mem.eql(u8, srv.source, "project")) "project" else "global") catch {};
+        return desc.toOwnedSlice() catch {
+            desc.deinit();
+            return "?";
         };
-        if (mgr.servers.items.len == 0) {
-            self.addMessage("No MCP servers configured.");
-            return;
-        }
-        // Name column width (pi: default 32, grows for long names).
-        var col: usize = 32;
-        for (mgr.servers.items) |srv| {
-            if (srv.name.len + 2 > col) col = srv.name.len + 2;
-        }
+    }
 
-        var out = std.array_list.Managed(u8).init(self.alloc);
-        defer out.deinit();
-        out.appendSlice("MCP servers\n\n") catch return;
-        var first = true;
+    /// The mcp.json file that defines (or overrode) the server — the file
+    /// enable/disable/exposure writes back to (pi override semantics use the
+    /// entry's own file; project overrides are read last and win).
+    fn mcpServerConfigPath(self: *TUI, srv: *mcp.Server) []u8 {
+        const base = if (self.cfg) |c| c.base_dir else return self.alloc.dupe(u8, "mcp.json") catch unreachable;
+        if (std.mem.eql(u8, srv.source, "project")) {
+            return std.fmt.allocPrint(self.alloc, "{s}/.pi/mcp.json", .{self.cwd_abs}) catch unreachable;
+        }
+        return std.fmt.allocPrint(self.alloc, "{s}/mcp.json", .{base}) catch unreachable;
+    }
+
+    /// Open the servers menu (pi serversMenu): rows sorted by state
+    /// attention, description = state · exposure · scope.
+    fn openMcpManager(self: *TUI) void {
+        const mgr = mcp.Manager.getGlobal() orelse return;
+        self.menu_mode = .mcp;
+        self.menu_selected = 0;
+        self.menu_view_start = 0;
+        self.sel_len = 0;
+        // attention rank (pi): failed first, then disabled, then connected.
+        const Item = struct { srv: *mcp.Server, rank: u8 };
+        var items: [mcp_max_servers]Item = undefined;
+        var n: usize = 0;
         for (mgr.servers.items) |srv| {
-            // state (pi describeState)
-            var desc = std.array_list.Managed(u8).init(self.alloc);
-            defer desc.deinit();
-            if (!srv.enabled) {
-                desc.appendSlice("disabled") catch break;
-            } else if (srv.connected) {
-                const s = std.fmt.allocPrint(self.alloc, "connected · {d} tool{s}", .{ srv.tools.len, if (srv.tools.len == 1) "" else "s" }) catch break;
-                defer self.alloc.free(s);
-                desc.appendSlice(s) catch break;
-            } else if (srv.error_msg) |e| {
-                desc.appendSlice("failed: ") catch break;
-                desc.appendSlice(e) catch break;
-            } else {
-                desc.appendSlice("starting") catch break;
+            if (n >= mcp_max_servers) break;
+            const rank: u8 = if (!srv.enabled) 1 else if (!srv.connected) 0 else 2;
+            items[n] = .{ .srv = srv, .rank = rank };
+            n += 1;
+        }
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            var j = i;
+            const cur = items[i];
+            while (j > 0 and (items[j - 1].rank > cur.rank or
+                (items[j - 1].rank == cur.rank and std.mem.lessThan(u8, items[j - 1].srv.name, cur.srv.name)))) : (j -= 1)
+            {
+                items[j] = items[j - 1];
             }
-            // exposure (default codemode) + scope (user → global)
-            desc.appendSlice(" · ") catch break;
-            desc.appendSlice(srv.exposure orelse "codemode") catch break;
-            desc.appendSlice(" · ") catch break;
-            desc.appendSlice(if (std.mem.eql(u8, srv.source, "project")) "project" else "global") catch break;
-
-            // line = prefix + name (left-padded to col) + description
-            const prefix: []const u8 = if (first) "→ " else "  ";
-            first = false;
-            out.appendSlice(prefix) catch break;
-            out.appendSlice(srv.name) catch break;
-            for (0..(col - srv.name.len)) |_| out.append(' ') catch break;
-            out.appendSlice(desc.items) catch break;
-            out.append('\n') catch break;
+            items[j] = cur;
         }
-        self.addMessage(out.items);
+        for (items[0..n]) |it| {
+            if (self.sel_len >= SEL_MAX) break;
+            const row = self.sel_len;
+            const desc = self.mcpServerDesc(it.srv);
+            defer self.alloc.free(desc);
+            self.selSetName(row, it.srv.name);
+            self.selSetDesc(row, desc);
+            self.selSetId(row, it.srv.name);
+            self.sel_len += 1;
+        }
+        self.menu_selected = 0;
+        self.menu_view_start = 0;
+        self.refreshSelMenu();
+    }
+
+    const mcp_max_servers = 32;
+
+    /// The actions menu for one server (pi serverMenu): enable/sign-in /
+    /// tools/reconnect/sign-out/exposure/disable, with transport/scope/state
+    /// details.
+    fn openMcpServerMenu(self: *TUI, name: []const u8) void {
+        const mgr = mcp.Manager.getGlobal() orelse return;
+        const srv = mgr.findByName(name) orelse return;
+        self.mcpSetServer(name);
+        self.menu_mode = .mcp_server;
+        self.menu_selected = 0;
+        self.menu_view_start = 0;
+        self.sel_len = 0;
+        var row: usize = 0;
+        if (!srv.enabled) {
+            self.selSetName(row, "Enable");
+            self.selSetDesc(row, "saved to mcp.json");
+            self.selSetId(row, "enable");
+            row += 1;
+        } else {
+            if (srv.connected) {
+                const d = std.fmt.allocPrint(self.alloc, "{d} offered", .{srv.tools.len}) catch return;
+                defer self.alloc.free(d);
+                self.selSetName(row, "Tools");
+                self.selSetDesc(row, d);
+                self.selSetId(row, "tools");
+                row += 1;
+            }
+            self.selSetName(row, "Reconnect");
+            self.selSetDesc(row, "");
+            self.selSetId(row, "reconnect");
+            row += 1;
+            self.selSetName(row, "Exposure");
+            self.selSetDesc(row, srv.exposure orelse "codemode");
+            self.selSetId(row, "exposure");
+            row += 1;
+            self.selSetName(row, "Disable");
+            self.selSetDesc(row, "saved to mcp.json");
+            self.selSetId(row, "disable");
+            row += 1;
+        }
+        self.sel_len = row;
+        self.menu_selected = 0;
+        self.refreshSelMenu();
+    }
+
+    /// The server's tool list (pi showTools): name + first description line;
+    /// Enter goes back.
+    fn openMcpToolsMenu(self: *TUI) void {
+        const mgr = mcp.Manager.getGlobal() orelse return;
+        const srv = mgr.findByName(self.mcpServerName()) orelse return;
+        self.menu_mode = .mcp_tools;
+        self.menu_selected = 0;
+        self.menu_view_start = 0;
+        self.sel_len = 0;
+        for (srv.tools) |t| {
+            if (self.sel_len >= SEL_MAX) break;
+            const row = self.sel_len;
+            // first line of the description
+            var line = t.description;
+            if (std.mem.indexOfScalar(u8, line, '\n')) |nl| line = line[0..nl];
+            self.selSetName(row, t.raw_name);
+            self.selSetDesc(row, line);
+            self.selSetId(row, t.raw_name);
+            self.sel_len += 1;
+        }
+        self.menu_selected = 0;
+        self.refreshSelMenu();
+    }
+
+    /// Exposure choice list (pi chooseExposure): all four values, the
+    /// current one marked ✓.
+    fn openMcpExposureMenu(self: *TUI) void {
+        const mgr = mcp.Manager.getGlobal() orelse return;
+        const srv = mgr.findByName(self.mcpServerName()) orelse return;
+        const current = srv.exposure orelse "codemode";
+        self.menu_mode = .mcp_exposure;
+        self.menu_selected = 0;
+        self.menu_view_start = 0;
+        self.sel_len = 0;
+        const values = [_][]const u8{ "codemode", "direct", "deferred", "hidden" };
+        const descs = [_][]const u8{
+            "not declared; tool_search loads them",
+            "declared to the model",
+            "not declared; tool_search loads them",
+            "unreachable",
+        };
+        for (values, 0..) |v, k| {
+            if (self.sel_len >= SEL_MAX) break;
+            const row = self.sel_len;
+            var name_buf: [80]u8 = undefined;
+            const name = if (std.mem.eql(u8, v, current))
+                std.fmt.bufPrint(&name_buf, "✓ {s}", .{v}) catch v
+            else
+                v;
+            self.selSetName(row, name);
+            self.selSetDesc(row, descs[k]);
+            self.selSetId(row, v);
+            self.sel_len += 1;
+            if (std.mem.eql(u8, v, current)) self.menu_selected = row;
+        }
+        self.refreshSelMenu();
+    }
+
+    /// Remove and re-register one server's tools (after reconnect/exposure/
+    /// enable/disable changes).
+    fn mcpReregisterTools(self: *TUI) void {
+        const mgr = mcp.Manager.getGlobal() orelse return;
+        const srv = mgr.findByName(self.mcpServerName()) orelse return;
+        const prefix = std.fmt.allocPrint(self.alloc, "mcp__{s}__", .{srv.name}) catch return;
+        defer self.alloc.free(prefix);
+        self.session.registry.removeMatchingOn(&.{prefix}, struct {
+            fn pred(patterns: []const []const u8, name: []const u8) bool {
+                return patterns.len > 0 and std.mem.startsWith(u8, name, patterns[0]);
+            }
+        }.pred);
+        _ = srv.registerToolsInto(self.session.registry);
+    }
+
+    /// Enter in the /mcp manager menus. Returns should_exit (always false).
+    fn mcpMenuActivate(self: *TUI) bool {
+        switch (self.menu_mode) {
+            .mcp => {
+                const name = self.selRowId();
+                if (name.len == 0) return false;
+                self.openMcpServerMenu(name);
+                self.redraw();
+                return false;
+            },
+            .mcp_server => {
+                const action = self.selRowId();
+                const mgr = mcp.Manager.getGlobal() orelse return false;
+                const srv = mgr.findByName(self.mcpServerName()) orelse return false;
+                const path = self.mcpServerConfigPath(srv);
+                defer self.alloc.free(path);
+                if (std.mem.eql(u8, action, "enable") or std.mem.eql(u8, action, "disable")) {
+                    const want = std.mem.eql(u8, action, "enable");
+                    _ = mcp.setEntryField(self.alloc, self.io, path, srv.name, "enabled", if (want) "true" else "false") catch false;
+                    srv.enabled = want;
+                    if (want) {
+                        if (srv.error_msg) |em| {
+                            self.alloc.free(em);
+                            srv.error_msg = null;
+                        }
+                        if (mgr.reconnectServer(srv.name)) {
+                            self.mcpReregisterTools();
+                            self.note("{s} connected", .{srv.name});
+                        } else {
+                            self.note("{s} reconnect failed", .{srv.name});
+                        }
+                    } else {
+                        _ = mgr.reconnectServer(srv.name); // fails fast: disabled
+                        srv.enabled = false;
+                        if (srv.error_msg) |em| {
+                            self.alloc.free(em);
+                            srv.error_msg = null;
+                        }
+                        srv.error_msg = self.alloc.dupe(u8, "disabled") catch null;
+                        mcp.teardownProcess(srv);
+                        self.mcpReregisterTools();
+                        self.note("{s} disabled", .{srv.name});
+                    }
+                } else if (std.mem.eql(u8, action, "reconnect")) {
+                    if (mgr.reconnectServer(srv.name)) {
+                        self.mcpReregisterTools();
+                        self.note("{s} connected ({d} tools)", .{ srv.name, srv.tools.len });
+                    } else {
+                        self.mcpReregisterTools();
+                        self.note("{s} reconnect failed: {s}", .{ srv.name, srv.error_msg orelse "?" });
+                    }
+                } else if (std.mem.eql(u8, action, "tools")) {
+                    self.openMcpToolsMenu();
+                    self.redraw();
+                    return false;
+                } else if (std.mem.eql(u8, action, "exposure")) {
+                    self.openMcpExposureMenu();
+                    self.redraw();
+                    return false;
+                }
+                self.openMcpServerMenu(self.mcpServerName());
+                self.redraw();
+                return false;
+            },
+            .mcp_tools => {
+                self.openMcpServerMenu(self.mcpServerName());
+                self.redraw();
+                return false;
+            },
+            .mcp_exposure => {
+                const value = self.selRowId();
+                if (value.len > 0) {
+                    const mgr = mcp.Manager.getGlobal() orelse return false;
+                    const srv = mgr.findByName(self.mcpServerName()) orelse return false;
+                    const path = self.mcpServerConfigPath(srv);
+                    defer self.alloc.free(path);
+                    const vj = std.fmt.allocPrint(self.alloc, "\"{s}\"", .{value}) catch return false;
+                    defer self.alloc.free(vj);
+                    _ = mcp.setEntryField(self.alloc, self.io, path, srv.name, "exposure", vj) catch false;
+                    if (srv.exposure) |old| self.alloc.free(old);
+                    srv.exposure = self.alloc.dupe(u8, value) catch null;
+                    self.mcpReregisterTools();
+                    self.note("{s} exposure set to {s}", .{ srv.name, value });
+                }
+                self.openMcpServerMenu(self.mcpServerName());
+                self.redraw();
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// ESC in the /mcp manager: back one level (servers menu closes).
+    fn mcpMenuCancel(self: *TUI) void {
+        switch (self.menu_mode) {
+            .mcp_server, .mcp_tools, .mcp_exposure => self.openMcpManager(),
+            else => self.menu_mode = .hidden,
+        }
+        self.redraw();
     }
 
     /// Send text as a user prompt with the full submit ceremony (display,
@@ -4373,7 +4962,13 @@ pub const TUI = struct {
         if (std.mem.eql(u8, word, "/model")) {
             const cfg = self.cfg;
             if (arg.len == 0) {
-                if (cfg) |c| {
+                if (cfg != null and cfg.?.models.items.len > 0) {
+                    // pi /model (no argument): open the model selector. Our
+                    // selector is the editor completion menu with an empty
+                    // query (every model listed, fuzzy-filterable by typing).
+                    self.editor.setText("/model ") catch {};
+                    self.updateMenu();
+                } else if (cfg) |c| {
                     var aw: std.Io.Writer.Allocating = .init(self.alloc);
                     defer aw.deinit();
                     const lw = &aw.writer;
@@ -4389,14 +4984,26 @@ pub const TUI = struct {
                 self.redraw();
                 return false;
             }
-            // /model <name>: fuzzy-find and switch directly.
+            // /model <name>: fuzzy-find (pi fuzzy scoring, best match wins)
+            // and switch directly. "provider/id" is also matched exactly.
             if (cfg) |c| {
                 var best: ?usize = null;
-                var best_score: u32 = 0;
+                var best_score: i64 = std.math.maxInt(i64);
                 for (c.models.items, 0..) |m, idx| {
-                    if (fuzzyScore(m.name, arg)) |s| {
-                        if (s > best_score) {
-                            best_score = s;
+                    var hit: ?i64 = null;
+                    if (std.mem.eql(u8, m.id, arg)) {
+                        hit = -10000;
+                    } else blk: {
+                        const pid = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ m.provider, m.id }) catch break :blk;
+                        defer self.alloc.free(pid);
+                        if (std.mem.eql(u8, pid, arg)) hit = -9999;
+                    }
+                    if (hit == null) {
+                        hit = fuzzy.fuzzyMatch(self.alloc, arg, m.id) orelse fuzzy.fuzzyMatch(self.alloc, arg, m.name);
+                    }
+                    if (hit) |sc| {
+                        if (sc < best_score) {
+                            best_score = sc;
                             best = idx;
                         }
                     }
@@ -4782,7 +5389,9 @@ pub const TUI = struct {
             // Modal dialogs swallow the global bindings (scroll, search,
             // ctrl+c/d exit, paste...) — only the dialog's own keys respond.
             const modal_open = self.menu_mode == .settings or self.menu_mode == .sessions or
-                self.menu_mode == .tree or self.menu_mode == .forksel;
+                self.menu_mode == .tree or self.menu_mode == .forksel or
+                self.menu_mode == .mcp or self.menu_mode == .mcp_server or
+                self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure;
             if (key == .unknown and !modal_open) {
                 // Timer tick (scrollbar hide deadline / throttled wheel-flush
                 // tail). Stats don't change on a timer — the cached-footer
@@ -5034,11 +5643,11 @@ pub const TUI = struct {
             }
             if (self.menu_mode == .files) {
                 if (self.bindings.matches(key, .menu_up)) {
-                    if (self.menu_selected > 0) self.menu_selected -= 1;
+                    self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_down)) {
-                    if (self.menu_selected + 1 < self.menu_len) self.menu_selected += 1;
+                    self.menu_selected = if (self.menu_selected + 1 >= self.menu_len) 0 else self.menu_selected + 1;
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_close)) {
@@ -5064,11 +5673,11 @@ pub const TUI = struct {
             if (self.menu_mode == .settings) {
                 // Modal settings selector: only menu keys respond.
                 if (self.bindings.matches(key, .menu_up)) {
-                    if (self.menu_selected > 0) self.menu_selected -= 1;
+                    self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_down)) {
-                    if (self.menu_selected + 1 < self.menu_len) self.menu_selected += 1;
+                    self.menu_selected = if (self.menu_selected + 1 >= self.menu_len) 0 else self.menu_selected + 1;
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_close)) {
@@ -5088,12 +5697,12 @@ pub const TUI = struct {
                 // TreeSelector): arrows + Enter; the sessions picker also
                 // filters on typed characters and deletes with ctrl+d.
                 if (self.bindings.matches(key, .menu_up)) {
-                    if (self.menu_selected > 0) self.menu_selected -= 1;
+                    self.menu_selected = if (self.menu_selected == 0) self.sel_len - 1 else self.menu_selected - 1;
                     self.scrollSelMenu();
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_down)) {
-                    if (self.menu_selected + 1 < self.sel_len) self.menu_selected += 1;
+                    self.menu_selected = if (self.menu_selected + 1 >= self.sel_len) 0 else self.menu_selected + 1;
                     self.scrollSelMenu();
                     self.redraw();
                     continue;
@@ -5140,17 +5749,36 @@ pub const TUI = struct {
                 continue; // swallow everything else while a picker is open
             }
             if (self.menu_mode != .hidden) {
+                const is_mcp = self.menu_mode == .mcp or self.menu_mode == .mcp_server or
+                    self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure;
+                // pi SelectList.handleInput: up/down WRAP AROUND; pgup/pgdn
+                // move by one page (clamped to the bounds).
                 if (self.bindings.matches(key, .menu_up)) {
-                    if (self.menu_selected > 0) self.menu_selected -= 1;
+                    self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_down)) {
-                    if (self.menu_selected + 1 < self.menu_len) self.menu_selected += 1;
+                    self.menu_selected = if (self.menu_selected + 1 >= self.menu_len) 0 else self.menu_selected + 1;
+                    self.redraw();
+                    continue;
+                } else if (key == .page_up or key == .page_down) {
+                    // pi getSelectPageIndex: target = clamp(sel ± pageSize).
+                    const page = self.menuMaxVisible();
+                    if (key == .page_up) {
+                        self.menu_selected = if (self.menu_selected > page) self.menu_selected - page else 0;
+                    } else {
+                        const rest = self.menu_len - 1 - self.menu_selected;
+                        self.menu_selected = if (rest > page) self.menu_selected + page else self.menu_len - 1;
+                    }
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_close)) {
-                    self.menu_mode = .hidden;
-                    self.redraw();
+                    if (is_mcp) {
+                        self.mcpMenuCancel();
+                    } else {
+                        self.menu_mode = .hidden;
+                        self.redraw();
+                    }
                     continue;
                 } else if (self.bindings.matches(key, .menu_tab)) {
                     self.menuComplete();
@@ -5162,6 +5790,10 @@ pub const TUI = struct {
                     self.updateMenu();
                     self.redraw();
                     if (should_exit) break;
+                    continue;
+                } else if (is_mcp) {
+                    // The manager menu swallows everything else (pi
+                    // McpManagerView handles only menu keys).
                     continue;
                 }
             }

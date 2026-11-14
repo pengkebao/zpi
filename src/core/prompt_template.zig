@@ -19,6 +19,9 @@ pub const Template = struct {
     name: []u8,
     content: []u8, // body after frontmatter strip (owned)
     description: []u8, // frontmatter description or first line (owned)
+    /// Autocomplete source tag scope: "u" user (~/.pi/agent) or "p" project
+    /// (pi getAutocompleteSourceTag renders it as `[u]`/`[p]` prefix).
+    scope: []const u8 = "p",
 };
 
 /// Discover templates: agent_dir/prompts + cwd/.pi/prompts. Later entries
@@ -28,14 +31,14 @@ pub fn discover(alloc: std.mem.Allocator, io: std.Io, agent_dir: []const u8, cwd
     // Project first so user-level entries cannot shadow project ones.
     const proj = std.fmt.allocPrint(alloc, "{s}/.pi/prompts", .{cwd}) catch return list.toOwnedSlice() catch return &.{};
     defer alloc.free(proj);
-    addDir(&list, alloc, io, proj);
+    addDir(&list, alloc, io, proj, "p");
     const glob = std.fmt.allocPrint(alloc, "{s}/prompts", .{agent_dir}) catch return list.toOwnedSlice() catch return &.{};
     defer alloc.free(glob);
-    addDir(&list, alloc, io, glob);
+    addDir(&list, alloc, io, glob, "u");
     return list.toOwnedSlice() catch return &.{};
 }
 
-fn addDir(list: *std.array_list.Managed(Template), alloc: std.mem.Allocator, io: std.Io, dir_path: []const u8) void {
+fn addDir(list: *std.array_list.Managed(Template), alloc: std.mem.Allocator, io: std.Io, dir_path: []const u8, scope: []const u8) void {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return;
     defer dir.close(io);
     var it = dir.iterateAssumeFirstIteration();
@@ -59,6 +62,7 @@ fn addDir(list: *std.array_list.Managed(Template), alloc: std.mem.Allocator, io:
                 continue;
             },
             .description = firstLine(body, alloc) catch alloc.dupe(u8, "") catch "",
+            .scope = scope,
         };
         list.append(t) catch {
             alloc.free(t.name);

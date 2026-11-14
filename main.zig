@@ -684,6 +684,7 @@ pub fn main(init: std.process.Init) !void {
         defer alloc.free(auth_path);
         mgr.auth_path = auth_path;
         mcp.Manager.setGlobal(mgr);
+        mgr.rememberConfigs(cfgs);
         mgr.connectAll(cfgs);
         _ = mgr.registerTools(&registry);
         _ = mcp.registerResourceTools(mgr, &registry);
@@ -1029,6 +1030,7 @@ pub fn main(init: std.process.Init) !void {
     } else {
         // TUI mode
         var t = tui.TUI.init(io, alloc, &session, model.name, sessions_dir, cwd_abs, home_dir, &cfg, init.minimal.environ, append_system_prompt, system_prompt_override);
+        t.initLate();
         defer t.deinit();
         // Persisted history → visible transcript (pi: renderInitialMessages
         // runs whenever the session has messages — continue/resume/--session).
