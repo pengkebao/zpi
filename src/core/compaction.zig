@@ -556,7 +556,7 @@ pub fn generateSummary(
     var sess = SummarySession.init(alloc, abort_check);
     defer sess.deinit();
     // Compaction is a cheap summarization call: no reasoning effort.
-    provider.streamChat(model_id, wire.items, "[]", true, config.ThinkingLevel.off, &sess) catch |e| {
+    provider.streamChat(model_id, wire.items, "[]", true, config.ThinkingLevel.off, .{}, &sess) catch |e| {
         if (e == error.Aborted) return e;
         return e;
     };

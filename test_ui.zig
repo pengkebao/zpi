@@ -688,3 +688,23 @@ test "compaction.isOverflowError matches pi OVERFLOW_PATTERNS subset" {
     try std.testing.expect(!c.isOverflowError("connection refused"));
     try std.testing.expect(!c.isOverflowError(""));
 }
+
+test "config.splitThinkingSuffix parses provider/model:level" {
+    const cfgmod = @import("src/core/config.zig");
+    // valid suffix on provider/model form
+    const r1 = cfgmod.splitThinkingSuffix("ovf/ovf-mini:high").?;
+    try std.testing.expectEqualStrings("ovf/ovf-mini", r1.base);
+    try std.testing.expect(r1.level == .high);
+    // bare id form
+    const r2 = cfgmod.splitThinkingSuffix("glm-5.3:xhigh").?;
+    try std.testing.expectEqualStrings("glm-5.3", r2.base);
+    try std.testing.expect(r2.level == .xhigh);
+    // off is a valid level
+    try std.testing.expect(cfgmod.splitThinkingSuffix("m:off") != null);
+    // invalid suffix → null (strict: text kept whole)
+    try std.testing.expect(cfgmod.splitThinkingSuffix("m:turbo") == null);
+    // no colon → null
+    try std.testing.expect(cfgmod.splitThinkingSuffix("m") == null);
+    // empty suffix → null
+    try std.testing.expect(cfgmod.splitThinkingSuffix("m:") == null);
+}

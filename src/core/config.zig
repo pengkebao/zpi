@@ -60,6 +60,21 @@ pub const ThinkingLevel = enum {
     }
 };
 
+/// Provider-specific thinking parameter format (pi-ai compat.thinkingFormat):
+/// .default → `reasoning_effort`; .zai → `thinking:{type:enabled|disabled}`
+/// (GLM series); .qwen → `enable_thinking` (DashScope/Qwen).
+pub const ThinkingFormat = enum { default, zai, qwen };
+
+/// Split a trailing `:level` thinking suffix (pi splitThinkingSuffix):
+/// `ovf/ovf-mini:high` → base "ovf/ovf-mini", level .high. Returns null
+/// when there is no colon or the suffix is not a valid level (strict —
+/// the text is then kept whole).
+pub fn splitThinkingSuffix(text: []const u8) ?struct { base: []const u8, level: ThinkingLevel } {
+    const ci = std.mem.lastIndexOfScalar(u8, text, ':') orelse return null;
+    const level = ThinkingLevel.fromStr(text[ci + 1 ..]) orelse return null;
+    return .{ .base = text[0..ci], .level = level };
+}
+
 /// Fullscreen scrollbar visibility (settings.json "fullscreenScrollbar").
 pub const ScrollbarMode = enum { auto, always, hidden };
 
@@ -91,6 +106,16 @@ pub const Config = struct {
         /// Default thinking/reasoning effort for this model (drives border
         /// color + reasoning effort). Can be changed at runtime via /think.
         thinking_level: ThinkingLevel = .off,
+        /// Provider-specific thinking parameter shape (models.json
+        /// "thinkingFormat", pi-ai compat.thinkingFormat).
+        thinking_format: ThinkingFormat = .default,
+        /// "supportsReasoningEffort": zai/qwen models may also accept a
+        /// (mapped) reasoning_effort alongside their switch field.
+        /// null = auto-detect from the base URL (pi detected-compat).
+        supports_reasoning_effort: ?bool = null,
+        /// "thinkingLevelMap": maps a level name to a provider-specific
+        /// effort string sent as reasoning_effort (index = @intFromEnum).
+        thinking_level_map: [6]?[]u8 = .{null, null, null, null, null, null},
         /// Whether the model accepts image input (gates image content blocks).
         supports_images: bool = true,
         // USD per million tokens; null = unknown (cost stays 0)
@@ -107,6 +132,7 @@ pub const Config = struct {
             alloc.free(m.name);
             alloc.free(m.base_url);
             alloc.free(m.api_key);
+            for (m.thinking_level_map) |slot| if (slot) |s| alloc.free(s);
         }
         self.models.deinit();
         if (self.default_provider) |dp| alloc.free(dp);
@@ -205,6 +231,15 @@ fn strIn(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = o.get(key) orelse return null;
     return switch (v) {
         .string => |s| s,
+        else => null,
+    };
+}
+
+/// tri-state bool from a JSON object field: true/false/null (absent).
+fn triBoolIn(o: std.json.ObjectMap, key: []const u8) ?bool {
+    const v = o.get(key) orelse return null;
+    return switch (v) {
+        .bool => |b| b,
         else => null,
     };
 }
@@ -511,6 +546,27 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                     .max_tokens = numIn(mo, "maxTokens") orelse 16384,
                     .reasoning = boolIn(mo, "reasoning", false),
                     .thinking_level = ThinkingLevel.defaultFor(boolIn(mo, "reasoning", false), strIn(mo, "thinkingLevel")),
+                    .thinking_format = blk_tf: {
+                        const tf = strIn(mo, "thinkingFormat") orelse break :blk_tf .default;
+                        if (std.mem.eql(u8, tf, "zai")) break :blk_tf .zai;
+                        if (std.mem.eql(u8, tf, "qwen")) break :blk_tf .qwen;
+                        break :blk_tf .default;
+                    },
+                    .supports_reasoning_effort = triBoolIn(mo, "supportsReasoningEffort"),
+                    .thinking_level_map = blk_tm: {
+                        var map = [6]?[]u8{null, null, null, null, null, null};
+                        if (mo.get("thinkingLevelMap")) |tm| {
+                            if (tm == .object) {
+                                for (&map, 0..) |*slot, li| {
+                                    const lv_name = @as(ThinkingLevel, @enumFromInt(li)).name();
+                                    if (tm.object.get(lv_name)) |v| {
+                                        if (v == .string) slot.* = alloc.dupe(u8, v.string) catch null;
+                                    }
+                                }
+                            }
+                        }
+                        break :blk_tm map;
+                    },
                     .cost_input = costIn(mo, "input"),
                     .cost_output = costIn(mo, "output"),
                     .cost_cache_read = costIn(mo, "cacheRead"),

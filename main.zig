@@ -104,6 +104,7 @@ pub fn main(init: std.process.Init) !void {
     var print_mode = false;
     var prompt: ?[]const u8 = null;
     var model_name: ?[]const u8 = null;
+    var cli_thinking: ?config.ThinkingLevel = null;
     var model_id: ?[]const u8 = null;
     var cwd: ?[]const u8 = null;
     var no_tui = false;
@@ -135,6 +136,16 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
         } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--model")) {
             if (i + 1 < argv.items.len) model_name = argv.items[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--thinking")) {
+            if (i + 1 < argv.items.len) {
+                const lv = argv.items[i + 1];
+                if (config.ThinkingLevel.fromStr(lv)) |tl| {
+                    cli_thinking = tl;
+                } else {
+                    std.debug.print("warning: invalid thinking level \"{s}\" (valid: off, low, medium, high, xhigh, max)\n", .{lv});
+                }
+            }
             i += 1;
         } else if (std.mem.eql(u8, arg, "--model-id")) {
             if (i + 1 < argv.items.len) model_id = argv.items[i + 1];
@@ -211,17 +222,42 @@ pub fn main(init: std.process.Init) !void {
     // Select model: -m/--model-id > settings.json default > first
     var model: config.Config.Model = blk: {
         if (model_name) |name| {
-            if (cfg.findModel(name)) |m| break :blk m.*;
+            // pi resolveModelReference: exact reference first, then a
+            // `:level` thinking suffix split (strict — an invalid suffix
+            // keeps the text whole and fails). Explicit --thinking wins
+            // over the suffix (pi main.js).
+            if (cfg.findModel(name)) |m| {
+                var mm = m.*;
+                if (cli_thinking) |tl| mm.thinking_level = tl;
+                break :blk mm;
+            }
+            if (config.splitThinkingSuffix(name)) |suffix| {
+                if (cfg.findModel(suffix.base)) |m| {
+                    var mm = m.*;
+                    mm.thinking_level = cli_thinking orelse suffix.level;
+                    break :blk mm;
+                }
+            }
             std.debug.print("error: unknown model '{s}' (use --list-models)\n", .{name});
             return error.UnknownModel;
         }
         if (model_id) |id| {
-            if (cfg.findModel(id)) |m| break :blk m.*;
+            if (cfg.findModel(id)) |m| {
+                var mm = m.*;
+                if (cli_thinking) |tl| mm.thinking_level = tl;
+                break :blk mm;
+            }
             std.debug.print("error: unknown model id '{s}' (use --list-models)\n", .{id});
             return error.UnknownModel;
         }
-        if (cfg.findDefaultModel()) |m| break :blk m.*;
-        break :blk cfg.models.items[0];
+        if (cfg.findDefaultModel()) |m| {
+            var mm = m.*;
+            if (cli_thinking) |tl| mm.thinking_level = tl;
+            break :blk mm;
+        }
+        var mm = cfg.models.items[0];
+        if (cli_thinking) |tl| mm.thinking_level = tl;
+        break :blk mm;
     };
 
     // Init provider

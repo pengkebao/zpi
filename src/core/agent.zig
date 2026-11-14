@@ -555,6 +555,12 @@ pub const Session = struct {
                 tools_json,
                 self.model.supports_images,
                 self.thinking_level,
+                .{
+                    .format = self.model.thinking_format,
+                    .map = &self.model.thinking_level_map,
+                    .reasoning = self.model.reasoning,
+                    .supports_effort = self.model.supports_reasoning_effort,
+                },
                 self,
             ) catch |e| {
                 if (e == error.Aborted) {

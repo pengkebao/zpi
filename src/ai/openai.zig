@@ -63,6 +63,25 @@ pub const OpenAiProvider = struct {
 
     pub const StreamOutcome = enum { ok, transport_error, retryable_status, fatal_status };
 
+    /// Provider-specific thinking parameter shape (pi-ai compat.thinkingFormat
+    /// + model.thinkingLevelMap), threaded through streamChat from the model.
+    pub const ThinkingInfo = struct {
+        format: config.ThinkingFormat = .default,
+        /// thinkingLevelMap slots (index = @intFromEnum(level)); null = unset.
+        map: ?*const [6]?[]u8 = null,
+        reasoning: bool = false,
+        /// null = auto-detect from base URL (zai endpoints → false).
+        supports_effort: ?bool = null,
+
+        /// pi: mappedEffort ?? level name.
+        fn effortFor(self: ThinkingInfo, level: config.ThinkingLevel) []const u8 {
+            if (self.map) |m| {
+                if (m[@intFromEnum(level)]) |mapped| return mapped;
+            }
+            return level.name();
+        }
+    };
+
     const max_retries: usize = 3;
 
     fn hasStreamedOutput(self: *OpenAiProvider, session: anytype) bool {
@@ -81,12 +100,27 @@ pub const OpenAiProvider = struct {
         tools_json: []const u8,
         supports_images: bool,
         thinking_level: config.ThinkingLevel,
+        tinfo: ThinkingInfo,
         session: anytype,
     ) !void {
+        // pi detected-compat defaults from the base URL: zai endpoints use
+        // the thinking switch without reasoning_effort; other endpoints
+        // default to accepting a (mapped) reasoning_effort.
+        var info = tinfo;
+        const is_zai_url = std.mem.indexOf(u8, self.base_url, "api.z.ai") != null or
+            std.mem.indexOf(u8, self.base_url, "open.bigmodel.cn") != null;
+        if (info.format == .default and is_zai_url) info.format = .zai;
+        if (info.supports_effort == null) info.supports_effort = !is_zai_url;
+
         // Build JSON body
         var body = std.array_list.Managed(u8).init(self.alloc);
         defer body.deinit();
-        try self.buildBody(&body, model, messages, tools_json, supports_images, thinking_level);
+        try self.buildBody(&body, model, messages, tools_json, supports_images, thinking_level, .{
+            .format = info.format,
+            .map = info.map,
+            .reasoning = info.reasoning,
+            .supports_effort = info.supports_effort.?,
+        });
 
         // Build URL
         const url_str = std.fmt.allocPrint(self.alloc, "{s}/chat/completions", .{self.base_url}) catch return error.OutOfMemory;
@@ -203,6 +237,7 @@ pub const OpenAiProvider = struct {
         tools_json: []const u8,
         supports_images: bool,
         thinking_level: config.ThinkingLevel,
+        tinfo: ThinkingInfo,
     ) !void {
         try body.appendSlice("{");
         const model_part = std.fmt.allocPrint(self.alloc, "\"model\":\"{s}\",", .{model}) catch return error.OutOfMemory;
@@ -340,13 +375,47 @@ pub const OpenAiProvider = struct {
             try body.appendSlice(tools_json);
         }
 
-        // Reasoning effort (OpenAI-compatible). Sent only when a thinking level
-        // is active; off sends nothing so non-reasoning models are unaffected.
-        switch (thinking_level) {
-            .off => {},
-            .low => try body.appendSlice(",\"reasoning_effort\":\"low\""),
-            .medium => try body.appendSlice(",\"reasoning_effort\":\"medium\""),
-            .high, .xhigh, .max => try body.appendSlice(",\"reasoning_effort\":\"high\""),
+        // Thinking parameters (pi openai-completions thinkingFormat semantics).
+        // .default sends reasoning_effort; zai sends thinking:{type} (GLM);
+        // qwen sends enable_thinking (DashScope). Only sent when a thinking
+        // level is active; off sends nothing so non-reasoning models are
+        // unaffected (except zai/qwen reasoning models, which get an explicit
+        // disabled switch).
+        switch (tinfo.format) {
+            .default => if (thinking_level != .off and (tinfo.supports_effort orelse true)) {
+                // pi: reasoning_effort = thinkingLevelMap[level] ?? level
+                // (xhigh/max pass through for models that support them).
+                var effort_buf: [64]u8 = undefined;
+                const effort = tinfo.effortFor(thinking_level);
+                const part = std.fmt.bufPrint(&effort_buf, ",\"reasoning_effort\":\"{s}\"", .{effort}) catch "";
+                try body.appendSlice(part);
+            },
+            .zai => if (tinfo.reasoning) {
+                if (thinking_level == .off) {
+                    try body.appendSlice(",\"thinking\":{\"type\":\"disabled\"}");
+                } else {
+                    try body.appendSlice(",\"thinking\":{\"type\":\"enabled\",\"clear_thinking\":false}");
+                    if (tinfo.supports_effort orelse false) {
+                        var effort_buf: [64]u8 = undefined;
+                        const effort = tinfo.effortFor(thinking_level);
+                        const part = std.fmt.bufPrint(&effort_buf, ",\"reasoning_effort\":\"{s}\"", .{effort}) catch "";
+                        try body.appendSlice(part);
+                    }
+                }
+            },
+            .qwen => if (tinfo.reasoning) {
+                if (thinking_level == .off) {
+                    try body.appendSlice(",\"enable_thinking\":false");
+                } else {
+                    try body.appendSlice(",\"enable_thinking\":true");
+                    if (tinfo.supports_effort orelse false) {
+                        var effort_buf: [64]u8 = undefined;
+                        const effort = tinfo.effortFor(thinking_level);
+                        const part = std.fmt.bufPrint(&effort_buf, ",\"reasoning_effort\":\"{s}\"", .{effort}) catch "";
+                        try body.appendSlice(part);
+                    }
+                }
+            },
         }
 
         try body.append('}');
@@ -548,3 +617,90 @@ fn writeJsonStr(body: *std.array_list.Managed(u8), s: []const u8) !void {
 }
 
 
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+test "buildBody default format sends reasoning_effort" {
+    const p = OpenAiProvider{
+        .alloc = std.testing.allocator,
+        .io = undefined,
+        .base_url = @constCast("http://x"),
+        .api_key = "",
+        .client = undefined,
+    };
+    var body = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer body.deinit();
+    var user_blocks = [_]msg.ContentBlock{.{ .text = "hi" }};
+    var msgs = [_]OpenAiProvider.ChatMessage{.{ .role = .user, .blocks = &user_blocks }};
+    try p.buildBody(&body, "m", &msgs, "", false, .high, .{});
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinking\"") == null);
+}
+
+test "buildBody zai format sends thinking switch" {
+    const p = OpenAiProvider{
+        .alloc = std.testing.allocator,
+        .io = undefined,
+        .base_url = @constCast("http://x"),
+        .api_key = "",
+        .client = undefined,
+    };
+    var body = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer body.deinit();
+    var user_blocks = [_]msg.ContentBlock{.{ .text = "hi" }};
+    var msgs = [_]OpenAiProvider.ChatMessage{.{ .role = .user, .blocks = &user_blocks }};
+    // reasoning model + thinking on → enabled switch
+    try p.buildBody(&body, "m", &msgs, "", false, .high, .{ .format = .zai, .reasoning = true });
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinking\":{\"type\":\"enabled\",\"clear_thinking\":false}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "reasoning_effort") == null);
+    // off → explicit disabled switch
+    body.clearRetainingCapacity();
+    try p.buildBody(&body, "m", &msgs, "", false, .off, .{ .format = .zai, .reasoning = true });
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinking\":{\"type\":\"disabled\"}") != null);
+    // non-reasoning model → nothing
+    body.clearRetainingCapacity();
+    try p.buildBody(&body, "m", &msgs, "", false, .high, .{ .format = .zai, .reasoning = false });
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thinking\"") == null);
+}
+
+test "buildBody qwen format sends enable_thinking" {
+    const p = OpenAiProvider{
+        .alloc = std.testing.allocator,
+        .io = undefined,
+        .base_url = @constCast("http://x"),
+        .api_key = "",
+        .client = undefined,
+    };
+    var body = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer body.deinit();
+    var user_blocks = [_]msg.ContentBlock{.{ .text = "hi" }};
+    var msgs = [_]OpenAiProvider.ChatMessage{.{ .role = .user, .blocks = &user_blocks }};
+    try p.buildBody(&body, "m", &msgs, "", false, .medium, .{ .format = .qwen, .reasoning = true });
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"enable_thinking\":true") != null);
+    body.clearRetainingCapacity();
+    try p.buildBody(&body, "m", &msgs, "", false, .off, .{ .format = .qwen, .reasoning = true });
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"enable_thinking\":false") != null);
+}
+
+test "buildBody thinkingLevelMap remaps effort" {
+    const p = OpenAiProvider{
+        .alloc = std.testing.allocator,
+        .io = undefined,
+        .base_url = @constCast("http://x"),
+        .api_key = "",
+        .client = undefined,
+    };
+    var map = [6]?[]u8{ null, null, null, null, std.testing.allocator.dupe(u8, "high_v2") catch unreachable, null };
+    defer std.testing.allocator.free(map[4].?);
+    var body = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer body.deinit();
+    var user_blocks = [_]msg.ContentBlock{.{ .text = "hi" }};
+    var msgs = [_]OpenAiProvider.ChatMessage{.{ .role = .user, .blocks = &user_blocks }};
+    // zai + supports_effort + map[xhigh]="high_v2" → mapped string
+    try p.buildBody(&body, "m", &msgs, "", false, .xhigh, .{ .format = .zai, .reasoning = true, .supports_effort = true, .map = &map });
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"reasoning_effort\":\"high_v2\"") != null);
+    // unmapped level falls back to the level name (pi: mappedEffort ?? level)
+    body.clearRetainingCapacity();
+    try p.buildBody(&body, "m", &msgs, "", false, .low, .{ .format = .zai, .reasoning = true, .supports_effort = true, .map = &map });
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"reasoning_effort\":\"low\"") != null);
+}

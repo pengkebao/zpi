@@ -36,7 +36,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | 流式输出（text delta） | ✅ | ✅ | SSE 逐行解析（包级节奏） |
 | 流式 tool_call 增量合并 | ✅ | ✅ | index 合并 |
 | thinking/reasoning 块 | ✅ | ✅ | reasoning_content/reasoning/reasoning_text 三形态；TUI Ctrl+T 折叠 |
-| thinking 级别 + thinkingLevelMap | ✅ | ⚠️ | off…xhigh 循环（shift+tab）+ reasoning_effort 发送 + 模型默认级别；缺 `--thinking` CLI、`provider/model:level` 后缀、zai/qwen thinkingFormat 映射 |
+| thinking 级别 + thinkingLevelMap | ✅ | ✅ | off…xhigh/max 循环（shift+tab）+ `--thinking` CLI（显式优先）+ `provider/model:level` 后缀（pi splitThinkingSuffix strict 语义）+ thinkingFormat 三形态（default=reasoning_effort 直传 / zai=thinking:{type} / qwen=enable_thinking）+ thinkingLevelMap 映射 + models.json thinkingFormat/supportsReasoningEffort（三态，zai 域名 URL 自动检测）|
 | steering（运行中插话） | ✅ | ✅ | Enter 队列；每轮 LLM 请求前注入（drainSteeringIntoContext） |
 | follow-up（任务结束后续跑） | ✅ | ✅ | Alt+Enter 队列（运行中）；空闲时 = 普通提交（pi handleFollowUp 尾分支） |
 | 中断（Escape / Ctrl+C） | ✅ | ✅ | HTTP 流停止；已流出 thinking/text 保留；未执行 tool_call 补 "aborted by user" 错误结果（wire 合法） |
