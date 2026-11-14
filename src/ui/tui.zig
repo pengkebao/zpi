@@ -843,6 +843,88 @@ pub const TUI = struct {
                         }
                     }
                 }
+                // pi: the editor stays interactive while the agent runs.
+                // Typing edits the buffer live; enter submits it to the
+                // steering queue (injected before the next LLM request);
+                // alt+enter queues a follow-up (new turn after this one);
+                // alt+up restores a queued follow-up to the editor. Ctrl
+                // combos and keys we don't handle here keep the old capture
+                // and replay behavior below.
+                if (keys.parseSequence(seq, self.key_reader.kitty_active)) |k| {
+                    const steering_key: bool = switch (k) {
+                        .enter, .backspace, .space, .shift_enter, .left, .right, .up, .down, .home, .end, .delete => true,
+                        .char => |ch| !ch.ctrl and !ch.alt,
+                        .text => true,
+                        else => false,
+                    };
+                    // alt+enter arrives as char{c='\r', alt=true} — a
+                    // follow-up queue submit, not an editor newline. Checked
+                    // BEFORE the editor keys (steering_key is false for it).
+                    // NOTE: render calls (note/addUserMessage) happen AFTER
+                    // the unlock — they take render_mutex themselves, and
+                    // this mutex is not recursive.
+                    if (k == .char and k.char.alt and k.char.c == '\r') {
+                        self.render_mutex.lockUncancelable(self.io);
+                        const text = self.editor.getText() catch "";
+                        defer self.alloc.free(@constCast(text));
+                        const has_text = text.len > 0;
+                        if (has_text) {
+                            self.session.queueFollowUp(text);
+                            self.editor.clear() catch {};
+                        }
+                        self.render_mutex.unlock(self.io);
+                        if (has_text) {
+                            self.note("\x1b[90m[follow-up queued — alt+up to restore]\x1b[0m", .{});
+                            // Watcher thread: render from cached footer stats
+                            // (self.redraw() walks the session on the main
+                            // thread only, and the agent thread is appending
+                            // to it right now).
+                            self.redrawCached();
+                        }
+                        acted = true;
+                        continue;
+                    }
+                    if (steering_key) {
+                        if (k == .enter) {
+                            // Enter while running: steer the current turn.
+                            self.render_mutex.lockUncancelable(self.io);
+                            const text = self.editor.getText() catch "";
+                            defer self.alloc.free(@constCast(text));
+                            const has_text = text.len > 0;
+                            if (has_text) {
+                                self.session.queueSteering(text);
+                                self.editor.clear() catch {};
+                            }
+                            self.render_mutex.unlock(self.io);
+                            if (has_text) {
+                                self.addUserMessage(text);
+                                self.render_mutex.lock(self.io) catch {};
+                                self.sv.scrollToEnd(ss.nowMs(self.io));
+                                self.render_mutex.unlock(self.io);
+                                self.redrawCached();
+                            }
+                            acted = true;
+                            continue;
+                        }
+                        self.render_mutex.lockUncancelable(self.io);
+                        _ = self.editor.handleKey(k, self.io) catch {};
+                        self.render_mutex.unlock(self.io);
+                        acted = true;
+                        continue;
+                    }
+                    if (k == .char and k.char.alt and k.char.c == 'v') {
+                        // alt+v (windows pi binding) / alt+up both restore a
+                        // queued follow-up into the editor.
+                        if (self.session.drainFollowUp()) |text| {
+                            defer self.alloc.free(text);
+                            self.render_mutex.lockUncancelable(self.io);
+                            self.editor.setText(text) catch {};
+                            self.render_mutex.unlock(self.io);
+                            acted = true;
+                            continue;
+                        }
+                    }
+                }
                 // Anything else (typing): capture for replay after the turn.
                 self.watch_mutex.lock(self.io) catch return;
                 for (seq) |b| {
@@ -2436,13 +2518,9 @@ pub const TUI = struct {
     /// editor's cursor (pi: the cursor is positioned as the last write).
     /// Emits nothing when the park is unchanged (idle ticks stay byte-silent).
     fn parkCursorInto(self: *TUI, out: *std.ArrayListUnmanaged(u8), cursor_row: usize, cursor_col: u16) void {
-        if (self.working) {
-            // Hidden is sticky (nothing else touches DECTCEM).
-            if (self.cursor_park_key == 0) return;
-            self.cursor_park_key = 0;
-            out.appendSlice(self.alloc, ansi.HIDE_CURSOR) catch return;
-            return;
-        }
+        // The editor stays interactive while the agent runs (steering), so
+        // the cursor parks at the editor position in every state; the dedup
+        // below keeps idle ticks silent.
         const key: u64 = (@as(u64, 1) << 63) | (@as(u64, cursor_row) << 32) | cursor_col;
         // ANY other bytes in this frame moved the terminal cursor, so the
         // park must be re-emitted even when the position is unchanged — a

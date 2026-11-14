@@ -122,6 +122,16 @@ pub const Session = struct {
     /// would dangle once buildWireMessages returns).
     system_blocks: [1]msg.ContentBlock = undefined,
 
+    /// Messages submitted while a turn is running (pi: steeringQueue —
+    /// injected into the context before the next LLM request, steering the
+    /// current run). The TUI watcher thread pushes; the agent thread drains
+    /// between tool-call rounds.
+    steering_queue: std.ArrayListUnmanaged([]u8) = .empty,
+    queue_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    /// Messages queued to start a NEW turn after the current one ends
+    /// (pi: followUpQueue, alt+enter).
+    followup_queue: std.ArrayListUnmanaged([]u8) = .empty,
+
     pub fn init(
         alloc: std.mem.Allocator,
         io: std.Io,
@@ -149,7 +159,82 @@ pub const Session = struct {
         self.clearTurnEvents();
         self.turn_events.deinit(self.alloc);
         self.context.deinit();
+        for (self.steering_queue.items) |t| self.alloc.free(t);
+        self.steering_queue.deinit(self.alloc);
+        for (self.followup_queue.items) |t| self.alloc.free(t);
+        self.followup_queue.deinit(self.alloc);
         // cwd is a static string, no need to free
+    }
+
+    /// Queue `text` to steer the running turn (watcher thread; copies).
+    pub fn queueSteering(self: *Session, text: []const u8) void {
+        const copy = self.alloc.dupe(u8, text) catch return;
+        self.queue_mutex.lock(self.io) catch {
+            self.alloc.free(copy);
+            return;
+        };
+        defer self.queue_mutex.unlock(self.io);
+        self.steering_queue.append(self.alloc, copy) catch {
+            self.alloc.free(copy);
+            return;
+        };
+    }
+
+    /// Queue `text` to run as a new turn after the current one (watcher thread).
+    pub fn queueFollowUp(self: *Session, text: []const u8) void {
+        const copy = self.alloc.dupe(u8, text) catch return;
+        self.queue_mutex.lock(self.io) catch {
+            self.alloc.free(copy);
+            return;
+        };
+        defer self.queue_mutex.unlock(self.io);
+        self.followup_queue.append(self.alloc, copy) catch {
+            self.alloc.free(copy);
+            return;
+        };
+    }
+
+    /// Number of queued follow-up messages (steering drains invisibly).
+    pub fn followUpCount(self: *Session) usize {
+        self.queue_mutex.lock(self.io) catch return 0;
+        defer self.queue_mutex.unlock(self.io);
+        return self.followup_queue.items.len;
+    }
+
+    /// Take all steering messages (agent thread; owns the returned texts).
+    fn drainSteering(self: *Session) ![][]u8 {
+        self.queue_mutex.lock(self.io) catch return error.LockFailed;
+        defer self.queue_mutex.unlock(self.io);
+        return self.steering_queue.toOwnedSlice(self.alloc);
+    }
+
+    /// Take the oldest follow-up message, or null. Public: the TUI's
+    /// alt+up "restore queued messages" pulls it back into the editor.
+    pub fn drainFollowUp(self: *Session) ?[]u8 {
+        self.queue_mutex.lock(self.io) catch return null;
+        defer self.queue_mutex.unlock(self.io);
+        if (self.followup_queue.items.len == 0) return null;
+        return self.followup_queue.orderedRemove(0);
+    }
+
+    /// Append queued steering messages to the context as user messages
+    /// (pi: the steering drain before each LLM request). Called on the agent
+    /// thread between tool-call rounds. The TUI already rendered them when
+    /// they were queued — no turn events here.
+    fn drainSteeringIntoContext(self: *Session) !void {
+        const texts = try self.drainSteering();
+        defer {
+            for (texts) |t| self.alloc.free(t);
+            self.alloc.free(texts);
+        }
+        for (texts) |t| {
+            var user_msg = msg.Message.init(self.alloc);
+            defer user_msg.deinit();
+            user_msg.role = .user;
+            user_msg.timestamp_ms = ss.nowMs(self.io);
+            try user_msg.blocks.append(.{ .text = try self.alloc.dupe(u8, t) });
+            try self.appendAndRecord(&user_msg);
+        }
     }
 
     /// Hand the recorded turn events to the caller, oldest first. The caller
@@ -417,11 +502,20 @@ pub const Session = struct {
         // Events nobody took belong to an earlier turn.
         self.clearTurnEvents();
 
+        // pi: after a turn ends, queued follow-up messages run as new turns
+        // (the outer loop below). Steering messages are injected BEFORE each
+        // LLM request (drainSteeringIntoContext, between tool-call rounds).
+        var current_prompt: []u8 = self.alloc.dupe(u8, prompt) catch return error.OutOfMemory;
+        defer self.alloc.free(current_prompt);
+        var follow_up = true;
+        while (follow_up) {
+            follow_up = false;
+
         // Add user message (context.append deep-copies; we own user_msg)
         var user_msg = msg.Message.init(self.alloc);
         defer user_msg.deinit();
         user_msg.role = .user;
-        const prompt_copy = self.alloc.dupe(u8, prompt) catch return error.OutOfMemory;
+        const prompt_copy = self.alloc.dupe(u8, current_prompt) catch return error.OutOfMemory;
         try user_msg.blocks.append(.{ .text = prompt_copy });
         try self.appendAndRecord(&user_msg);
 
@@ -429,6 +523,10 @@ pub const Session = struct {
         while (rounds < self.max_tool_rounds) : (rounds += 1) {
             // Auto-compact before building the request if context is large.
             try self.maybeAutoCompact();
+
+            // pi: queued steering messages join the context before the next
+            // LLM request, so the user can redirect the run mid-flight.
+            try self.drainSteeringIntoContext();
 
             // Build wire messages
             var wire_msgs = std.array_list.Managed(ai.OpenAiProvider.ChatMessage).init(self.alloc);
@@ -506,7 +604,17 @@ pub const Session = struct {
             // Count tool calls
             const n_tool_calls: usize = n_tool_calls_pending(&assistant_msg);
 
-            if (n_tool_calls == 0) break;
+            if (n_tool_calls == 0) {
+                // Turn complete. A queued follow-up message starts a new turn
+                // (pi: the outer loop continues with followUpQueue contents).
+                if (self.drainFollowUp()) |fu| {
+                    self.alloc.free(current_prompt);
+                    current_prompt = fu;
+                    follow_up = true;
+                    rounds = 0;
+                }
+                break;
+            }
 
             if (aborted) {
                 // Keep the conversation wire-valid: every tool call needs a
@@ -581,6 +689,7 @@ pub const Session = struct {
             }
 
             if (self.isAborted()) break;
+        }
         }
     }
 

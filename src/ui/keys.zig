@@ -116,6 +116,10 @@ pub const Key = union(enum) {
     ctrl_down,
     ctrl_shift_up,
     ctrl_shift_down,
+    /// Alt+Up / Alt+Down: restore a queued follow-up message (pi:
+    /// app.message.dequeue); alt+down is unused but parses for symmetry.
+    alt_up,
+    alt_down,
     /// A typed character with optional modifiers. For plain letters, ctrl/alt
     /// are false and `c` is the character. For ctrl+letter, ctrl is true and
     /// `c` is the lowercase letter. For alt+letter, alt is true. `shift` is
@@ -345,7 +349,8 @@ fn encodeUtf8(cp: usize, buf: *[4]u8) usize {
 
 /// Up/Down with Ctrl (and optionally Shift) are their own keys (jump between
 /// user messages); every other modifier combination is the plain arrow.
-fn verticalArrow(up: bool, ctrl: bool, shift: bool) Key {
+fn verticalArrow(up: bool, ctrl: bool, shift: bool, alt: bool) Key {
+    if (alt and !ctrl) return if (up) .alt_up else .alt_down;
     if (ctrl) {
         if (up) return if (shift) .ctrl_shift_up else .ctrl_up;
         return if (shift) .ctrl_shift_down else .ctrl_down;
@@ -392,8 +397,8 @@ fn parseCsi(params: []const u8, ss3: bool) ?Key {
         switch (k.codepoint) {
             57417 => return .left,
             57418 => return .right,
-            57419 => return verticalArrow(true, is_ctrl, is_shift),
-            57420 => return verticalArrow(false, is_ctrl, is_shift),
+            57419 => return verticalArrow(true, is_ctrl, is_shift, is_alt),
+            57420 => return verticalArrow(false, is_ctrl, is_shift, is_alt),
             57421 => return .page_up,
             57422 => return .page_down,
             57423 => return if (is_ctrl) .ctrl_home else .home,
@@ -490,8 +495,8 @@ fn parseCsi(params: []const u8, ss3: bool) ?Key {
         const is_ctrl = modifier & 4 != 0;
         const is_shift = modifier & 1 != 0;
         return switch (final) {
-            'A' => verticalArrow(true, is_ctrl, is_shift),
-            'B' => verticalArrow(false, is_ctrl, is_shift),
+            'A' => verticalArrow(true, is_ctrl, is_shift, false),
+            'B' => verticalArrow(false, is_ctrl, is_shift, false),
             'C' => .right,
             'D' => .left,
             'H' => if (is_ctrl) .ctrl_home else .home,
@@ -588,11 +593,14 @@ pub fn isDeviceAttributesReply(seq: []const u8) bool {
 /// on terminals without Kitty/shift+enter support it is the only way to
 /// insert a line break. pi maps `\n` to enter when Kitty is inactive.
 pub fn parseSequence(seq: []const u8, kitty_active: bool) ?Key {
+    _ = kitty_active; // ESC CR means alt+enter in both terminal modes
     if (seq.len == 1 and seq[0] == '\n') {
         return .shift_enter; // Ctrl+J / terminal shift+enter mapping: newline
     }
     if (seq.len == 2 and seq[0] == 27 and seq[1] == '\r') {
-        if (kitty_active) return .shift_enter;
+        // ESC CR is alt+enter in both modes: kitty terminals report
+        // shift+enter as CSI 13;2u (handled in parseCsi), so the legacy
+        // ESC CR pair can only be alt here (pi: app.message.followUp).
         return .{ .char = .{ .c = '\r', .ctrl = false, .alt = true } };
     }
     if (std.mem.eql(u8, seq, "\x1bOM")) return .enter; // numpad enter
@@ -920,9 +928,10 @@ test "parseSequence legacy mappings depend on kitty state" {
     // without shift+enter support it is the only newline key).
     try expectKey(parseSequence("\n", true), .shift_enter);
     try expectKey(parseSequence("\n", false), .shift_enter);
-    // ESC CR: shift+enter when kitty active, alt+enter otherwise.
-    try expectKey(parseSequence("\x1b\r", true), .shift_enter);
+    // ESC CR is alt+enter in both modes (kitty terminals report shift+enter
+    // as CSI 13;2u, which parseCsi handles separately).
     const alt_enter: Key = .{ .char = .{ .c = '\r', .ctrl = false, .alt = true } };
+    try expectKey(parseSequence("\x1b\r", true), alt_enter);
     try expectKey(parseSequence("\x1b\r", false), alt_enter);
     // Numpad enter is always enter.
     try expectKey(parseSequence("\x1bOM", true), .enter);

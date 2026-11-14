@@ -81,7 +81,7 @@
 | app.tools.expand（工具输出） | ctrl+o | ✅ | |
 | app.editor.external（$EDITOR） | ctrl+g | ✅ | |
 | app.message.copy（选区/最后回复） | ctrl+x | ✅ | |
-| app.message.followUp / dequeue（排队） | alt+enter / alt+up | ⏳ | 需 agent 层消息队列 |
+| app.message.followUp / dequeue（排队） | alt+enter / alt+up | ✅ | 运行中排队，回合结束自动续跑 |
 | app.clipboard.pasteImage（图片粘贴） | ctrl+v | ⏳ | 需图片输入管线 |
 | app.session.toggleNamedFilter | ctrl+n | ⏳ | |
 | tui.altScreen.search（转写搜索） | ctrl+shift+f | ✅ | |
@@ -106,7 +106,7 @@
 | 转写搜索（高亮 / 导航） | ✅ | ✅ | |
 | 鼠标：点击折叠 / 拖选复制 / 滚轮 | ✅ | ✅ | |
 | footer（token / cost / git 分支 / cwd / 模型） | ✅ | ✅ | |
-| steering（运行中改向）+ follow-up 排队 | ✅ | ⏳ | 需 agent 层队列 |
+| steering（运行中改向）+ follow-up 排队 | ✅ | ✅ | Enter 运行中改向，alt+enter 排队，alt+up 恢复 |
 | 图片输入（粘贴 / 拖放） | ✅ | ⏳ | |
 | 会话分享 / 导出 | ✅ | ⏳ | |
 | 扩展 / 技能 / MCP 体系 | ✅ | ⏳ | 架构级 |

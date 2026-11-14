@@ -72,6 +72,13 @@ pub const Editor = struct {
         return out;
     }
 
+    pub fn getTextLen(self: *const Editor) usize {
+        var total: usize = 0;
+        for (self.lines.items) |l| total += l.len + 1;
+        if (self.lines.items.len > 0) total -= 1;
+        return total;
+    }
+
     pub fn isEmpty(self: *const Editor) bool {
         return self.lines.items.len == 1 and self.lines.items[0].len == 0;
     }
