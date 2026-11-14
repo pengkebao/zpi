@@ -103,10 +103,18 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        if (self.stdin) |f| File.close(f, self.io);
-        if (self.stdout) |f| File.close(f, self.io);
-        if (self.stderr) |f| File.close(f, self.io);
-        if (self.child) |*c| c.kill(self.io);
+        // child.kill closes the pipe fds; closing them first is a use-after-free.
+        if (self.child) |*c| {
+            c.kill(self.io);
+            self.child = null;
+        } else {
+            if (self.stdin) |f| File.close(f, self.io);
+            if (self.stdout) |f| File.close(f, self.io);
+            if (self.stderr) |f| File.close(f, self.io);
+        }
+        self.stdin = null;
+        self.stdout = null;
+        self.stderr = null;
         if (self.line_buf) |b| self.alloc.free(b);
         self.stderr_tail.deinit();
         for (self.tools) |t| {
@@ -304,14 +312,19 @@ fn connectStdio(self: *Server, cfg: ServerConfig) !void {
 }
 
 fn teardownProcess(self: *Server) void {
-    if (self.stdin) |f| File.close(f, self.io);
-    if (self.stdout) |f| File.close(f, self.io);
-    if (self.stderr) |f| File.close(f, self.io);
-    if (self.child) |*c| c.kill(self.io);
+    // child.kill → childCleanupPosix closes stdin/stdout/stderr; closing them
+    // first would be a use-after-free (BADF). Only close manually if no child.
+    if (self.child) |*c| {
+        c.kill(self.io);
+        self.child = null;
+    } else {
+        if (self.stdin) |f| File.close(f, self.io);
+        if (self.stdout) |f| File.close(f, self.io);
+        if (self.stderr) |f| File.close(f, self.io);
+    }
     self.stdin = null;
     self.stdout = null;
     self.stderr = null;
-    self.child = null;
     self.connected = false;
 }
 
