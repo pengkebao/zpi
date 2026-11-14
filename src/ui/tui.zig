@@ -3924,37 +3924,55 @@ pub const TUI = struct {
     }
 
     /// /mcp — list configured MCP servers with their state (pi /mcp).
+    /// Format matches pi's SelectList: `→ name<col> state · exposure · scope`.
     fn showMcpStatus(self: *TUI) void {
         const mgr = mcp.Manager.getGlobal() orelse {
             self.addMessage("No MCP servers configured.\nAdd entries to mcp.json under your agent dir or in .pi/mcp.json.");
             return;
         };
-        var out = std.array_list.Managed(u8).init(self.alloc);
-        defer out.deinit();
         if (mgr.servers.items.len == 0) {
             self.addMessage("No MCP servers configured.");
             return;
         }
-        out.appendSlice("MCP servers:\n") catch return;
+        // Name column width (pi: default 32, grows for long names).
+        var col: usize = 32;
         for (mgr.servers.items) |srv| {
-            const state: []const u8 = if (srv.connected) "connected"
-            else if (!srv.enabled) "disabled"
-            else srv.error_msg orelse "disconnected";
-            const line = std.fmt.allocPrint(self.alloc,
-                "  \x1b[1m{s}\x1b[0m — {s} ({d} tool{s}) [{s}]",
-                .{ srv.name, state, srv.tools.len, if (srv.tools.len == 1) "" else "s", srv.source })
-                catch continue;
-            defer self.alloc.free(line);
-            out.appendSlice(line) catch return;
-            if (srv.server_info) |info| {
-                out.appendSlice(" — ") catch return;
-                out.appendSlice(info) catch return;
+            if (srv.name.len + 2 > col) col = srv.name.len + 2;
+        }
+
+        var out = std.array_list.Managed(u8).init(self.alloc);
+        defer out.deinit();
+        out.appendSlice("MCP servers\n\n") catch return;
+        var first = true;
+        for (mgr.servers.items) |srv| {
+            // state (pi describeState)
+            var desc = std.array_list.Managed(u8).init(self.alloc);
+            if (!srv.enabled) {
+                desc.appendSlice("disabled") catch break;
+            } else if (srv.connected) {
+                const s = std.fmt.allocPrint(self.alloc, "connected · {d} tool{s}", .{ srv.tools.len, if (srv.tools.len == 1) "" else "s" }) catch break;
+                defer self.alloc.free(s);
+                desc.appendSlice(s) catch break;
+            } else if (srv.error_msg) |e| {
+                desc.appendSlice("failed: ") catch break;
+                desc.appendSlice(e) catch break;
+            } else {
+                desc.appendSlice("starting") catch break;
             }
-            if (srv.description) |d| {
-                out.appendSlice(" — ") catch return;
-                out.appendSlice(d) catch return;
-            }
-            out.append('\n') catch return;
+            // exposure (default codemode) + scope (user → global)
+            desc.appendSlice(" · ") catch break;
+            desc.appendSlice(srv.exposure orelse "codemode") catch break;
+            desc.appendSlice(" · ") catch break;
+            desc.appendSlice(if (std.mem.eql(u8, srv.source, "project")) "project" else "global") catch break;
+
+            // line = prefix + name (left-padded to col) + description
+            const prefix: []const u8 = if (first) "→ " else "  ";
+            first = false;
+            out.appendSlice(prefix) catch break;
+            out.appendSlice(srv.name) catch break;
+            for (0..(col - srv.name.len)) |_| out.append(' ') catch break;
+            out.appendSlice(desc.items) catch break;
+            out.append('\n') catch break;
         }
         self.addMessage(out.items);
     }

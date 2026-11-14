@@ -256,13 +256,30 @@ fn connectStdio(self: *Server, cfg: ServerConfig) !void {
     try argv.append(command);
     for (cfg.args) |a| try argv.append(a);
 
+    // Child environment: inherit the parent environment, then apply the
+    // server's `env` overrides (pi semantics: config.env wins). Required for
+    // e.g. NODE_PATH pointing at a vendored node_modules.
+    var env_map = std.process.Environ.Map.init(self.alloc);
+    defer env_map.deinit();
+    const parent_env = std.mem.span(std.c.environ);
+    for (parent_env) |entry| {
+        if (entry) |e| {
+            const s = std.mem.span(e);
+            if (std.mem.indexOfScalar(u8, s, '=')) |eq| {
+                env_map.put(s[0..eq], s[eq + 1 ..]) catch return error.SpawnFailed;
+            }
+        }
+    }
+    for (cfg.env) |e| {
+        env_map.put(e.key, e.value) catch return error.SpawnFailed;
+    }
+
     var child = process.spawn(self.io, .{
         .argv = argv.items,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
-        // v1: inherit the parent environment. `env` overrides are a follow-up.
-        .environ_map = null,
+        .environ_map = &env_map,
     }) catch return error.SpawnFailed;
 
     const stdin = child.stdin orelse {
