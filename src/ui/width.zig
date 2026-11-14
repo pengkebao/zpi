@@ -216,3 +216,42 @@ test "prevCharStart / nextCharEnd" {
     // nextCharEnd on ASCII single byte at col 1 → end 2.
     try std.testing.expectEqual(@as(usize, 2), nextCharEnd("ab", 1));
 }
+
+/// Visual width of a string that contains ANSI escape sequences: escapes
+/// occupy zero columns, everything else counts via `visualWidth`. The plain
+/// `visualWidth` above counts escape bytes as printable characters — use
+/// this for styled rows (search box content, caret markers).
+pub fn visibleWidthEsc(s: []const u8) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b) {
+            i += 1;
+            if (i >= s.len) break;
+            if (s[i] == '[') {
+                i += 1;
+                while (i < s.len and !(s[i] >= 0x40 and s[i] <= 0x7E)) i += 1;
+                i = @min(i + 1, s.len);
+            } else if (s[i] == ']') {
+                i += 1;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] == 0x07) {
+                        i += 1;
+                        break;
+                    }
+                    if (s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '\\') {
+                        i += 2;
+                        break;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        const end = nextCharEnd(s, i);
+        total += visualWidth(s[i..end]);
+        i = end;
+    }
+    return total;
+}

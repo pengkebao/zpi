@@ -2137,10 +2137,26 @@ pub const TUI = struct {
         s.box_width = box_w;
         for (lines.lines, search.Search.BOX_ROW..) |line, row| {
             if (row >= frame.items.len) break;
-            if (overlay.overlay(self.alloc, frame.items[row], line, box_w, s.box_col)) |composited| {
-                self.alloc.free(frame.items[row]);
-                frame.items[row] = composited;
-            } else |_| {}
+            // Splice directly: base[0..box_col) + box line + base[box_col+box_w..).
+            // (overlay()'s SGR-state tracking mis-renders this box because the
+            // box line carries its own SGR runs; a plain column splice is what
+            // the layout actually needs here.)
+            const before = overlay.sliceByColumn(self.alloc, frame.items[row], 0, s.box_col) catch continue;
+            defer self.alloc.free(before);
+            const after = overlay.sliceByColumn(self.alloc, frame.items[row], s.box_col + box_w, self.width) catch continue;
+            defer self.alloc.free(after);
+            // Pad `before` up to box_col so the box sits at a fixed column
+            // even when the base row is shorter (empty transcript rows).
+            const before_w = wmod.visibleWidthEsc(before);
+            const pad = if (s.box_col > before_w) s.box_col - before_w else 0;
+            var pad_buf: [128]u8 = undefined;
+            const pad_str = if (pad > 0 and pad <= pad_buf.len) blk: {
+                @memset(pad_buf[0..pad], ' ');
+                break :blk pad_buf[0..pad];
+            } else "";
+            const composed = std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{ before, pad_str, line, after }) catch continue;
+            self.alloc.free(frame.items[row]);
+            frame.items[row] = composed;
         }
     }
 

@@ -98,10 +98,16 @@ pub const Span = struct {
 pub const Corpus = struct {
     text: []u21,
     spans: []Span,
+    /// Per-codepoint case-folded copy of `text` (same length): matching runs
+    /// against this array directly — no fold() call per position, which in
+    /// debug builds made typing into the search box feel frozen on long
+    /// transcripts.
+    folded: []u21,
     alloc: std.mem.Allocator,
 
     pub fn deinit(self: *Corpus) void {
         self.alloc.free(self.text);
+        self.alloc.free(self.folded);
         self.alloc.free(self.spans);
     }
 };
@@ -184,9 +190,11 @@ fn decodeCp(s: []const u8, i: usize) ?struct { u21, usize } {
 /// column spans, and whitespace runs collapse to a single space in the text.
 pub fn buildSearchCorpus(alloc: std.mem.Allocator, lines: []const []const u8) !Corpus {
     var text: std.ArrayListUnmanaged(u21) = .empty;
+    var folded: std.ArrayListUnmanaged(u21) = .empty;
     var spans: std.ArrayListUnmanaged(Span) = .empty;
     errdefer {
         text.deinit(alloc);
+        folded.deinit(alloc);
         spans.deinit(alloc);
     }
     var pending_separator = false;
@@ -207,10 +215,13 @@ pub fn buildSearchCorpus(alloc: std.mem.Allocator, lines: []const []const u8) !C
                 while (end < plain.len and plain[end] != ' ') end += 1;
                 if (pending_separator) {
                     try text.append(alloc, ' ');
+                    try folded.append(alloc, ' ');
                     pending_separator = false;
                 }
                 const start = text.items.len;
+                const ascii_start = folded.items.len;
                 try appendAsciiCps(&text, alloc, plain[i..end]);
+                for (text.items[ascii_start..]) |c| try folded.append(alloc, fold(c));
                 try spans.append(alloc, .{
                     .text_start = start,
                     .text_end = text.items.len,
@@ -235,10 +246,12 @@ pub fn buildSearchCorpus(alloc: std.mem.Allocator, lines: []const []const u8) !C
                 }
                 if (pending_separator) {
                     try text.append(alloc, ' ');
+                    try folded.append(alloc, ' ');
                     pending_separator = false;
                 }
                 const start = text.items.len;
                 try text.append(alloc, cp[0]);
+                try folded.append(alloc, fold(cp[0]));
                 try spans.append(alloc, .{
                     .text_start = start,
                     .text_end = text.items.len,
@@ -255,6 +268,7 @@ pub fn buildSearchCorpus(alloc: std.mem.Allocator, lines: []const []const u8) !C
     }
     return .{
         .text = try text.toOwnedSlice(alloc),
+        .folded = try folded.toOwnedSlice(alloc),
         .spans = try spans.toOwnedSlice(alloc),
         .alloc = alloc,
     };
@@ -309,22 +323,42 @@ pub fn findMatches(alloc: std.mem.Allocator, corpus: *const Corpus, query: []con
         matches.deinit(alloc);
     }
 
+    // Fast path: compare against the pre-folded corpus copy — no fold()
+    // call per position (debug builds made typing feel frozen on long
+    // transcripts: every keystroke scanned the whole corpus through fold()).
+    const folded = if (corpus.folded.len == corpus.text.len) corpus.folded else null;
+
     var span_index: usize = 0;
     var start: usize = 0;
     while (start + q.len <= corpus.text.len) {
         // Find the next occurrence at or after `start`.
         var s = start;
         var found = false;
-        while (s + q.len <= corpus.text.len) {
-            var k: usize = 0;
-            while (k < q.len) : (k += 1) {
-                if (fold(corpus.text[s + k]) != q[k]) break;
+        if (folded) |fd| {
+            // First-codepoint filter, then the rest — plain array compares.
+            while (s + q.len <= fd.len) {
+                if (fd[s] == q[0]) {
+                    var k: usize = 1;
+                    while (k < q.len and fd[s + k] == q[k]) k += 1;
+                    if (k == q.len) {
+                        found = true;
+                        break;
+                    }
+                }
+                s += 1;
             }
-            if (k == q.len) {
-                found = true;
-                break;
+        } else {
+            while (s + q.len <= corpus.text.len) {
+                var k: usize = 0;
+                while (k < q.len) : (k += 1) {
+                    if (fold(corpus.text[s + k]) != q[k]) break;
+                }
+                if (k == q.len) {
+                    found = true;
+                    break;
+                }
+                s += 1;
             }
-            s += 1;
         }
         if (!found) break;
         const m_start = s;
@@ -665,7 +699,11 @@ pub const Search = struct {
             std.fmt.bufPrint(&styled_buf, DIM ++ " {s} " ++ ansi.RESET, .{result}) catch ""
         else
             "";
-        const result_w: usize = @intCast(wmod.visualWidth(result_text));
+        // Styled strings (DIM/RESET, the caret's inverse CSI) must be
+        // measured escape-aware — the plain visualWidth counts escape bytes
+        // as printable columns, which pushed the right border out of the
+        // overlay region (missing box edge).
+        const result_w: usize = wmod.visibleWidthEsc(result_text);
         const input_width = if (inner > result_w) inner - result_w else 0;
 
         // Input line: the query with the caret rendered as an inverted cell.
@@ -684,13 +722,18 @@ pub const Search = struct {
         }
         const input_line = try overlay.sliceByColumn(alloc, input.items, 0, input_width);
         defer alloc.free(input_line);
-        const input_w: usize = @intCast(wmod.visualWidth(input_line));
+        const input_w: usize = wmod.visibleWidthEsc(input_line);
         const pad = if (input_width > input_w) input_width - input_w else 0;
         var content: std.ArrayListUnmanaged(u8) = .empty;
         defer content.deinit(alloc);
         try content.appendSlice(alloc, input_line);
         if (pad > 0) try content.appendNTimes(alloc, ' ', pad);
         try content.appendSlice(alloc, result_text);
+        // Top the content up to `inner` exactly (pi: the input row is a full
+        // rule-width row). Small measurement drift between the styled input
+        // slice and the counter must not shift the closing border.
+        const content_w = wmod.visibleWidthEsc(content.items);
+        if (content_w < inner) try content.appendNTimes(alloc, ' ', inner - content_w);
 
         // Bottom line: buttons or a plain rule.
         var bottom_inner: std.ArrayListUnmanaged(u8) = .empty;
@@ -715,6 +758,11 @@ pub const Search = struct {
             try bottom_inner.appendSlice(alloc, next_btn);
             if (self.hover_dir == 1) try bottom_inner.appendSlice(alloc, ansi.RESET);
             if (right_rule > 0) try appendRule(&bottom_inner, alloc, right_rule);
+            // Top up the rules so the bottom row always spans `inner` like
+            // the top row — the gap bookkeeping can drift by a column or two
+            // when glyph widths (arrows) render narrower than measured.
+            const bottom_w = wmod.visibleWidthEsc(bottom_inner.items);
+            if (bottom_w < inner) try appendRule(&bottom_inner, alloc, inner - bottom_w);
         } else {
             try appendRule(&bottom_inner, alloc, inner);
         }
@@ -966,4 +1014,20 @@ test "search input: insert, backspace, caret" {
     const cjk = keys.Key{ .text = .{ .bytes = [_]u8{ 0xE4, 0xB8, 0xAD, 0 }, .len = 3 } };
     try std.testing.expect(s.handleKey(cjk));
     try std.testing.expectEqualStrings("\xE4\xB8\xADb", s.query);
+}
+
+
+test "box rows all equal box width" {
+    const t = std.testing;
+    var search: Search = undefined;
+    search = try Search.init(t.allocator);
+    defer search.deinit();
+    const box_w: usize = 44;
+    var lines: Search.Lines = try search.render(t.allocator, box_w);
+    defer lines.deinit();
+    const wmod2 = @import("width.zig");
+    for (lines.lines) |l| {
+        const w = wmod2.visibleWidthEsc(l);
+        try t.expectEqual(box_w, w);
+    }
 }
