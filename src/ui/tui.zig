@@ -918,8 +918,19 @@ pub const TUI = struct {
     /// (muted); the whole row is accent-colored when selected. Owned,
     /// caller frees.
     fn menuLine(self: *TUI, v: usize, width: usize, col_min: usize, col_max: usize) ![]u8 {
-        const e = self.menu_items[v];
-        const selected = self.menu_view_start + v == self.menu_selected;
+        // Editor menus keep the FULL filtered list in menu_items: v is the
+        // window-relative row and the window starts at menu_view_start.
+        // Modal pickers (sessions/tree/settings//mcp manager) PROJECT their
+        // rows into menu_items through refreshSelMenu — there v indexes the
+        // projected window directly and menu_view_start only decides the
+        // selection marker.
+        const projected = switch (self.menu_mode) {
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure => true,
+            else => false,
+        };
+        const item_idx = if (projected) v else self.menu_view_start + v;
+        const e = self.menu_items[item_idx];
+        const selected = (self.menu_view_start + v) == self.menu_selected;
         const prefix: []const u8 = if (selected) "\u{2192} " else "  ";
         const name_full = if (e.name.len > 0 and e.name[0] == '/') e.name[1..] else e.name;
         const accent = "\x1b[38;2;167;152;215m";
@@ -2334,7 +2345,13 @@ pub const TUI = struct {
         // bottom border (1) + cwd (1) + status (1). The menu viewport shows
         // at most 16 rows (pi select-list maxVisible).
         const menu_h: usize = if (self.menu_mode != .hidden) @min(self.menu_len, self.menuMaxVisible()) else 0;
-        const fixed_bottom = editor_h + 4 + menu_h;
+        // The "(sel/total)" scroll-indicator row renders under the menu rows
+        // (pi SelectList.render appends it after the items) and must be part
+        // of the bottom budget — without it the frame is one row taller than
+        // the terminal, which scrolls the screen by one line on every menu
+        // frame and leaves stale rows behind.
+        const count_line: usize = if (menu_h > 0 and self.menu_len > menu_h) 1 else 0;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -2482,7 +2499,10 @@ pub const TUI = struct {
         const status_line = self.statusLine() catch return;
         frame.append(self.alloc, status_line) catch return;
 
-        const cursor_row = transcript_h + menu_h + 1 + (cursor_vis.row - vis_top);
+        // The menu renders below the editor (pi editor.render: autocomplete
+        // after the bottom border), so the editor row is transcript_h +
+        // top border + row — menu_h no longer shifts it.
+        const cursor_row = transcript_h + 1 + (cursor_vis.row - vis_top);
         const cursor_col: u16 = @intCast(if (1 + cursor_vis.col < self.width) 1 + cursor_vis.col else self.width);
         // diffRender adopts the frame's lines (they become the next diff
         // base); afterwards only the array itself needs releasing.
@@ -5571,25 +5591,30 @@ pub const TUI = struct {
             }
 
             // Transcript scrolling (pi: the altScreen scroll bindings).
-            if (self.bindings.matches(key, .scroll_page_up)) {
+            // While ANY completion menu is open, pgup/pgdn/home/end belong to
+            // the menu (pi editor.js: autocomplete state intercepts
+            // tui.select.pageUp/pageDown before anything else) — transcript
+            // scrolling is skipped so the keys reach the menu branch below.
+            const menu_captures_nav = self.menu_mode != .hidden;
+            if (!menu_captures_nav and self.bindings.matches(key, .scroll_page_up)) {
                 // pi: viewportHeight - PAGE_SCROLL_OVERLAP (4 rows of context).
                 self.scrollBy(-@as(isize, @intCast(@max(1, self.transcript_h -| 4))));
                 self.redraw();
                 continue;
             }
-            if (self.bindings.matches(key, .scroll_page_down)) {
+            if (!menu_captures_nav and self.bindings.matches(key, .scroll_page_down)) {
                 self.scrollBy(@as(isize, @intCast(@max(1, self.transcript_h -| 4))));
                 self.redraw();
                 continue;
             }
-            if (self.bindings.matches(key, .scroll_top)) {
+            if (!menu_captures_nav and self.bindings.matches(key, .scroll_top)) {
                 self.render_mutex.lock(self.io) catch continue;
                 self.sv.scrollToStart(ss.nowMs(self.io));
                 self.render_mutex.unlock(self.io);
                 self.redraw();
                 continue;
             }
-            if (self.bindings.matches(key, .scroll_bottom)) {
+            if (!menu_captures_nav and self.bindings.matches(key, .scroll_bottom)) {
                 self.scrollToLatest();
                 self.redraw();
                 continue;
