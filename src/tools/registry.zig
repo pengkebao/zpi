@@ -51,6 +51,14 @@ pub const Tool = struct {
     /// `tool` is the Tool being executed (lets a shared executor, like the MCP
     /// one, discover its own name). Built-in tools ignore it.
     execute: *const fn (tool: *const Tool, args_json: []const u8, ctx: *ExecutionContext) ToolResult,
+    /// pi exposure: "direct" (declared to the model), "codemode" (pi default
+    /// for MCP: callable via codemode scripts, not declared), "deferred" (not
+    /// declared until tool_search loads it), "model-only" (declared, not
+    /// script-callable), "hidden" (unreachable).
+    exposure: []const u8 = "direct",
+    /// Whether the tool is declared to the model (sent in toolSchemasJson).
+    /// tool_search flips this at runtime to load deferred/codemode tools.
+    active: bool = true,
 };
 
 pub const ExecutionContext = struct {
@@ -107,6 +115,59 @@ pub const Registry = struct {
         }
     }
 
+    /// Activate exactly the tools in `selected`; every other tool stays
+    /// registered but inactive (not declared to the model). This mirrors pi,
+    /// where inactive tools can be loaded later (e.g. by `tool_search`).
+    pub fn activateOnly(self: *Registry, selected: []const []const u8) void {
+        for (self.tools.items) |*t| {
+            t.active = blk: {
+                for (selected) |s| {
+                    if (std.mem.eql(u8, t.name, s)) break :blk true;
+                }
+                break :blk false;
+            };
+        }
+    }
+
+    /// Set a tool's active flag. Returns whether the tool exists. `tool_search`
+    /// uses this to load deferred/codemode tools for the next model call.
+    pub fn setActive(self: *Registry, name: []const u8, active: bool) bool {
+        for (self.tools.items) |*t| {
+            if (std.mem.eql(u8, t.name, name)) {
+                t.active = active;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remove the tools whose names match any pattern (exact or `*` wildcard).
+    /// pi never registers excluded tools, so MCP tools filtered out by
+    /// `--exclude-tools` are dropped from the registry entirely.
+    pub fn removeMatching(self: *Registry, patterns: []const []const u8) void {
+        self.removeMatchingOn(patterns, removeMatchingDefault);
+    }
+
+    fn removeMatchingDefault(patterns: []const []const u8, name: []const u8) bool {
+        const selection = @import("selection.zig");
+        return selection.matchesAny(name, patterns);
+    }
+
+    /// Remove the tools for which `shouldRemove(patterns, name)` is true.
+    /// Used by main.zig to apply the MCP-specific selection rules.
+    pub fn removeMatchingOn(self: *Registry, patterns: []const []const u8, shouldRemove: *const fn (patterns: []const []const u8, name: []const u8) bool) void {
+        var w: usize = 0;
+        for (self.tools.items) |t| {
+            if (!shouldRemove(patterns, t.name)) {
+                self.tools.items[w] = t;
+                w += 1;
+            }
+        }
+        while (self.tools.items.len > w) {
+            _ = self.tools.pop();
+        }
+    }
+
     /// Return JSON array of function schemas.
     pub fn toolSchemasJson(self: *const Registry, alloc: std.mem.Allocator) ![]u8 {
         var out = std.array_list.Managed(u8).init(alloc);
@@ -114,16 +175,13 @@ pub const Registry = struct {
         try out.append('[');
         var first = true;
         for (self.tools.items) |tool| {
+            if (!tool.active) continue;
             if (!first) try out.append(',');
             first = false;
-            try out.appendSlice("{\"type\":\"function\",\"function\":{");
-            const name_part = std.fmt.allocPrint(alloc, "\"name\":\"{s}\"", .{tool.name}) catch break;
-            try out.appendSlice(name_part);
-            alloc.free(name_part);
-            try out.append(',');
-            const desc_part = std.fmt.allocPrint(alloc, "\"description\":\"{s}\"", .{tool.description}) catch break;
-            try out.appendSlice(desc_part);
-            alloc.free(desc_part);
+            try out.appendSlice("{\"type\":\"function\",\"function\":{\"name\":");
+            try appendJsonString(&out, tool.name);
+            try out.appendSlice(",\"description\":");
+            try appendJsonString(&out, tool.description);
             try out.appendSlice(",\"parameters\":");
             try out.appendSlice(tool.parameters_json);
             try out.appendSlice("}}");
@@ -246,6 +304,32 @@ const bashParams = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\
 const bashDescription = std.fmt.comptimePrint(
     "Execute a shell command in the current working directory. Returns stdout and stderr. Output is truncated to last {d} lines or {d}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
     .{ truncate.DEFAULT_MAX_LINES, truncate.DEFAULT_MAX_BYTES / 1024 });
+
+
+/// Append `s` as a JSON string (with quotes), escaping control characters,
+/// quotes and backslashes (RFC 8259).
+fn appendJsonString(out: *std.array_list.Managed(u8), s: []const u8) !void {
+    try out.append('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice("\\\""),
+            '\\' => try out.appendSlice("\\\\"),
+            '\n' => try out.appendSlice("\\n"),
+            '\r' => try out.appendSlice("\\r"),
+            '\t' => try out.appendSlice("\\t"),
+            else => {
+                if (c < 0x20) {
+                    var buf: [8]u8 = undefined;
+                    const hex = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch continue;
+                    try out.appendSlice(hex);
+                } else {
+                    try out.append(c);
+                }
+            },
+        }
+    }
+    try out.append('"');
+}
 
 pub fn registerBash(registry: *Registry) !void {
     try registry.register(.{

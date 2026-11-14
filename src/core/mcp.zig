@@ -237,16 +237,21 @@ pub const Manager = struct {
         var count: usize = 0;
         for (self.servers.items) |srv| {
             if (!srv.connected) continue;
-            // "hidden" exposure suppresses the server's tools (pi).
-            if (srv.exposure) |e| {
-                if (std.mem.eql(u8, e, "hidden")) continue;
-            }
+            // Exposure (pi defaults to "codemode"): "hidden" suppresses
+            // registration entirely; only "direct" tools are declared to the
+            // model right away. codemode/deferred tools register INACTIVE —
+            // `tool_search` (auto-activated for such servers) loads matches.
+            const exposure = srv.exposure orelse "codemode";
+            if (std.mem.eql(u8, exposure, "hidden")) continue;
+            const active = std.mem.eql(u8, exposure, "direct");
             for (srv.tools) |t| {
                 registry.register(.{
                     .name = t.full_name,
                     .description = t.description,
                     .parameters_json = t.input_schema,
                     .execute = executeMcpTool,
+                    .exposure = exposure,
+                    .active = active,
                 }) catch continue;
                 count += 1;
             }
@@ -254,6 +259,19 @@ pub const Manager = struct {
         return count;
     }
 };
+
+/// Whether a tool comes from MCP: a server tool (`mcp__<server>__<tool>`) or
+/// one of the global resource tools (pi `isMcpToolName`). Used by the tool
+/// selection engine: `--exclude-tools` and `mcp__`-prefixed `--tools` entries
+/// reach MCP tools, plain builtin allowlists keep them.
+pub fn isMcpToolName(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "mcp__")) return true;
+    const names = [_][]const u8{ "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource" };
+    for (names) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
 
 // ── stdio connection + JSON-RPC ──────────────────────────────────────
 
@@ -1078,6 +1096,8 @@ pub fn registerResourceTools(self: *Manager, registry: *tools.Registry) usize {
         .description = "List MCP resources across one or every connected server.",
         .parameters_json = LIST_RESOURCES_SCHEMA,
         .execute = executeListResources,
+        .exposure = "direct",
+        .active = true,
     })) {
         count += 1;
     } else |_| {}
@@ -1086,6 +1106,8 @@ pub fn registerResourceTools(self: *Manager, registry: *tools.Registry) usize {
         .description = "List MCP resource templates across one or every connected server.",
         .parameters_json = LIST_TEMPLATES_SCHEMA,
         .execute = executeListResourceTemplates,
+        .exposure = "direct",
+        .active = true,
     })) {
         count += 1;
     } else |_| {}
@@ -1094,6 +1116,8 @@ pub fn registerResourceTools(self: *Manager, registry: *tools.Registry) usize {
         .description = "Read an MCP resource by server and URI.",
         .parameters_json = READ_RESOURCE_SCHEMA,
         .execute = executeReadResource,
+        .exposure = "direct",
+        .active = true,
     })) {
         count += 1;
     } else |_| {}

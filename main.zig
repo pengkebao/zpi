@@ -15,6 +15,7 @@ const msgmod = @import("src/core/message.zig");
 const ptmod = @import("src/core/prompt_template.zig");
 const skills = @import("src/core/skills.zig");
 const mcp = @import("src/core/mcp.zig");
+const tool_search = @import("src/tools/tool_search.zig");
 
 fn getCwdAlloc(alloc: std.mem.Allocator) ![]u8 {
     var buf: [4096]u8 = undefined;
@@ -354,6 +355,7 @@ pub fn main(init: std.process.Init) !void {
     var tools_arg: ?[]const u8 = null;
     var exclude_tools_arg: ?[]const u8 = null;
     var no_tools = false;
+    var no_builtin_tools = false;
     // System prompt (Phase D5)
     var append_system_prompt: ?[]const u8 = null;
     var system_prompt_override: ?[]const u8 = null;
@@ -418,6 +420,8 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--no-tools") or std.mem.eql(u8, arg, "-nt")) {
             no_tools = true;
+        } else if (std.mem.eql(u8, arg, "--no-builtin-tools") or std.mem.eql(u8, arg, "-nbt")) {
+            no_builtin_tools = true;
         } else if (std.mem.eql(u8, arg, "--append-system-prompt")) {
             if (i + 1 < argv.items.len) append_system_prompt = argv.items[i + 1];
             i += 1;
@@ -568,7 +572,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Init tools
     var registry = tools.Registry.init(alloc);
-    defer registry.deinit();
+    defer {
+        tool_search.setGlobal(null);
+        registry.deinit();
+    }
     try tools.registerAll(&registry);
 
     // ---- Tool selection (Phase E7) ----
@@ -576,6 +583,12 @@ pub fn main(init: std.process.Init) !void {
     // (settings defaultTools if set, else the built-in default).
     var cli_tools_list: ?[]const []const u8 = null;
     var exclude_list: ?[]const []const u8 = null;
+    // MCP-tool allowlist (null = MCP tools bypass the tool filter). See the
+    // selection block below for how it is derived.
+    var mcp_allowlist: ?[]const []const u8 = null;
+    // Whether the tool_search tool registers at all (resolved with the
+    // selection, applied after MCP registration).
+    var register_tool_search = true;
     if (tools_arg) |t| cli_tools_list = try splitComma(alloc, t);
     if (exclude_tools_arg) |e| exclude_list = try splitComma(alloc, e);
     defer if (cli_tools_list) |l| alloc.free(l);
@@ -591,9 +604,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Base set: --no-tools -> empty; else defaultTools (resolved) or built-in.
+    // Base set: --no-tools / --no-builtin-tools -> empty; else defaultTools
+    // (resolved) or built-in (pi: noTools="all" and noTools="builtin" both
+    // empty the default set; they differ in how MCP tools are filtered).
     var base_owned: ?[]const []const u8 = null;
-    const base: []const []const u8 = if (no_tools) blk: {
+    const base: []const []const u8 = if (no_tools or no_builtin_tools) blk: {
         break :blk &[_][]const u8{};
     } else if (cfg.default_tools) |dt| blk: {
         base_owned = try selection.resolveDefaultTools(alloc, dt);
@@ -605,7 +620,28 @@ pub fn main(init: std.process.Init) !void {
 
     const selected = try selection.select(alloc, base, cli_tools_list, exclude_list orelse &[_][]const u8{});
     defer alloc.free(selected);
-    registry.filterToNames(selected);
+    // Inactive tools stay registered (tool_search can load them later); they
+    // are just not declared to the model.
+    registry.activateOnly(selected);
+
+    // MCP filtering (pi sdk.js):
+    //   - `--exclude-tools` reaches MCP tools: they are never registered.
+    //   - A plain `--tools` list filters MCP tools only when one of its
+    //     entries starts with `mcp__` (exact names or `*` globs); unmatched
+    //     MCP tools are not registered either.
+    //   - `--no-tools` ("all") registers no MCP tools at all;
+    //     `--no-builtin-tools` leaves MCP tools untouched.
+    //   - A modifiers-only `--tools` list does not filter MCP tools.
+    mcp_allowlist = if (no_tools)
+        try alloc.alloc([]const u8, 0)
+    else blk: {
+        const list = cli_tools_list orelse break :blk null;
+        var has_mcp = false;
+        for (list) |e| {
+            if (std.mem.startsWith(u8, e, "mcp__")) has_mcp = true;
+        }
+        break :blk if (has_mcp) list else null;
+    };
 
     // Resolve cwd (needed for the system prompt + sessions)
     var cwd_alloc: ?[]u8 = null;
@@ -652,6 +688,70 @@ pub fn main(init: std.process.Init) !void {
         _ = mgr.registerTools(&registry);
         _ = mcp.registerResourceTools(mgr, &registry);
         mcp_mgr = mgr;
+    }
+    // Apply the tool-selection filters to MCP tools (they register above so
+    // the manager stays the executor; filtering happens here because the
+    // selection state lives in main).
+    if (mcp_mgr != null) {
+        if (exclude_list) |ex| {
+            registry.removeMatchingOn(ex, struct {
+                fn pred(patterns: []const []const u8, name: []const u8) bool {
+                    return mcp.isMcpToolName(name) and selection.matchesAny(name, patterns);
+                }
+            }.pred);
+        }
+        if (mcp_allowlist) |allow| {
+            // Not registered: pi drops MCP tools the `mcp__` allowlist does
+            // not match (they cannot even be searched).
+            registry.removeMatchingOn(allow, struct {
+                fn pred(patterns: []const []const u8, name: []const u8) bool {
+                    return mcp.isMcpToolName(name) and !selection.matchesAny(name, patterns);
+                }
+            }.pred);
+        }
+    }
+    // `tool_search` (pi parity): registered INACTIVE; activated when the
+    // selection includes it (`--tools tool_search`, `--tools +tool_search`,
+    // the defaultTools setting) or automatically when a server with
+    // codemode/deferred exposure connected (pi activates the codemode script
+    // runner for codemode servers; rpi has no codemode yet, so tool_search is
+    // the access path for those tools). Registration follows the selection:
+    // excluded tools never register, and a `mcp__`-prefixed plain allowlist
+    // that does not list tool_search drops it (pi _isAllowedTool).
+    register_tool_search = blk: {
+        if (exclude_list) |ex| {
+            if (selection.matchesAny("tool_search", ex)) break :blk false;
+        }
+        if (mcp_allowlist) |allow| {
+            var listed = false;
+            for (allow) |a| {
+                if (std.mem.eql(u8, a, "tool_search")) listed = true;
+            }
+            if (!listed) break :blk false;
+        }
+        break :blk true;
+    };
+    if (register_tool_search) {
+        tool_search.registerToolSearch(&registry) catch {};
+    }
+    if (registry.find("tool_search") != null) {
+        var want_active = false;
+        for (selected) |n| {
+            if (std.mem.eql(u8, n, "tool_search")) want_active = true;
+        }
+        if (!want_active) {
+            // Auto-activate when searchable (codemode/deferred) tools are
+            // registered but not declared — tool_search is their access path
+            // (pi activates codemode/tool_search per server exposure).
+            for (registry.tools.items) |*t| {
+                if (!t.active and tool_search.isSearchable(t.exposure)) {
+                    want_active = true;
+                    break;
+                }
+            }
+        }
+        _ = registry.setActive("tool_search", want_active);
+        tool_search.setGlobal(&registry);
     }
     defer if (mcp_mgr) |m| {
         mcp.Manager.setGlobal(null);
@@ -755,6 +855,8 @@ pub fn main(init: std.process.Init) !void {
     var tool_snippets = std.array_list.Managed(sp.ToolSnippet).init(alloc);
     defer tool_snippets.deinit();
     for (registry.tools.items) |t| {
+        // Only active tools are declared to the model (pi).
+        if (!t.active) continue;
         try tool_snippets.append(.{ .name = t.name, .snippet = t.description });
     }
     const system_prompt = try sp.buildFromSnippets(alloc, io, tool_snippets.items, cwd_abs, cfg.base_dir, append_system_prompt, system_prompt_override, skills_block);

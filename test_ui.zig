@@ -4,6 +4,7 @@ const config = @import("src/core/config.zig");
 const agent = @import("src/core/agent.zig");
 const ai = @import("src/ai/openai.zig");
 const tools = @import("src/tools/registry.zig");
+const tool_search = @import("src/tools/tool_search.zig");
 const component = @import("src/ui/component.zig");
 const keys = @import("src/ui/keys.zig");
 const ss = @import("src/core/session_store.zig");
@@ -15,6 +16,7 @@ const tool_block = @import("src/ui/tool_block.zig");
 const footer = @import("src/ui/footer.zig");
 const overlay = @import("src/ui/overlay.zig");
 comptime {
+    _ = tool_search;
     _ = tui;
     _ = component;
     _ = editor;

@@ -74,9 +74,9 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | ls | ✅ 原生 | ✅ | 原生实现；path/limit；case-insensitive 排序；目录加 / 后缀；含 dotfiles；500/50KB 截断+notice |
 | powershell | ✅ Win | ➖ | 后续 Windows 支持时做 |
 | codemode（QuickJS 沙箱调用其他工具） | ✅ | 砍掉→原生并行工具执行 | 零依赖约束下不内嵌 C 解释器，并行执行入 A 阶段 |
-| tool_search（未声明工具的搜索装载） | ✅ | ❌ | 依赖 MCP/exposure 概念 |
-| 工具选择：`--tools`/`+name`/`-name`/`*` 通配 | ✅ | ❌ | `-nt --no-tools` |
-| `defaultTools` 设置 | ✅ | ❌ | |
+| tool_search（未声明工具的搜索装载） | ✅ | ✅ | pi 同款 BM25（k1=1.2 b=0.75，name 权重 3、namespace 0.5，exact>coverage>score 稳定排序）；搜索未激活的 codemode/deferred 工具并装载至下一轮声明；注册即 inactive（`defaultActive:false`），`--tools tool_search`/`defaultTools`/搜索性 MCP 服务器自动激活（pi 激活 codemode 脚本工具，rpi 无 codemode 以 tool_search 兜底）；E2E：搜索→装载→下一轮 tools 数组含 `mcp__mini__screenshot` |
+| 工具选择：`--tools`/`+name`/`-name`/`*` 通配 | ✅ | ✅ | selection.zig（E7）+ MCP 接入：`-nt` 禁一切（含 MCP 不注册）、`-nbt` 只禁内置、plain `--tools` 替换内置且仅含 `mcp__` 前缀条目时过滤 MCP（精确/glob，未匹配者不注册）、全 modifier 改默认集不动 MCP、`--exclude-tools` 波及一切（MCP 不注册）；Registry 改 `activateOnly`（inactive 保注册可被 tool_search 装载）+ `removeMatchingOn` |
+| `defaultTools` 设置 | ✅ | ✅ | settings.json `defaultTools`（plain 替换/modifier 修改，同 pi resolveDefaultTools）；项目级合并待 H4（`.pi/settings.json` + trust） |
 | ToolResult 所有权契约 | n/a | ✅ | 本次修复：content 一律堆分配、move 进消息、零泄漏 |
 
 ### 4. 会话（Sessions）
@@ -402,7 +402,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 - [ ] I4 编译期扩展点：仓库内 `src/ext/builtin/` 模块 comptime 注册（对齐 pi 的 `builtin:mcp` 模式），功能以“内置扩展”形态交付
 - [ ] I5 资源打包即扩展：skills/prompts/themes/hooks 目录本身可分发（配合 K4 package 安装）
 - [ ] ~~codemode~~：**砍掉**（需 C 解释器）。其核心价值改为原生实现：**并行工具执行**（独立 tool call 线程池并发 + 按 id 归位），归入 A 阶段
-- [ ] tool_search：移到 J（MCP）阶段，零依赖可实现
+- [x] tool_search：`src/tools/tool_search.zig`（BM25 分词/排名 + 搜索装载工具），随 J3 exposure 落地
 
 ### Phase J — MCP 客户端（~2k 行）
 - [x] J1a JSON-RPC over stdio；tools/list、tools/call（全链路 E2E 验证）
@@ -410,7 +410,9 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 - [x] J2 streamable HTTP + bearer 认证（SSE/JSON 双解析、session-id、Bearer；E2E 含需鉴权服务器）
 - [x] J3 mcp.json 加载（用户/项目覆盖规则）+ `/mcp` 状态列出
 - [x] J4 `rpi mcp add/remove/list/login/logout` 子命令（login/logout 存 `mcp-auth.json`）
-- [x] J5 exposure 模式（hidden 抑制；其余直接注册）
+- [x] J5 exposure 模式（pi 四值：`direct` 直接声明；`codemode`（默认）/`deferred` 注册但**不声明**，由 tool_search 装载；`hidden` 不注册；`toolExposure` 单工具覆盖待 I 阶段）。rpi 适配：codemode 服务器自动激活 `tool_search`（pi 激活 codemode 脚本工具；rpi 无 codemode 以 tool_search 兜底）
+- [x] J7 `tool_search` 工具（pi BM25 同款：分词=camelCase 拆分+停用词+naive 单数化（Intl.Segmenter 的 ASCII 近似）；k1=1.2 b=0.75；name 权重 3 / namespace 0.5（namespace=MCP 服务器 description）；exact-name 查询最优先、coverage 次之、score 再次、并列保持文档序）。注册即 inactive；激活路径：`--tools tool_search`、`+tool_search`、defaultTools 设置、搜索性 MCP 服务器自动激活。装载=翻 active 位，下一轮请求即声明（E2E 双轮验证）
+- [x] J8 工具选择 × MCP（pi sdk.js `_isAllowedTool` 语义）：`-nt`（noTools=all）禁一切含 MCP 不注册；`-nbt`（noTools=builtin）只禁内置；plain `--tools` 替换内置、仅当含 `mcp__` 前缀条目时过滤 MCP（未匹配者不注册、tool_search 未列入亦不注册）；全 modifier 修改默认集且 MCP 绕过；`--exclude-tools` 波及一切（MCP 不注册）。Registry：`Tool.exposure`+`Tool.active`、`activateOnly`（inactive 保注册）、`removeMatchingOn`、`toolSchemasJson` 只出 active + JSON 字符串转义（修 request 体裸换行 bug）
 - [ ] J6 OAuth 浏览器流程（以 login 存 token 近似；完整 OAuth 待做）
 
 ### Phase K — JSON/RPC 模式与分发（~2k 行）

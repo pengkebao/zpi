@@ -3911,6 +3911,8 @@ pub const TUI = struct {
         var tool_snippets = std.array_list.Managed(sp.ToolSnippet).init(self.alloc);
         defer tool_snippets.deinit();
         for (self.session.registry.tools.items) |t| {
+            // Only active tools are declared to the model (pi).
+            if (!t.active) continue;
             try tool_snippets.append(.{ .name = t.name, .snippet = t.description });
         }
         const new_prompt = try sp.buildFromSnippets(self.alloc, self.io, tool_snippets.items, self.cwd_abs, cfg.base_dir, self.append_system_prompt, self.system_prompt_override, block);
