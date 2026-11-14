@@ -121,7 +121,7 @@ pub const MousePoint = struct { col: usize, row: usize };
 pub const TUI = struct {
     // ---- Completion menu types (G4) ----
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null };
-    const MenuMode = enum { hidden, commands, models, settings };
+    const MenuMode = enum { hidden, commands, models, settings, files };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
 
     /// How a scrollback block can be re-rendered (a terminal resize
@@ -377,6 +377,15 @@ pub const TUI = struct {
     menu_items: [16]MenuEntry = undefined,
     /// Storage for formatted settings descriptions (menu_items' desc points here).
     settings_desc_buf: [16][64]u8 = undefined,
+    // ---- @file completion menu state ----
+    file_names: [16][160]u8 = undefined,
+    file_paths: [16][256]u8 = undefined,
+    file_path_lens: [16]usize = undefined,
+    /// Byte offset of the '@' that opened the menu (per row).
+    file_at_col: [16]usize = undefined,
+    /// The token last applied by completion: the file menu stays closed
+    /// until the token changes again (pi dismisses on selection).
+    at_suppress: ?[]u8 = null,
     menu_len: usize = 0,
     menu_selected: usize = 0,
 
@@ -462,6 +471,150 @@ pub const TUI = struct {
             return;
         }
 
+        // "@path" completion: the cursor sits right after an "@token" on the
+        // current line ('@' at line start or after whitespace, no spaces in
+        // the token). Live fuzzy menu over cwd entries (pi editor.js
+        // autocomplete with trigger character '@').
+        if (self.editor.lineBeforeCursor()) |before| {
+            if (std.mem.lastIndexOfScalar(u8, before, '@')) |at| {
+                const tok = before[at + 1 ..];
+                const boundary_ok = at == 0 or before[at - 1] == ' ' or before[at - 1] == '\t';
+                const has_space = std.mem.indexOfAny(u8, tok, " \t") != null;
+                if (boundary_ok and !has_space) {
+                    if (self.at_suppress) |sup| {
+                        if (std.mem.eql(u8, tok, sup)) {
+                            self.menu_mode = .hidden;
+                            return;
+                        }
+                        self.alloc.free(sup);
+                        self.at_suppress = null;
+                    }
+                    if (tok.len == 0 or fuzzyScore("", "") != null) {
+                        self.fillFileMenu(tok, at);
+                        return;
+                    }
+                    self.fillFileMenu(tok, at);
+                    return;
+                }
+            }
+        }
+
+        self.menu_mode = .hidden;
+    }
+
+    /// Fill the file menu for an "@query" token: base dir from the query's
+    /// directory part (pi getBaseDirSuggestions), fuzzy filter, depth/length
+    /// tie-breaks, cap 16. Directories render with a trailing '/' and
+    /// complete with one (pi buildCompletionValue).
+    fn fillFileMenu(self: *TUI, query: []const u8, at_col: usize) void {
+        self.menu_len = 0;
+        self.menu_selected = 0;
+        const cwd = self.cwd_abs;
+        // Split query into (dir_part, name_part).
+        var dir_part: []const u8 = "";
+        var name_part: []const u8 = query;
+        if (std.mem.lastIndexOfScalar(u8, query, '/')) |slash| {
+            dir_part = query[0 .. slash + 1]; // keep trailing '/'
+            name_part = query[slash + 1 ..];
+        }
+        const base = if (dir_part.len > 0)
+            std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ cwd, dir_part }) catch return
+        else
+            self.alloc.dupe(u8, cwd) catch return;
+        defer self.alloc.free(base);
+
+        var dir = std.Io.Dir.cwd().openDir(self.io, base, .{}) catch {
+            self.menu_mode = .hidden;
+            return;
+        };
+        defer dir.close(self.io);
+
+        var candidates: [16]struct { src: usize, name_len: usize, path_len: usize, score: u32, is_dir: bool } = undefined;
+
+        var n: usize = 0;
+        var it = dir.iterateAssumeFirstIteration();
+        while (it.next(self.io) catch null) |entry| {
+            if (n >= candidates.len) break;
+            const nm = entry.name;
+            // Hidden files only surface when the query starts with '.'.
+            if (nm.len > 0 and nm[0] == '.' and (name_part.len == 0 or name_part[0] != '.')) continue;
+            const score = if (name_part.len == 0)
+                @as(u32, 1)
+            else
+                fuzzyScore(nm, name_part) orelse continue;
+            const with_slash: []const u8 = if (entry.kind == .directory) "/" else "";
+            const full_len = dir_part.len + nm.len + with_slash.len;
+            candidates[n] = .{
+                .src = n,
+                .name_len = @min(nm.len, self.file_names[0].len - 1),
+                .path_len = @min(full_len, self.file_paths[n].len - 1),
+                .score = score + (if (entry.kind == .directory) @as(u32, 10) else 0),
+                .is_dir = entry.kind == .directory,
+            };
+            const nb = self.file_names[n][0..candidates[n].name_len];
+            @memcpy(nb, nm[0..candidates[n].name_len]);
+            // Full relative path for insertion: dir_part ++ name (+ '/' for dirs).
+            const full = std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ dir_part, nm, with_slash }) catch continue;
+            defer self.alloc.free(full);
+            @memcpy(self.file_paths[n][0..candidates[n].path_len], full[0..candidates[n].path_len]);
+            n += 1;
+        }
+        if (n == 0) {
+            self.menu_mode = .hidden;
+            return;
+        }
+        // Sort: score desc, then path length asc (pi's tie-breaks).
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            var j = i;
+            const cur = candidates[i];
+            while (j > 0 and candidates[j - 1].score < cur.score) : (j -= 1) {
+                candidates[j] = candidates[j - 1];
+            }
+            candidates[j] = cur;
+        }
+        // Reorder the parallel buffers to match.
+        var ordered_names: [16][160]u8 = undefined;
+        var ordered_paths: [16][256]u8 = undefined;
+        var ordered_lens: [16]usize = undefined;
+        var ordered_at: [16]usize = undefined;
+        for (0..n) |k| {
+            const src = candidates[k].src;
+            const nl = candidates[k].name_len;
+            const pl = candidates[k].path_len;
+            @memcpy(ordered_names[k][0..nl], self.file_names[src][0..nl]);
+            @memcpy(ordered_paths[k][0..pl], self.file_paths[src][0..pl]);
+            ordered_lens[k] = pl;
+            ordered_at[k] = at_col;
+        }
+        self.file_names = ordered_names;
+        self.file_paths = ordered_paths;
+        self.file_path_lens = ordered_lens;
+        self.file_at_col = ordered_at;
+        for (0..n) |k| {
+            const nm = self.file_names[k][0..candidates[k].name_len];
+            const slash: []const u8 = if (candidates[k].is_dir) "/" else "";
+            self.menu_items[k] = .{ .name = nm, .desc = self.file_paths[k][0..candidates[k].path_len] };
+            _ = slash;
+        }
+        self.menu_len = n;
+        self.menu_mode = .files;
+    }
+
+    /// Apply the selected file completion: replace the "@token" before the
+    /// cursor with "@selected" (directories keep their trailing '/').
+    fn applyFileCompletion(self: *TUI) void {
+        if (self.menu_len == 0 or self.menu_selected >= self.menu_len) return;
+        const path = self.file_paths[self.menu_selected][0..self.file_path_lens[self.menu_selected]];
+        if (path.len == 0) return;
+        const at = self.file_at_col[self.menu_selected];
+        const col = self.editor.cursorPos().col;
+        const insertion = std.fmt.allocPrint(self.alloc, "@{s}", .{path}) catch return;
+        defer self.alloc.free(insertion);
+        self.editor.replaceRange(at, col, insertion) catch return;
+        // Suppress re-opening until the token changes.
+        if (self.at_suppress) |old| self.alloc.free(old);
+        self.at_suppress = self.alloc.dupe(u8, insertion[1..]) catch null;
         self.menu_mode = .hidden;
     }
 
@@ -477,6 +630,10 @@ pub const TUI = struct {
     /// Complete the editor text with the selected menu entry (Tab).
     fn menuComplete(self: *TUI) void {
         if (self.menu_len == 0) return;
+        if (self.menu_mode == .files) {
+            self.applyFileCompletion();
+            return;
+        }
         const e = self.menu_items[self.menu_selected];
         const text = if (self.menu_mode == .models)
             std.fmt.allocPrint(self.alloc, "/model {s} ", .{e.name}) catch return
@@ -510,6 +667,10 @@ pub const TUI = struct {
                     };
                 }
                 self.editor.clear() catch {};
+                return false;
+            },
+            .files => {
+                self.applyFileCompletion();
                 return false;
             },
             .settings => {
@@ -1222,6 +1383,7 @@ pub const TUI = struct {
         for (self.tool_calls.items) |*e| e.deinit(self.session.alloc);
         self.tool_calls.deinit(self.session.alloc);
         self.thinking_blocks.deinit(self.alloc);
+        if (self.at_suppress) |sup| self.alloc.free(sup);
         self.user_blocks.deinit(self.alloc);
         self.thinking_shut.deinit(self.alloc);
         for (self.prev_lines.items) |l| self.alloc.free(l);
@@ -4273,6 +4435,35 @@ pub const TUI = struct {
             }
 
             // Completion menu navigation (takes precedence over editor keys).
+            if (self.menu_mode == .files) {
+                if (self.bindings.matches(key, .menu_up)) {
+                    if (self.menu_selected > 0) self.menu_selected -= 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_down)) {
+                    if (self.menu_selected + 1 < self.menu_len) self.menu_selected += 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_close)) {
+                    self.menu_mode = .hidden;
+                    if (self.at_suppress) |sup| {
+                        self.alloc.free(sup);
+                        self.at_suppress = null;
+                    }
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    self.applyFileCompletion();
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_tab)) {
+                    self.applyFileCompletion();
+                    self.updateMenu();
+                    self.redraw();
+                    continue;
+                }
+                // anything else falls through to the editor (live filtering)
+            }
             if (self.menu_mode == .settings) {
                 // Modal settings selector: only menu keys respond.
                 if (self.bindings.matches(key, .menu_up)) {
@@ -4388,11 +4579,8 @@ pub const TUI = struct {
                     self.startWatch();
                     self.redraw();
                     const run_err: ?anyerror = if (self.session.runPrompt(text_to_send)) |_| null else |e| e;
-                    if (expanded_input.ptr != text_to_send.ptr or expanded_input.ptr != input.ptr) {
-                        // text_to_send is the expanded allocation; input was
-                        // freed when expansion succeeded.
-                        self.alloc.free(text_to_send);
-                    }
+                    // text_to_send is freed once at the end of the turn
+                    // (it owns the expanded copy or the raw input).
                     // The callback rendered events as they came; take the rest.
                     self.drainTurnEvents();
                     // The events normally cover everything that streamed. What
@@ -4432,7 +4620,9 @@ pub const TUI = struct {
                     self.loader.stop();
                     // A tool may have switched branches.
                     self.refreshGitBranch();
-                    self.alloc.free(input);
+                    // Owns either `expanded_input` (input already freed at
+                    // the expansion site) or `input` itself — exactly once.
+                    self.alloc.free(text_to_send);
                     if (self.session.isAborted()) {
                         agent.clearAbort();
                         self.addMessage(FG_ERROR ++ "Operation aborted" ++ "\x1b[0m");

@@ -137,7 +137,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | `/model`（Ctrl+L）、`/thinking`（Shift+Tab 循环） | ✅ | ✅ | /model 模糊匹配切换 + ctrl+p/shift+ctrl+p 循环 + ctrl+l 列表；/think + shift+tab 档位循环；全屏 selector 🚧 |
 | `/hotkeys` | ✅ | ✅ | |
 | `/settings` 对话框、`/debug` | ✅ | ✅ | /settings：模态选择器（菜单基建复用，Up/Down/Enter/Esc）——Auto-compact 开关、reserve/keepRecent tokens 档位循环、Default model 循环；Enter 生效并**保真写回 settings.json**（未知字段保留）；/debug：终端尺寸 + 全部渲染行（含可见宽度）+ 会话消息 JSONL → /tmp/rpi-debug-*.log |
-| `!cmd` / `!!cmd`、`@file` 补全、Tab 路径补全 | ✅ | ✅ | !cmd/!!cmd（本轮已实现，见上下文组装节）；编辑器 @path Tab 补全（G4，common-prefix）；CLI `@file` 位置参数（文本+图片附件） |
+| `!cmd` / `!!cmd`、`@file` 补全、Tab 路径补全 | ✅ | ✅ | !cmd/!!cmd ✅；**@file 实时菜单** ✅（输入 `@token` 即弹：token 边界检测（@ 在行首/空白后、无空格）、目录部分进入子目录、fuzzy 过滤+目录加权+深度排序、目录带 `/` 补全、选择后抑制重弹（token 相同不再弹出）、Tab/Enter 应用、Esc 关闭、继续输入实时过滤——pi autocomplete `@` 触发语义；简化：无 fd 工具递归遍历（仅 cwd+子目录进入））；CLI `@file` 位置参数 ✅ |
 | Ctrl+G 外部编辑器 | ✅ | ✅ | $EDITOR/VISUAL，挂起→编辑→恢复全量重绘 |
 | 运行中输入（steering/follow-up/Escape 中断） | ✅ | ✅ | Escape/Ctrl+C 中断✅；**steering 队列**✅（运行中 Enter → 下一 LLM 请求前注入 context，pi getSteeringMessages 语义）；**follow-up 队列**✅（alt+enter 排队 → 回合结束自动续跑为新回合，pi followUpQueue）；**alt+up/alt+v 恢复排队消息到编辑器**✅（app.message.dequeue）；运行中编辑器 live（watcher 分发编辑器键，光标常驻输入框） |
 | Ctrl+O 折叠工具输出、Ctrl+T 隐藏 thinking | ✅ | ✅ | Ctrl+O 预览↔全文；Ctrl+T 全局显隐 + 单块点击折叠 |

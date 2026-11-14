@@ -99,6 +99,25 @@ pub const Editor = struct {
         return .{ .row = self.cursor_line, .col = self.cursor_col };
     }
 
+    /// Borrow the text on the cursor's line before the cursor column
+    /// (null when the cursor column is out of range for that line).
+    pub fn lineBeforeCursor(self: *const Editor) ?[]const u8 {
+        const line = self.lines.items[self.cursor_line];
+        if (self.cursor_col > line.len) return null;
+        return line[0..self.cursor_col];
+    }
+
+    /// Replace range [start, end) of the cursor's line with `insertion`
+    /// and park the cursor after it (file-completion application).
+    pub fn replaceRange(self: *Editor, start: usize, end: usize, insertion: []const u8) !void {
+        const line = self.lines.items[self.cursor_line];
+        if (end > line.len or start > end) return error.BadRange;
+        const new_line = try std.fmt.allocPrint(self.lines.allocator, "{s}{s}{s}", .{ line[0..start], insertion, line[end..] });
+        self.lines.allocator.free(line);
+        self.lines.items[self.cursor_line] = new_line;
+        self.cursor_col = start + insertion.len;
+    }
+
     /// Visual column of the cursor (wide-char aware). `cursor_col` is a byte
     /// offset, but CJK chars occupy 2 columns, so the hardware cursor must be
     /// positioned by the visual width of the line prefix, not the byte count.
