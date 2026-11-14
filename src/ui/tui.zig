@@ -529,6 +529,83 @@ pub const TUI = struct {
         self.redraw();
     }
 
+    /// Cycle the thinking level off→low→medium→high→xhigh→max→off
+    /// (pi: app.thinking.cycle, shift+tab).
+    fn cycleThinkingLevel(self: *TUI) void {
+        const levels = [_]config.ThinkingLevel{ .off, .low, .medium, .high, .xhigh, .max };
+        var idx: usize = 0;
+        for (levels, 0..) |l, i| {
+            if (l == self.session.thinking_level) idx = i;
+        }
+        self.session.thinking_level = levels[(idx + 1) % levels.len];
+        self.flash(self.session.thinking_level.name());
+        self.redraw();
+    }
+
+    /// Cycle to the next/previous configured model (pi: app.model.cycle,
+    /// ctrl+p / shift+ctrl+p). Wraps around the flattened models list.
+    fn cycleModel(self: *TUI, dir: isize) void {
+        const cfg = self.cfg orelse {
+            self.flash("no config — selector unavailable");
+            return;
+        };
+        const n = cfg.models.items.len;
+        if (n == 0) return;
+        var idx: usize = 0;
+        for (cfg.models.items, 0..) |m, i| {
+            if (std.mem.eql(u8, m.name, self.model_name)) idx = i;
+        }
+        const next: usize = @intCast(@mod(@as(isize, @intCast(idx)) + dir, @as(isize, @intCast(n))));
+        self.switchModel(next) catch |err| {
+            self.note("model switch failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Copy the selection, or the last assistant reply when nothing is
+    /// selected (pi: app.message.copy, ctrl+x).
+    fn copyLastMessage(self: *TUI) void {
+        if (self.selectionText()) |text| {
+            defer self.alloc.free(text);
+            self.copyToClipboard(text);
+            self.flash("Copied!");
+            self.redraw();
+            return;
+        }
+        const msgs = self.session.context.messages.items;
+        var i = msgs.len;
+        while (i > 0) {
+            i -= 1;
+            const m = &msgs[i];
+            if (m.role != .assistant) continue;
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(self.alloc);
+            for (m.blocks.items) |b| switch (b) {
+                .text => |t| {
+                    if (buf.items.len > 0) buf.appendSlice(self.alloc, "\n\n") catch {};
+                    buf.appendSlice(self.alloc, t) catch {};
+                },
+                else => {},
+            };
+            if (buf.items.len == 0) continue;
+            self.copyToClipboard(buf.items);
+            self.flash("Copied!");
+            self.redraw();
+            return;
+        }
+        self.flash("Nothing to copy");
+        self.redraw();
+    }
+
+    /// Suspend to background (pi: app.suspend, ctrl+z). Restores the tty so
+    /// the shell takes over; the default SIGTSTP stops us and SIGCONT
+    /// resumes right after the raise, where we re-enter raw mode and
+    /// repaint from scratch.
+    fn suspendToBackground(self: *TUI) void {
+        self.restoreTerminal();
+        std.posix.raise(std.posix.SIG.TSTP) catch {};
+        self.resumeTui();
+    }
+
     /// Open $EDITOR (fallback: $VISUAL, vi) with the current prompt buffer.
     /// Suspends the TUI (leaves alt-screen, restores cooked mode), runs the
     /// editor on a temp file, then resumes and loads the result.
@@ -537,7 +614,7 @@ pub const TUI = struct {
             std.process.Environ.getPosix(self.environ, "VISUAL") orelse "vi";
 
         var path_buf: [64]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/tmp/rpi-prompt-{d}.md", .{std.os.linux.getpid()}) catch return;
+        const path = std.fmt.bufPrint(&path_buf, "/tmp/rpi-prompt-{d}.md", .{std.c.getpid()}) catch return;
 
         // Write the current editor content to the temp file.
         const text = self.editor.getText() catch return;
@@ -3730,6 +3807,38 @@ pub const TUI = struct {
             if (self.bindings.matches(key, .toggle_thinking)) {
                 self.thinking_hidden = !self.thinking_hidden;
                 self.redraw();
+                continue;
+            }
+
+            // pi: app.thinking.cycle (shift+tab), app.model.cycle (ctrl+p /
+            // shift+ctrl+p), app.model.select (ctrl+l), app.message.copy
+            // (ctrl+x), app.suspend (ctrl+z), app.exit (ctrl+d).
+            if (self.bindings.matches(key, .thinking_cycle)) {
+                self.cycleThinkingLevel();
+                continue;
+            }
+            if (self.bindings.matches(key, .model_next)) {
+                self.cycleModel(1);
+                continue;
+            }
+            if (self.bindings.matches(key, .model_prev)) {
+                self.cycleModel(-1);
+                continue;
+            }
+            if (self.bindings.matches(key, .model_select)) {
+                _ = self.handleCommand("/model");
+                continue;
+            }
+            if (self.bindings.matches(key, .copy_message)) {
+                self.copyLastMessage();
+                continue;
+            }
+            if (self.bindings.matches(key, .suspend_bg)) {
+                self.suspendToBackground();
+                continue;
+            }
+            if (self.bindings.matches(key, .exit_empty)) {
+                if (self.editor.isEmpty()) break;
                 continue;
             }
 

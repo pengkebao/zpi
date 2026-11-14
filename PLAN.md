@@ -354,6 +354,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
   - **实测**（pty + mock 流式服务器，30×90）：单个滚轮步 3141→638B（DECSTBM+RI ~20B + 1 行露出内容 + hint 离群行 + 2 个 thumb 差量单元格，其余为空闲 poll 帧）；PageUp/ctrl+end 均走原生滚动；会话总输出 336KB→247KB；滚上去/回底逐字节一致、流式中滚动不弹跳等 e2e 14 项全过
   - 单测：verifyShift（up/down/离群/预算拒绝）、detectShift（scroll_delta 定向、流式增长回退、非位移拒绝）4 项进 tui.zig
   - **链式写入跨间隙错位修复**（用户反馈三截图：上滚后 hint 标签在中间列逐行堆叠、stale Working 边框行残留、菜单打开后光标停在输入行下一行）：`\r\n` 链式写入只在“上一画行 == 本行-1”时合法，但绘制循环跳过不需重绘的行后仍沿用链式状态 → 跨间隙的内容全部写到错误的屏幕行（hint 行内容画到 row 1、离群行画丢、后续帧的 diff 基座与屏幕永久不一致）；改为跟踪 `last_painted`，间隙后回退绝对 `moveTo`（pty + pyte 逐字节重放复现并验证：hint 恒在一行、流式中滚动无 stale 行、菜单光标对位）
+- **TUI 功能对齐审计 + 六个缺失键位**（用户要求盘点差距并实现）：对照 pi 1.5.0 的 47 个 keybinding 与全部命令逐一核对。**新实现**（pi 默认键位）：shift+tab → thinking 档位循环（app.thinking.cycle，off→low→…→max→off，flash 提示）；ctrl+p / shift+ctrl+p → 模型循环切换（app.model.cycleForward/Backward，按 cfg.models 展平列表 wrap）；ctrl+l → 模型列表展示（app.model.select 的弱选择器替代）；ctrl+x → 复制选区或最后 assistant 回复（app.message.copy，OSC52）；ctrl+z → 挂起后台（app.suspend，restoreTerminal → SIGTSTP → SIGCONT 后 resumeTui 全量重绘）；ctrl+d → 空编辑器时退出（app.exit）。附带修复：copyLastMessage 漏 redraw 导致 flash 不显示；openExternalEditor 用 std.os.linux.getpid()（macOS 假实现）改 std.c.getpid()。E2E 6/6 过。**已实现清单**（详见本条目后附表）与**暂缓差距**（steering/follow-up 排队、图片粘贴/文件拖放、/themes /settings /skills /trust /login /share /import /clone、editor undo/kill-ring、app.session.toggleNamedFilter）见审计表
 - **欢迎头对齐 pi 结构与文案**（用户反馈：pi 继续会话时欢迎/技能信息不展示在历史下，要求对齐）：查证 pi 结构——headerContainer 是 documentContainer 的子节点，**欢迎头就是滚动文档的第一块**（随文档滚动，继续会话时视窗钉底故日常不可见；技能列表默认隐藏仅 verbose 展开；changelog 有历史时跳过）。我们此前把欢迎信息用 addMessage 加在 run() 里——排在 replaySession 的历史**之后**，夹在历史和输入框之间。修复：新增 `addWelcomeHeader()`（bold wordmark `rpi` + dim `v0.1.0` + muted 快捷键行 `esc interrupt · ctrl+c clear/exit · / commands · ctrl+o tools · ctrl+t thinking` + dim onboarding 行，对齐 pi compact header 文案），replaySession 开头先加欢迎头再回放历史（header 恒为文档首块）；删除 run() 里的旧欢迎块（模型信息 footer 已有，对齐 pi）。实测：新会话顶部显示新欢迎头、继续会话底部视口纯历史、181+153 测试全过
 - **`-c` 回放宽度错误**（用户截图：历史内容固定半屏 ~80 列宽，不铺满终端）：replaySession 在 run()/setupTerminal 之前执行，此时 width 仍是 init 默认 80——所有回放块按 80 列渲染；而 setupTerminal 的 measureSize 只改字段不触发重渲染，首帧 refreshSize 比较发现“无变化”，rerenderAtWidth 永不执行，80 列渲染永久保留。修复：replaySession 开头在 render_mutex 下先 measureSize() 再渲染。实测 117 列终端下历史内容铺满全宽（气泡/文本/工具块），181+153 测试全过
 - **`-c`/`-r` 继续会话界面回放**（用户反馈：`rpi -c` 不能继续会话）：对比 pi 原版发现上下文恢复其实早已实现（`-p` 模式验证通过、branchMessages → session.context），缺的是 **TUI 界面回放**——pi 启动时 `renderInitialMessages → renderSessionEntries` 把持久化消息渲染进 chat（assistant 文本/thinking 为消息块、toolCall 为工具块、toolResult 按 id 配对回填）。修复：TUI 新增 `replaySession()`（main.zig 启动时调用，无 store/空分支 no-op）——user → 用户消息块（多 text 拼接）、assistant 按块序 thinking/text/tool_call → thinking 块/markdown/折叠工具块（ToolEntry 直接入列）、tool 角色 → 按 tool_call_id 匹配回填结果。实测：-c 打开后历史完整可见（thinking、用户消息、markdown 回复、`edit ~/.pi/agent/models.json` 折叠工具块），滚动可及；新会话启动无变化；181+153 测试全过
@@ -433,3 +434,68 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | J. MCP | ~2,000 | 高 | E/I |
 | K. JSON/RPC/分发（含六平台矩阵） | ~2,000 | 中 | B/I |
 | **总计** | **~21,800** | | 当前已完成 ~2,400 |
+
+
+---
+
+## 附：TUI 功能对齐审计表（对照 pi 1.5.0，2026-11）
+
+### 命令
+
+| 命令 | pi | rpi | 状态 |
+|---|---|---|---|
+| /help /clear /exit /quit /hotkeys | ✓ | ✓ | 已实现 |
+| /model [name] | ✓ | ✓ | 已实现（模糊匹配切换） |
+| /think [level]（pi: /thinking） | ✓ | ✓ | 已实现（off/low/medium/high/xhigh/max） |
+| /session /name /new /tree /fork /resume | ✓ | ✓ | 已实现 |
+| /compact [hint] | ✓ | ✓ | 已实现（runCompaction + auto-compact 阈值） |
+| /changelog | ✓ | — | 无版本日志体系，不适用 |
+| /export /copy /share | ✓ | /copy 未做 | 缺口（copy/export 低成本可加） |
+| /themes /settings /skills /trust /login /logout /scoped-models /mcp | ✓ | — | 暂缓（依赖主题/技能/扩展体系） |
+| /bug /debug /clone /import /reload /fork-easter-eggs | ✓ | — | 暂缓 |
+
+### 全局键位（主界面）
+
+| pi action | 默认键 | rpi | 状态 |
+|---|---|---|---|
+| app.interrupt | esc | ✓ | 已实现（中止运行中回合） |
+| app.clear | ctrl+c | ✓ | 已实现（清空编辑器/退出） |
+| app.exit | ctrl+d | ✓ | 本轮实现（空编辑器退出） |
+| app.suspend | ctrl+z | ✓ | 本轮实现 |
+| app.thinking.cycle | shift+tab | ✓ | 本轮实现 |
+| app.thinking.save | ctrl+s | — | 暂缓（保存档位到 settings） |
+| app.thinking.toggle | ctrl+t | ✓ | 已实现 |
+| app.model.cycleForward/Backward | ctrl+p / shift+ctrl+p | ✓ | 本轮实现 |
+| app.model.select | ctrl+l | ✓ | 本轮实现（列表展示；全屏 selector 暂缓） |
+| app.tools.expand | ctrl+o | ✓ | 已实现 |
+| app.editor.external | ctrl+g | ✓ | 已实现（$EDITOR） |
+| app.message.copy | ctrl+x | ✓ | 本轮实现（选区优先，否则最后回复） |
+| app.message.followUp / dequeue | alt+enter / alt+up | — | 暂缓（agent 层消息排队） |
+| app.clipboard.pasteImage | ctrl+v | — | 暂缓（图片输入管线） |
+| app.session.toggleNamedFilter | ctrl+n | — | 暂缓（session selector 过滤） |
+| tui.altScreen.search / nextPrompt / previousPrompt | ctrl+shift+f 等 | ✓ | 已实现（搜索框 + 高亮 + 导航） |
+| tui.altScreen.* 滚动（pageUp/Down、ctrl+home/end、half/line 可配） | ✓ | ✓ | 已实现 |
+| prompt_previous/next（用户消息跳转） | ctrl+up/down | ✓ | 已实现 |
+| editor：多行、history（ctrl+up）、kill-ring、undo、word-nav | ✓ | 部分 | undo/kill-ring 暂缓 |
+| 文件拖放 / 图片粘贴 | ✓ | — | 暂缓 |
+
+### 交互与渲染
+
+| 功能 | pi | rpi | 状态 |
+|---|---|---|---|
+| 差分渲染 + DECSTBM 原生滚动 + 位移检测 | ✓ | ✓ | 已实现（自研差分 + 校验回退） |
+| 滚动条（auto 显隐 + 拖拽 + 点击吸附） | ✓ | ✓ | 已实现 |
+| Jump to latest hint（ctrl+end / 点击） | ✓ | ✓ | 已实现 |
+| 流式 markdown 块级增量渲染 | ✓ | ✓ | 已实现（renderSegment 拼接逐字节一致） |
+| thinking 块（折叠/点击展开） | ✓ | ✓ | 已实现（ctrl+t 全局 + 点击单块） |
+| 工具块（折叠/展开/点击/耗时/错误着色） | ✓ | ✓ | 已实现 |
+| 会话持久化 + -c/-r 继续 + 界面回放 | ✓ | ✓ | 已实现（replaySession 对齐 renderInitialMessages） |
+| 压缩（手动 + 自动 + 压缩摘要块） | ✓ | ✓ | 已实现 |
+| 启动欢迎头（文档首块、继续会话不可见） | ✓ | ✓ | 已实现（addWelcomeHeader 对齐 compact 文案） |
+| 补全菜单（/ 命令、模型名） | ✓ | ✓ | 已实现（编辑器内联菜单） |
+| 搜索（转写内查找/高亮/导航） | ✓ | ✓ | 已实现 |
+| 鼠标：点击折叠、拖拽选区、松开复制、滚轮 | ✓ | ✓ | 已实现（含水平滚轮过滤 pi parity） |
+| footer（token/cost/git 分支/cwd/模型） | ✓ | ✓ | 已实现 |
+| steering（运行中改向）+ follow-up 排队 | ✓ | — | 暂缓（需 agent 层队列） |
+| 会话分享/导出（share/export） | ✓ | — | 暂缓 |
+| 扩展/技能/MCP 体系 | ✓ | — | 暂缓（架构级） |

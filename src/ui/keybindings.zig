@@ -52,6 +52,13 @@ pub const Action = enum(u8) {
     search_next, // enter / ctrl+g, while the search box is open
     search_previous, // shift+enter / ctrl+shift+g
     search_close, // escape
+    thinking_cycle, // shift+tab: cycle thinking level (pi: app.thinking.cycle)
+    model_next, // ctrl+p: cycle to the next model (pi: app.model.cycleForward)
+    model_prev, // shift+ctrl+p: previous model (pi: app.model.cycleBackward)
+    model_select, // ctrl+l: show the model list (pi: app.model.select)
+    copy_message, // ctrl+x: copy selection or last reply (pi: app.message.copy)
+    suspend_bg, // ctrl+z: suspend to background (pi: app.suspend)
+    exit_empty, // ctrl+d: exit when the editor is empty (pi: app.exit)
 
     pub const count = @typeInfo(Action).@"enum".field_names.len;
 
@@ -101,6 +108,13 @@ pub const Bindings = struct {
         b.set(.search_previous, parseKeyStr("shift+enter") orelse Key.shift_enter);
         b.set(.search_previous, parseKeyStr("ctrl+shift+g") orelse Key.escape);
         b.set(.search_close, parseKeyStr("escape") orelse Key.escape);
+        b.set(.thinking_cycle, parseKeyStr("shift+tab") orelse Key.shift_tab);
+        b.set(.model_next, parseKeyStr("ctrl+p") orelse .{ .char = .{ .c = 'p', .ctrl = true, .alt = false } });
+        b.set(.model_prev, parseKeyStr("shift+ctrl+p") orelse .{ .char = .{ .c = 'p', .ctrl = true, .alt = false, .shift = true } });
+        b.set(.model_select, parseKeyStr("ctrl+l") orelse .{ .char = .{ .c = 'l', .ctrl = true, .alt = false } });
+        b.set(.copy_message, parseKeyStr("ctrl+x") orelse .{ .char = .{ .c = 'x', .ctrl = true, .alt = false } });
+        b.set(.suspend_bg, parseKeyStr("ctrl+z") orelse .{ .char = .{ .c = 'z', .ctrl = true, .alt = false } });
+        b.set(.exit_empty, parseKeyStr("ctrl+d") orelse .{ .char = .{ .c = 'd', .ctrl = true, .alt = false } });
         return b;
     }
 
