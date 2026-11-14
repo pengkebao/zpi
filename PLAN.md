@@ -80,14 +80,14 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
-| JSONL 持久化（v3 树结构 id/parentId） | ✅ | ❌ | `~/.pi/agent/sessions/--path--/<ts>_<uuid>.jsonl` |
+| JSONL 持久化（v3 树结构 id/parentId） | ✅ | ✅ | `~/.pi/agent/sessions/--path--/<ts>_<uuid>.jsonl`；分支树 + branchMessages |
 | 会话头/消息/压缩/分支摘要/自定义条目 | ✅ | ❌ | entry 类型全集见 session-format.md |
 | `--continue` 最近会话 | ✅ | ✅ | |
 | `--resume` 选择器 | ✅ | ⚠️ | CLI 有 --resume/--session <id>；交互选择器在 TUI /resume |
 | `--session`/`--fork`/`--no-session`/`--name`/`--session-dir` | ✅ | ✅ | 支持 path 或 partial id |
 | `/new` `/resume` `/name` `/session` `/tree` `/fork` `/clone` `/import` | ✅ | ⚠️ | 缺 /clone /import |
 | 树导航 + 分支摘要 | ✅ | ⚠️ | /tree 只读展示；无交互导航/分支摘要 |
-| /export（HTML/JSONL）、/copy、/share（gist/radius） | ✅ | ⚠️ | /export HTML + /copy 已有；缺 /share |
+| /export（HTML/JSONL）、/copy、/share（gist/radius） | ✅ | ❌ | 均未实现；复制场景由 ctrl+x（选区/最后回复，OSC52）覆盖 |
 | 会话按 cwd 分组、选择器搜索/改名/删除 | ✅ | ⚠️ | cwd 分组 + /name 改名已有；选择器搜索/删除待补 |
 
 ### 5. 压缩（Compaction）
@@ -123,24 +123,28 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 
 ### 7. 交互 TUI
 
+> 2026-11 刷新：对照 pi 1.5.0 全量核对。本轮新增：shift+tab thinking 循环、ctrl+p/shift+ctrl+p 模型循环、ctrl+l 模型列表、ctrl+x 复制、ctrl+z 挂起、ctrl+d 空退出、会话继续界面回放、欢迎头对齐（详见文末审计表与本文件各条目）。
+
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
-| 全屏模式（alt-screen、固定编辑器/页脚、滚动区） | ✅ | ✅ | 批次 8+9：ScrollView 模型（wheel 加速/Ctrl+End 滚动、顶/底饱和不回绕、内容锚定不跟随）、滚动条（悬停/拖动/1s 自动隐藏）、"Jump to latest" 标签（叠最后一行、点击跳底）、PageUp/Down/Ctrl+Home/End、Ctrl+↑/↓ 用户消息跳转、Ctrl+Shift+F 转录搜索（语料构建/大小写折叠/高亮/回车·Shift+回车循环导航/右上角浮动搜索框）；e2e 全过 |
-| regular 模式（用终端原生 scrollback） | ✅ | ❌ | |
-| 多行编辑器（Shift+Enter、历史、光标移动） | ✅ | ⚠️ | 多行/历史/光标✅；Shift+Enter 经 Kitty 键盘协议✅（Ghostty 等）；待 Ctrl+G 外部编辑器 |
-| `/` 命令菜单 + 模糊搜索 | ✅ | ❌ | 现在硬编码 /exit /help /clear |
-| `/model` 选择器（Ctrl+L）、`/thinking`（Shift+Tab 循环） | ✅ | ❌ | |
-| `/settings` 对话框、`/hotkeys`、`/debug` | ✅ | ❌ | |
+| 全屏模式（alt-screen、固定编辑器/页脚、滚动区） | ✅ | ✅ | ScrollView 模型（wheel 加速/Ctrl+End 饱和、内容锚定）、滚动条（悬停/拖动/1s 隐藏）、Jump to latest 标签、PageUp/Down/Ctrl+Home/End、Ctrl+↑/↓ 用户消息跳转、Ctrl+Shift+F 搜索（语料/高亮/导航/浮框）；差分渲染 + DECSTBM 原生滚动 + 位移检测校验；到底惰性（no-op 拉拽零字节）；流式帧固定 22ms 节奏 |
+| regular 模式（终端原生 scrollback） | ✅ | ❌ | |
+| 多行编辑器（Shift+Enter、历史、光标移动） | ✅ | ✅ | Shift+Enter/ctrl+j（Kitty 协议）、Ctrl+↑/↓ 输入历史、全光标移动 |
+| `/` 命令菜单 + 模糊搜索 | ✅ | ✅ | 13 条命令（/help /clear /exit /model /think /session /name /new /tree /fork /resume /compact /hotkeys）+ `/` 补全菜单 + 模型名补全 |
+| `/model`（Ctrl+L）、`/thinking`（Shift+Tab 循环） | ✅ | ✅ | /model 模糊匹配切换 + ctrl+p/shift+ctrl+p 循环 + ctrl+l 列表；/think + shift+tab 档位循环；全屏 selector 🚧 |
+| `/hotkeys` | ✅ | ✅ | |
+| `/settings` 对话框、`/debug` | ✅ | ❌ | |
 | `!cmd` / `!!cmd`、`@file` 补全、Tab 路径补全 | ✅ | ❌ | |
-| Ctrl+G 外部编辑器 | ✅ | ❌ | |
-| 运行中输入（steering/follow-up/Escape 中断） | ✅ | ⚠️ | Escape/Ctrl+C 中断✅（watch 线程）；steering/follow-up 队列待做 |
-| Ctrl+O 折叠工具输出、Ctrl+T 隐藏 thinking | ✅ | ✅ | 批次 8：Ctrl+O 预览↔全文（原地重渲染）；Ctrl+T 按块索引隐藏 |
-| 页脚（cwd、session、model、context%、cost） | ✅ | ✅ | 批次 8：cwd+git 分支+session 名；↑↓R/W/CH$、ctx% 一位小数+70/90 变色+(auto)；右侧 (provider) model • thinking |
-| 启动 header（已加载资源清单） | ✅ | ❌ | |
-| markdown 渲染 + 代码高亮 + diff 视图 | ✅ | ⚠️ | 批次 8：markdown 全块（标题三式/有序无序任务列表/嵌套/表格全边框/引用/hr/链接+裸URL）；轻量代码高亮（keyword/string/number/comment，pi 色板）；diff 行号红/绿/上下文色；待：diff 行内 word 级高亮、OSC8、LaTeX |
+| Ctrl+G 外部编辑器 | ✅ | ✅ | $EDITOR/VISUAL，挂起→编辑→恢复全量重绘 |
+| 运行中输入（steering/follow-up/Escape 中断） | ✅ | ⚠️ | Escape 中断✅（watch 线程）；steering/follow-up 队列待做 |
+| Ctrl+O 折叠工具输出、Ctrl+T 隐藏 thinking | ✅ | ✅ | Ctrl+O 预览↔全文；Ctrl+T 全局显隐 + 单块点击折叠 |
+| 页脚（cwd、session、model、context%、cost） | ✅ | ✅ | cwd+git 分支+session 名；↑↓R/W/CH$、ctx% 变色+(auto)；右侧 (provider) model • thinking |
+| 启动 header（欢迎 + 已加载资源清单） | ✅ | 🚧 | 欢迎头✅：文档首块（pi headerContainer 语义，继续会话钉底不可见）、compact 文案（wordmark+版本+快捷键+onboarding）；"已加载资源清单"（Context/Skills/Extensions）⏳ |
+| 会话继续界面回放（-c/-r） | ✅ | ✅ | replaySession 对齐 pi renderInitialMessages：user/assistant/thinking 块 + 工具块按 id 配对回填 |
+| markdown 渲染 + 代码高亮 + diff 视图 | ✅ | ⚠️ | markdown 全块（标题/列表/嵌套/表格全边框/引用/hr/链接）；轻量代码高亮；diff 行级红绿；**流式块级增量渲染（自研增强，帧成本与流长度解耦）**；待：diff word 级高亮、OSC8、LaTeX |
 | 主题系统（JSON 主题文件、/settings 切换） | ✅ | ⚠️ | theme.zig 仅颜色枚举 |
-| 快捷键管理器（keybindings.json） | ✅ | ❌ | |
-| 鼠标、IME、OSC8 链接 | ✅ | ❌ | 可后置 |
+| 快捷键管理器（keybindings.json） | ✅ | ✅ | Action 全集（含滚动/搜索/菜单/本轮 7 个新键位）、keybindings.json 加载覆盖、pi 默认键位 |
+| 鼠标、IME、OSC8 链接 | ✅ | 🚧 | 鼠标✅：点击折叠、拖拽选区、松开复制（OSC52）、滚轮加速、水平滚轮过滤（pi parity）；IME/OSC8 ⏳ |
 
 ### 8. 进程模式
 
