@@ -7,6 +7,7 @@ const tools = @import("src/tools/registry.zig");
 const component = @import("src/ui/component.zig");
 const keys = @import("src/ui/keys.zig");
 const ss = @import("src/core/session_store.zig");
+const cmsg = @import("src/core/message.zig");
 const editor = @import("src/ui/editor.zig");
 const width = @import("src/ui/width.zig");
 const markdown = @import("src/ui/markdown.zig");
@@ -707,4 +708,80 @@ test "config.splitThinkingSuffix parses provider/model:level" {
     try std.testing.expect(cfgmod.splitThinkingSuffix("m") == null);
     // empty suffix → null
     try std.testing.expect(cfgmod.splitThinkingSuffix("m:") == null);
+}
+
+// ---- Sessions: leafChain / branchAt / forkAt / thinking level entries ----
+
+test "session: leafChain previews + branchAt/forkAt + thinking entries" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [1024]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const sdir = try std.fmt.allocPrint(alloc, "{s}/sess", .{root});
+    defer alloc.free(sdir);
+    const cwd = try std.fmt.allocPrint(alloc, "{s}/proj", .{root});
+    defer alloc.free(cwd);
+    std.Io.Dir.cwd().createDirPath(io, sdir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, cwd) catch {};
+
+    const st = try ss.Store.create(alloc, io, sdir, cwd, .{});
+    defer st.deinit();
+    var mu = cmsg.Message.init(alloc);
+    defer mu.deinit();
+    mu.role = .user;
+    try mu.blocks.append(.{ .text = cmsg.Message.allocStr(alloc, "first question") });
+    st.recordMessage(&mu);
+    var ma = cmsg.Message.init(alloc);
+    defer ma.deinit();
+    ma.role = .assistant;
+    try ma.blocks.append(.{ .text = cmsg.Message.allocStr(alloc, "an answer") });
+    st.recordMessage(&ma);
+    var mu2 = cmsg.Message.init(alloc);
+    defer mu2.deinit();
+    mu2.role = .user;
+    try mu2.blocks.append(.{ .text = cmsg.Message.allocStr(alloc, "second question") });
+    st.recordMessage(&mu2);
+
+    // leafChain: 3 message entries, user flag + preview extraction.
+    var chain: [8]ss.Store.ChainItem = undefined;
+    const cnt = st.leafChain(&chain);
+    try std.testing.expectEqual(@as(usize, 3), cnt);
+    try std.testing.expect(chain[0].is_user_message);
+    try std.testing.expect(!chain[1].is_user_message);
+    try std.testing.expect(chain[2].is_user_message);
+    try std.testing.expectEqualStrings("first question", chain[0].preview[0..chain[0].preview_len]);
+
+    // recordThinkingLevel + latestThinkingLevel.
+    st.recordThinkingLevel("high");
+    const lv = st.latestThinkingLevel(alloc).?;
+    defer alloc.free(lv);
+    try std.testing.expectEqualStrings("high", lv);
+
+    // forkAt the FIRST user message: new store has exactly that entry.
+    var id0_buf: [16]u8 = undefined;
+    @memcpy(id0_buf[0..chain[0].id_len], chain[0].id[0..chain[0].id_len]);
+    const fk = try st.forkAt(id0_buf[0..chain[0].id_len], sdir, cwd);
+    defer fk.deinit();
+    var chain2: [8]ss.Store.ChainItem = undefined;
+    const cnt2 = fk.leafChain(&chain2);
+    try std.testing.expectEqual(@as(usize, 1), cnt2);
+    try std.testing.expectEqualStrings("first question", chain2[0].preview[0..chain2[0].preview_len]);
+
+    // branchAt: leaf moves to the cut point, summary recorded, recoverable.
+    var id0_buf2: [16]u8 = undefined;
+    @memcpy(id0_buf2[0..chain[0].id_len], chain[0].id[0..chain[0].id_len]);
+    const from_copy = try alloc.dupe(u8, st.leaf_id.?);
+    defer alloc.free(from_copy);
+    st.branchAt(id0_buf2[0..chain[0].id_len], from_copy, "abandoned path summary");
+    // The new leaf is the branch_summary entry itself (children continue
+    // from the summary, pi semantics), NOT the cut point.
+    // The chain now ends with the branch summary entry.
+    var chain3: [8]ss.Store.ChainItem = undefined;
+    const cnt3 = st.leafChain(&chain3);
+    try std.testing.expectEqual(@as(usize, 2), cnt3);
+    try std.testing.expect(chain3[1].kind == .branch_summary);
+    try std.testing.expectEqualStrings("abandoned path summary", chain3[1].preview[0..chain3[1].preview_len]);
 }

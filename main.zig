@@ -622,7 +622,10 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    if (store) |st| st.deinit();
+    // The session may have swapped stores (/clone, /fork, /resume, /import):
+    // retire whatever store is current (the initial one moved into
+    // session.store at startup and swap paths retire the ones they replace).
+    if (session.store) |st| st.deinit();
     if (cwd_alloc) |c| alloc.free(c);
     if (sessions_dir_alloc) |d| alloc.free(d);
 }

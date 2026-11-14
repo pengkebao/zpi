@@ -141,6 +141,99 @@ fn writeJsonValue(out: *std.array_list.Managed(u8), v: std.json.Value) anyerror!
 }
 
 
+/// Extract a top-level string field from one JSONL entry line without a
+/// full parse: scans for "key":"..." and returns an owned copy.
+fn jsonStringField(alloc: std.mem.Allocator, line: []const u8, key: []const u8) ?[]u8 {
+    var pat_buf: [96]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":\"", .{key}) catch return null;
+    const idx = std.mem.indexOf(u8, line, pat) orelse return null;
+    var i = idx + pat.len;
+    var out = std.array_list.Managed(u8).init(alloc);
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (c == '"') return out.toOwnedSlice() catch null;
+        if (c == '\\') {
+            i += 1;
+            if (i >= line.len) break;
+            const esc = line[i];
+            const rep: u8 = switch (esc) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                else => esc,
+            };
+            out.append(rep) catch return null;
+            continue;
+        }
+        out.append(c) catch return null;
+        if (out.items.len > 4096) break;
+    }
+    out.deinit();
+    return null;
+}
+
+/// Copy text into the ChainItem preview with newlines collapsed to spaces.
+fn copyPreview(item: *Store.ChainItem, text: []const u8) void {
+    var len: usize = 0;
+    for (text) |c| {
+        if (len >= item.preview.len) break;
+        item.preview[len] = if (c == '\n' or c == '\r' or c == '\t') ' ' else c;
+        len += 1;
+    }
+    item.preview_len = len;
+}
+
+/// Fill a ChainItem's preview and user-message flag from the raw entry line.
+fn extractPreview(alloc: std.mem.Allocator, e: EntryRef, item: *Store.ChainItem) void {
+    switch (e.kind) {
+        .message => {
+            if (jsonStringField(alloc, e.line, "role")) |role| {
+                defer alloc.free(role);
+                item.is_user_message = std.mem.eql(u8, role, "user");
+            }
+            // Content is either a string or a block array: take the first
+            // text block text, falling back to the raw string content.
+            if (jsonStringField(alloc, e.line, "text")) |t| {
+                defer alloc.free(t);
+                copyPreview(item, t);
+            } else if (jsonStringField(alloc, e.line, "content")) |t| {
+                defer alloc.free(t);
+                copyPreview(item, t);
+            }
+        },
+        .session_info => {
+            if (jsonStringField(alloc, e.line, "name")) |t| {
+                defer alloc.free(t);
+                copyPreview(item, t);
+            }
+        },
+        .model_change => {
+            const provider = jsonStringField(alloc, e.line, "provider");
+            defer if (provider) |p| alloc.free(p);
+            const model_id = jsonStringField(alloc, e.line, "modelId");
+            defer if (model_id) |m| alloc.free(m);
+            if (provider != null and model_id != null) {
+                var tmp: [80]u8 = undefined;
+                const joined = std.fmt.bufPrint(&tmp, "{s}/{s}", .{ provider.?, model_id.? }) catch "";
+                copyPreview(item, joined);
+            }
+        },
+        .thinking_level_change => {
+            if (jsonStringField(alloc, e.line, "thinkingLevel")) |t| {
+                defer alloc.free(t);
+                copyPreview(item, t);
+            }
+        },
+        .compaction, .branch_summary => {
+            if (jsonStringField(alloc, e.line, "summary")) |t| {
+                defer alloc.free(t);
+                copyPreview(item, t);
+            }
+        },
+        else => {},
+    }
+}
+
 fn appendFmt(out: *std.array_list.Managed(u8), alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
     var buf: [256]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch {
@@ -792,6 +885,168 @@ pub const Store = struct {
         }
         line.appendSlice("}\n") catch return;
         self.appendLine(id, self.leaf_id, .compaction, line.items) catch {};
+    }
+
+    /// Record a thinking level change (pi v3: type "thinking_level_change").
+    pub fn recordThinkingLevel(self: *Store, level: []const u8) void {
+        const id = genEntryId(self.alloc, self.io);
+        defer self.alloc.free(id);
+        var ts_buf: [40]u8 = undefined;
+        const iso = formatIso(nowMs(self.io), &ts_buf);
+        var line = std.array_list.Managed(u8).init(self.alloc);
+        defer line.deinit();
+        appendFmt(&line, self.alloc, "{{\"type\":\"thinking_level_change\",\"id\":\"{s}\",\"parentId\":", .{id}) catch return;
+        if (self.leaf_id) |l| {
+            writeJsonStr(&line, l) catch return;
+        } else {
+            line.appendSlice("null") catch return;
+        }
+        line.appendSlice(",\"timestamp\":") catch return;
+        writeJsonStr(&line, iso) catch return;
+        line.appendSlice(",\"thinkingLevel\":") catch return;
+        writeJsonStr(&line, level) catch return;
+        line.appendSlice("}\n") catch return;
+        self.appendLine(id, self.leaf_id, .thinking_level_change, line.items) catch {};
+    }
+
+    /// The latest thinking level on the leaf path (owned), if any.
+    pub fn latestThinkingLevel(self: *Store, alloc: std.mem.Allocator) ?[]u8 {
+        // leafPath items borrow the store's entries: only the list is freed.
+        const path = self.leafPath(alloc) catch return null;
+        defer path.deinit();
+        var i = path.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = path.items[i];
+            if (e.kind != .thinking_level_change) continue;
+            if (jsonStringField(alloc, e.line, "thinkingLevel")) |lv| return lv;
+        }
+        return null;
+    }
+
+    /// The latest model change on the leaf path (owned fields), if any.
+    pub const ModelChange = struct { provider: []u8, model_id: []u8 };
+
+    pub fn latestModelChange(self: *Store, alloc: std.mem.Allocator) ?ModelChange {
+        const path = self.leafPath(alloc) catch return null;
+        defer path.deinit();
+        var i = path.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = path.items[i];
+            if (e.kind != .model_change) continue;
+            const provider = jsonStringField(alloc, e.line, "provider") orelse continue;
+            const model_id = jsonStringField(alloc, e.line, "modelId") orelse {
+                alloc.free(provider);
+                continue;
+            };
+            return .{ .provider = provider, .model_id = model_id };
+        }
+        return null;
+    }
+
+    /// Append a branch summary entry whose parent (and thus the new leaf) is
+    /// `cut_entry_id`: the tree continues from the cut point with the summary
+    /// of the abandoned path (pi: sessionManager.branchWithSummary).
+    pub fn branchAt(self: *Store, cut_entry_id: []const u8, from_id: []const u8, summary: []const u8) void {
+        const id = genEntryId(self.alloc, self.io);
+        defer self.alloc.free(id);
+        var ts_buf: [40]u8 = undefined;
+        const iso = formatIso(nowMs(self.io), &ts_buf);
+        var line = std.array_list.Managed(u8).init(self.alloc);
+        defer line.deinit();
+        appendFmt(&line, self.alloc, "{{\"type\":\"branch_summary\",\"id\":\"{s}\",\"parentId\":", .{id}) catch return;
+        writeJsonStr(&line, cut_entry_id) catch return;
+        line.appendSlice(",\"timestamp\":") catch return;
+        writeJsonStr(&line, iso) catch return;
+        line.appendSlice(",\"fromId\":") catch return;
+        writeJsonStr(&line, from_id) catch return;
+        line.appendSlice(",\"summary\":") catch return;
+        writeJsonStr(&line, summary) catch return;
+        line.appendSlice("}\n") catch return;
+        const cut_copy = self.alloc.dupe(u8, cut_entry_id) catch return;
+        defer self.alloc.free(cut_copy);
+        self.appendLine(id, cut_copy, .branch_summary, line.items) catch {};
+    }
+
+    /// Fork into a NEW session copying the leaf chain up to (and including)
+    /// `cut_entry_id` — pi /fork: create a new session from an earlier user
+    /// message. Compaction/branch-summary entries are not copied.
+    pub fn forkAt(self: *Store, cut_entry_id: []const u8, sessions_dir: []const u8, new_cwd: []const u8) !*Store {
+        const st = try Store.create(self.alloc, self.io, sessions_dir, new_cwd, .{
+            .parent_session = self.path,
+            .name = self.name,
+        });
+        errdefer st.deinit();
+        // Collect the chain from the cut point back to the root.
+        var chain = std.array_list.Managed(EntryRef).init(self.alloc);
+        defer chain.deinit();
+        var cur: ?[]const u8 = cut_entry_id;
+        while (cur) |cid| {
+            var found: ?EntryRef = null;
+            for (self.entries.items) |e| {
+                if (std.mem.eql(u8, e.id, cid)) {
+                    found = e;
+                    break;
+                }
+            }
+            const e = found orelse break;
+            chain.append(e) catch break;
+            cur = e.parent_id;
+        }
+        var i: usize = chain.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = chain.items[i];
+            if (e.kind == .compaction or e.kind == .branch_summary) continue;
+            const eid = genEntryId(self.alloc, self.io);
+            defer self.alloc.free(eid);
+            try st.appendLine(eid, st.leaf_id, e.kind, e.line);
+        }
+        return st;
+    }
+
+    /// One selectable row along the leaf path: entry id, kind, whether it is
+    /// a user message, and a short text preview extracted from the raw line.
+    pub const ChainItem = struct {
+        kind: EntryKind,
+        id: [16]u8,
+        id_len: usize,
+        is_user_message: bool,
+        preview: [72]u8,
+        preview_len: usize,
+    };
+
+    /// Leaf-path entries in conversation order (for the /tree and /fork
+    /// selectors). Returns item count (capped to `out.len`).
+    pub fn leafChain(self: *Store, out: []ChainItem) usize {
+        const path = self.leafPath(self.alloc) catch return 0;
+        defer path.deinit();
+        var n: usize = 0;
+        for (path.items) |e| {
+            if (n >= out.len) break;
+            if (e.kind == .header) continue;
+            var item: ChainItem = .{
+                .kind = e.kind,
+                .id = undefined,
+                .id_len = 0,
+                .is_user_message = false,
+                .preview = undefined,
+                .preview_len = 0,
+            };
+            item.id_len = @min(e.id.len, item.id.len);
+            @memcpy(item.id[0..item.id_len], e.id[0..item.id_len]);
+            extractPreview(self.alloc, e, &item);
+            out[n] = item;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Delete a session file from disk (pi: /resume Ctrl+D; uses unlink —
+    /// no trash CLI dependency).
+    pub fn deleteSessionFile(io: std.Io, path: []const u8) void {
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
     }
 
     /// Ids of message entries along the leaf path, in conversation order.

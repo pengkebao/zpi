@@ -121,8 +121,19 @@ pub const MousePoint = struct { col: usize, row: usize };
 pub const TUI = struct {
     // ---- Completion menu types (G4) ----
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null };
-    const MenuMode = enum { hidden, commands, models, settings, files };
+    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
+    /// Selector row capacity (sessions/tree/fork pickers).
+    const SEL_MAX = 64;
+    /// One picker row: display name/desc + attached id (entry id or path).
+    const SelRow = struct {
+        name: [168]u8 = undefined,
+        name_len: usize = 0,
+        desc: [80]u8 = undefined,
+        desc_len: usize = 0,
+        id: [300]u8 = undefined,
+        id_len: usize = 0,
+    };
 
     /// How a scrollback block can be re-rendered (a terminal resize
     /// re-renders the whole transcript at the new width, like pi's per-frame
@@ -192,9 +203,11 @@ pub const TUI = struct {
         .{ .name = "/session", .desc = "Session info" },
         .{ .name = "/name", .desc = "Name this session", .takes_arg = true },
         .{ .name = "/new", .desc = "Start a new session" },
-        .{ .name = "/tree", .desc = "Show session tree" },
-        .{ .name = "/fork", .desc = "Fork this session" },
-        .{ .name = "/resume", .desc = "Resume a session", .takes_arg = true },
+        .{ .name = "/tree", .desc = "Navigate the session tree" },
+        .{ .name = "/fork", .desc = "Fork from an earlier user message" },
+        .{ .name = "/clone", .desc = "Duplicate session at current position" },
+        .{ .name = "/import", .desc = "Import a session JSONL", .takes_arg = true },
+        .{ .name = "/resume", .desc = "Resume a session (picker, or /resume <id>)" },
         .{ .name = "/export", .desc = "Export session to HTML", .takes_arg = true },
         .{ .name = "/compact", .desc = "Compact the conversation" },
         .{ .name = "/copy", .desc = "Copy last reply to clipboard" },
@@ -388,6 +401,17 @@ pub const TUI = struct {
     at_suppress: ?[]u8 = null,
     menu_len: usize = 0,
     menu_selected: usize = 0,
+    /// Selector rows for the modal pickers (sessions/tree/fork): static
+    /// buffers the menu_items rows point into (menu_items cap is 16; the
+    /// full row set lives here with a scrolling viewport).
+    sel_rows: [SEL_MAX]SelRow = undefined,
+    sel_len: usize = 0,
+    /// Byte id attached to each selector row (entry id or session path).
+    /// Type--to-filter state for the sessions picker.
+    sel_filter: [80]u8 = undefined,
+    sel_filter_len: usize = 0,
+    /// First visible menu row (viewport follows menu_selected).
+    menu_view_start: usize = 0,
 
     fn commandTakesArg(name: []const u8) bool {
         for (COMMANDS) |c| {
@@ -410,7 +434,12 @@ pub const TUI = struct {
 
     /// Recompute the completion menu from the current editor text.
     pub fn updateMenu(self: *TUI) void {
-        if (self.menu_mode == .settings) return; // modal: not driven by editor text
+        // Modal dialogs (settings, session/tree/fork pickers) are not driven
+        // by editor text.
+        switch (self.menu_mode) {
+            .settings, .sessions, .tree, .forksel => return,
+            else => {},
+        }
         self.menu_len = 0;
         self.menu_selected = 0;
         const text = self.editor.getText() catch {
@@ -619,9 +648,17 @@ pub const TUI = struct {
     }
 
     /// Render menu row `i` (owned, caller frees).
-    fn menuLine(self: *TUI, i: usize) ![]u8 {
-        const e = self.menu_items[i];
-        if (i == self.menu_selected) {
+    /// Keep the menu viewport window such that menu_selected stays visible.
+    fn updateMenuViewport(self: *TUI, menu_h: usize) void {
+        if (self.menu_selected < self.menu_view_start) self.menu_view_start = self.menu_selected;
+        if (self.menu_selected >= self.menu_view_start + menu_h) {
+            self.menu_view_start = self.menu_selected + 1 - menu_h;
+        }
+    }
+
+    fn menuLine(self: *TUI, v: usize) ![]u8 {
+        const e = self.menu_items[v];
+        if (self.menu_view_start + v == self.menu_selected) {
             return std.fmt.allocPrint(self.alloc, "\x1b[38;2;167;152;215m\x1b[1m❯ {s}\x1b[0m  \x1b[2m{s}\x1b[0m", .{ e.name, e.desc });
         }
         return std.fmt.allocPrint(self.alloc, "  {s}  \x1b[2m{s}\x1b[0m", .{ e.name, e.desc });
@@ -686,6 +723,39 @@ pub const TUI = struct {
                 }
                 return false;
             },
+            .sessions => {
+                const path = self.selRowId();
+                if (path.len == 0) return false;
+                self.menu_mode = .hidden;
+                const new_st = ss.Store.open(self.alloc, self.io, path) catch {
+                    self.note("resume failed: cannot open {s}", .{path});
+                    return false;
+                };
+                const id_copy = self.alloc.dupe(u8, new_st.id) catch "?";
+                self.switchToStore(new_st);
+                self.note("\x1b[90mresumed session {s}\x1b[0m", .{id_copy});
+                return false;
+            },
+            .tree => {
+                const entry_id = self.selRowId();
+                if (entry_id.len == 0) return false;
+                const st = self.session.store orelse return false;
+                const leaf = st.leaf_id orelse return false;
+                self.menu_mode = .hidden;
+                if (std.mem.eql(u8, entry_id, leaf)) {
+                    self.note("Already at this point", .{});
+                    return false;
+                }
+                self.branchWithSummary(entry_id);
+                return false;
+            },
+            .forksel => {
+                const entry_id = self.selRowId();
+                if (entry_id.len == 0) return false;
+                self.menu_mode = .hidden;
+                self.forkFromUserMessage(entry_id);
+                return false;
+            },
             .hidden => return false,
         }
     }
@@ -735,6 +805,323 @@ pub const TUI = struct {
         self.menu_selected = 0;
         self.menu_mode = .settings;
         self.editor.clear() catch {};
+    }
+
+    // ---- modal selectors (pi session/tree selectors) ----
+
+    fn selSetName(self: *TUI, row: usize, name: []const u8) void {
+        const n = @min(name.len, self.sel_rows[row].name.len);
+        @memcpy(self.sel_rows[row].name[0..n], name[0..n]);
+        self.sel_rows[row].name_len = n;
+    }
+
+    fn selSetDesc(self: *TUI, row: usize, desc: []const u8) void {
+        const n = @min(desc.len, self.sel_rows[row].desc.len);
+        @memcpy(self.sel_rows[row].desc[0..n], desc[0..n]);
+        self.sel_rows[row].desc_len = n;
+    }
+
+    fn selSetId(self: *TUI, row: usize, id: []const u8) void {
+        const n = @min(id.len, self.sel_rows[row].id.len);
+        @memcpy(self.sel_rows[row].id[0..n], id[0..n]);
+        self.sel_rows[row].id_len = n;
+    }
+
+    /// Project the selector row window into menu_items (cap 16) for
+    /// rendering; menu viewport math stays shared with the other menus.
+    fn refreshSelMenu(self: *TUI) void {
+        var n: usize = 0;
+        const start = self.menu_view_start;
+        while (start + n < self.sel_len and n < self.menu_items.len) : (n += 1) {
+            const r = &self.sel_rows[start + n];
+            self.menu_items[n] = .{
+                .name = r.name[0..r.name_len],
+                .desc = r.desc[0..r.desc_len],
+            };
+        }
+        self.menu_len = n;
+        if (self.menu_selected >= self.sel_len) self.menu_selected = if (self.sel_len > 0) self.sel_len - 1 else 0;
+    }
+
+    /// Clamp the viewport so menu_selected stays visible, then re-project.
+    fn scrollSelMenu(self: *TUI) void {
+        const menu_h: usize = @min(self.sel_len, 16);
+        self.updateMenuViewport(menu_h);
+        self.refreshSelMenu();
+    }
+
+    /// Open the /resume picker: sessions for this cwd, type-to-filter.
+    fn openSessionsMenu(self: *TUI) void {
+        self.sel_filter_len = 0;
+        self.menu_selected = 0;
+        self.menu_view_start = 0;
+        self.menu_mode = .sessions;
+        self.editor.clear() catch {};
+        self.refilterSessions();
+    }
+
+    /// Rebuild the session rows from the directory listing, applying the
+    /// current filter as a case-insensitive substring on id+name.
+    fn refilterSessions(self: *TUI) void {
+        self.sel_len = 0;
+        const list = ss.listForCwd(self.alloc, self.io, self.sessions_dir, self.cwd_abs) catch &.{};
+        defer self.freeSessionList(list);
+        const flt = self.sel_filter[0..self.sel_filter_len];
+        for (list) |info| {
+            if (self.sel_len >= SEL_MAX) break;
+            const label = info.name orelse "(unnamed)";
+            // Match against "id name".
+            var hay: [400]u8 = undefined;
+            const hay_txt = std.fmt.bufPrint(&hay, "{s} {s}", .{ info.id, label }) catch continue;
+            if (flt.len > 0 and !containsNoCase(hay_txt, flt)) continue;
+            const row = self.sel_len;
+            self.selSetName(row, info.id[0..@min(info.id.len, 24)]);
+            self.selSetDesc(row, label);
+            self.selSetId(row, info.path);
+            self.sel_len += 1;
+        }
+        self.menu_view_start = 0;
+        self.menu_selected = 0;
+        self.refreshSelMenu();
+    }
+
+    /// Open the /tree picker: entries along the leaf chain with previews.
+    fn openTreeMenu(self: *TUI) void {
+        self.menu_selected = 0;
+        self.menu_view_start = 0;
+        self.menu_mode = .tree;
+        self.editor.clear() catch {};
+        self.sel_len = 0;
+        const st = self.session.store orelse return;
+        var chain: [SEL_MAX]ss.Store.ChainItem = undefined;
+        const cnt = st.leafChain(&chain);
+        for (chain[0..cnt]) |ci| {
+            if (self.sel_len >= SEL_MAX) break;
+            const row = self.sel_len;
+            const depth: usize = @min(self.sel_len, 12);
+            var name_buf: [168]u8 = undefined;
+            const icon: []const u8 = switch (ci.kind) {
+                .message => if (ci.is_user_message) "❯" else "✱",
+                .compaction => "⛁",
+                .branch_summary => "⑂",
+                .session_info => "✎",
+                .model_change => "◆",
+                .thinking_level_change => "◍",
+                else => "·",
+            };
+            const indent_src = "                                ";
+            const id_txt = ci.id[0..ci.id_len];
+            const name_txt = std.fmt.bufPrint(&name_buf, "{s}{s} {s}", .{
+                indent_src[0 .. depth * 2], icon, id_txt,
+            }) catch continue;
+            self.selSetName(row, name_txt);
+            self.selSetDesc(row, ci.preview[0..ci.preview_len]);
+            self.selSetId(row, ci.id[0..ci.id_len]);
+            self.sel_len += 1;
+        }
+        // Start the selection on the current leaf.
+        self.menu_selected = if (self.sel_len > 0) self.sel_len - 1 else 0;
+        self.refreshSelMenu();
+    }
+
+    /// Open the /fork picker: user messages along the leaf chain.
+    fn openForkMenu(self: *TUI) void {
+        self.menu_selected = 0;
+        self.menu_view_start = 0;
+        self.menu_mode = .forksel;
+        self.editor.clear() catch {};
+        self.sel_len = 0;
+        const st = self.session.store orelse return;
+        var chain: [SEL_MAX]ss.Store.ChainItem = undefined;
+        _ = st.leafChain(&chain);
+        for (chain) |ci| {
+            if (!ci.is_user_message) continue;
+            if (self.sel_len >= SEL_MAX) break;
+            const row = self.sel_len;
+            self.selSetName(row, ci.id[0..ci.id_len]);
+            self.selSetDesc(row, ci.preview[0..ci.preview_len]);
+            self.selSetId(row, ci.id[0..ci.id_len]);
+            self.sel_len += 1;
+        }
+        self.refreshSelMenu();
+    }
+
+    fn selRowId(self: *TUI) []const u8 {
+        if (self.menu_selected >= self.sel_len) return "";
+        const r = &self.sel_rows[self.menu_selected];
+        return r.id[0..r.id_len];
+    }
+
+    /// Swap in a (new or reopened) store and rebuild both the agent context
+    /// and the visible transcript (pi: resume/fork/clone/import all replace
+    /// the view). Applies the branch's recorded model_change /
+    /// thinking_level_change (pi replays them on resume).
+    fn switchToStore(self: *TUI, new_st: *ss.Store) void {
+        const old_st = self.session.store;
+        self.clearTranscript();
+        self.session.adoptStore(new_st) catch {};
+        // adoptStore's caller-owned contract: retire the previous store.
+        if (old_st) |o| {
+            if (o != new_st) o.deinit();
+        }
+        if (new_st.latestModelChange(self.alloc)) |mc| {
+            defer {
+                self.alloc.free(mc.provider);
+                self.alloc.free(mc.model_id);
+            }
+            if (self.cfg) |c| {
+                for (c.models.items, 0..) |m, idx| {
+                    if (std.mem.eql(u8, m.provider, mc.provider) and std.mem.eql(u8, m.id, mc.model_id)) {
+                        self.switchModel(idx) catch {};
+                        break;
+                    }
+                }
+            }
+        }
+        if (new_st.latestThinkingLevel(self.alloc)) |lv| {
+            defer self.alloc.free(lv);
+            if (config.ThinkingLevel.fromStr(lv)) |tl| {
+                self.session.thinking_level = tl;
+            }
+        }
+        self.replaySession();
+    }
+
+    /// Same-store view rebuild after a branch cut.
+    fn switchToStoreLive(self: *TUI) void {
+        self.clearTranscript();
+        if (self.session.store) |st| self.session.adoptStore(st) catch {};
+        self.replaySession();
+    }
+
+    /// /tree branch: cut the leaf to an earlier entry, summarize the
+    /// abandoned path with the LLM (pi branchWithSummary), record a
+    /// branch_summary entry and rebuild the view.
+    fn branchWithSummary(self: *TUI, cut_entry_id: []const u8) void {
+        const st = self.session.store orelse return;
+        const from_id = self.alloc.dupe(u8, st.leaf_id orelse return) catch return;
+        defer self.alloc.free(from_id);
+        // Messages after the cut point belong to the abandoned branch.
+        var abandoned = std.array_list.Managed(cmsg.Message).init(self.alloc);
+        defer {
+            for (abandoned.items) |*m| m.deinit();
+            abandoned.deinit();
+        }
+        if (self.collectAbandonedMessages(cut_entry_id, &abandoned) and abandoned.items.len > 0) {
+            const res = compact.generateSummary(
+                self.alloc,
+                self.io,
+                self.session.provider,
+                self.session.model.id,
+                abandoned.items,
+                null,
+                null,
+                null,
+            ) catch null;
+            if (res) |r| {
+                defer self.alloc.free(r.text);
+                st.branchAt(cut_entry_id, from_id, r.text);
+                self.switchToStoreLive();
+                self.addMessage(r.text);
+                self.note("\x1b[90mbranched from {s} · summary of the abandoned path above\x1b[0m", .{cut_entry_id});
+                return;
+            }
+        }
+        // No summary available (empty branch or LLM failure): cut only.
+        st.branchAt(cut_entry_id, from_id, "(no summary)");
+        self.switchToStoreLive();
+        self.note("\x1b[90mbranched from {s}\x1b[0m", .{cut_entry_id});
+    }
+
+    /// Messages on the leaf path strictly after `cut_entry_id`.
+    fn collectAbandonedMessages(self: *TUI, cut_entry_id: []const u8, out: *std.array_list.Managed(cmsg.Message)) bool {
+        const st = self.session.store orelse return false;
+        const all = st.branchMessages(self.alloc) catch return false;
+        defer {
+            for (all) |m| m.deinit();
+            self.alloc.free(all);
+        }
+        const ids = st.branchMessageIds(self.alloc) catch return false;
+        // The ids borrow the store's entries: free only the slice (same
+        // ownership as agent.zig's compaction usage).
+        defer self.alloc.free(ids);
+        // branchMessages and branchMessageIds are index-aligned.
+        var cut_idx: ?usize = null;
+        for (ids, 0..) |id, i| {
+            if (std.mem.eql(u8, id, cut_entry_id)) cut_idx = i;
+        }
+        const start = (cut_idx orelse return false) + 1;
+        if (start >= all.len) return false; // nothing to summarize
+        for (all[start..]) |m| {
+            out.append(m.clone(self.alloc) catch return false) catch return false;
+        }
+        return true;
+    }
+
+    /// /fork from an earlier user message: new session copying the chain up
+    /// to that message (pi handleForkCommand → runtimeHost.fork).
+    fn forkFromUserMessage(self: *TUI, entry_id: []const u8) void {
+        const st = self.session.store orelse return;
+        const forked = st.forkAt(entry_id, self.sessions_dir, self.cwd_abs) catch {
+            self.note("fork failed", .{});
+            return;
+        };
+        self.clearTranscript();
+        self.session.adoptStore(forked) catch {};
+        if (st != forked) st.deinit();
+        self.replaySession();
+        self.note("\x1b[90mforked → session {s}\x1b[0m", .{forked.id});
+    }
+
+    /// /import <path>: copy a session JSONL into the sessions dir (dedup
+    /// suffixes like pi importFromJsonl) and switch to it.
+    fn importSessionFrom(self: *TUI, input_path: []const u8) void {
+        const alloc = self.alloc;
+        const resolved = if (std.fs.path.isAbsolute(input_path)) blk: {
+            break :blk alloc.dupe(u8, input_path) catch return;
+        } else blk: {
+            const joined = std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.cwd_abs, input_path }) catch return;
+            break :blk joined;
+        };
+        defer alloc.free(resolved);
+        const io_file = std.Io.Dir.cwd().openFile(self.io, resolved, .{}) catch {
+            self.note("\x1b[91m/import: no such file: {s}\x1b[0m", .{resolved});
+            return;
+        };
+        io_file.close(self.io);
+        // Destination: sessions dir + basename (name-1, name-2 on collision).
+        const base = std.fs.path.basename(resolved);
+        var dest: []u8 = std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.sessions_dir, base }) catch return;
+        defer alloc.free(dest);
+        var suffix: usize = 1;
+        while (true) {
+            if (std.Io.Dir.cwd().openFile(self.io, dest, .{})) |f| {
+                f.close(self.io);
+                const stem = std.fs.path.stem(base);
+                const ext = std.fs.path.extension(base);
+                const next = std.fmt.allocPrint(alloc, "{s}/{s}-{d}{s}", .{ self.sessions_dir, stem, suffix, ext }) catch return;
+                alloc.free(dest);
+                dest = next;
+                suffix += 1;
+            } else |_| break;
+        }
+        // Copy file contents.
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, resolved, alloc, .limited(64 * 1024 * 1024)) catch {
+            self.note("\x1b[91m/import: read failed\x1b[0m", .{});
+            return;
+        };
+        defer alloc.free(data);
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = dest, .data = data }) catch {
+            self.note("\x1b[91m/import: write failed\x1b[0m", .{});
+            return;
+        };
+        const new_st = ss.Store.open(alloc, self.io, dest) catch {
+            self.note("\x1b[91m/import: parse failed\x1b[0m", .{});
+            return;
+        };
+        const id_copy = alloc.dupe(u8, new_st.id) catch "?";
+        self.switchToStore(new_st);
+        self.note("\x1b[90mimported session {s} from {s}\x1b[0m", .{ id_copy, resolved });
     }
 
     /// Enter on a settings row: cycle to the next value, apply in memory and
@@ -1604,8 +1991,9 @@ pub const TUI = struct {
         if (cursor_vis.row >= editor_h) vis_top = cursor_vis.row - editor_h + 1;
         const end = if (visual_total < vis_top + editor_h) visual_total else vis_top + editor_h;
         // Fixed bottom: menu (menu_h) + top border (1) + editor (editor_h) +
-        // bottom border (1) + cwd (1) + status (1).
-        const menu_h: usize = if (self.menu_mode != .hidden) self.menu_len else 0;
+        // bottom border (1) + cwd (1) + status (1). The menu viewport shows
+        // at most 16 rows (pi select-list maxVisible).
+        const menu_h: usize = if (self.menu_mode != .hidden) @min(self.menu_len, 16) else 0;
         const fixed_bottom = editor_h + 4 + menu_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
@@ -1687,9 +2075,12 @@ pub const TUI = struct {
         }
 
         // 1.5 Completion menu rows (between transcript and input border).
+        // The viewport window follows menu_selected so long lists scroll.
         if (menu_h > 0) {
-            for (0..menu_h) |i| {
-                const ml_raw = self.menuLine(i) catch return;
+            self.updateMenuViewport(menu_h);
+            for (0..menu_h) |v| {
+                // menu_items is the projected window: window-relative index.
+                const ml_raw = self.menuLine(v) catch return;
                 const ml = truncateToWidth(self.alloc, ml_raw, self.width) catch return;
                 self.alloc.free(ml_raw);
                 frame.append(self.alloc, ml) catch return;
@@ -3879,6 +4270,7 @@ pub const TUI = struct {
                 self.note("Thinking level: {s} (off|low|medium|high|xhigh|max)", .{self.session.thinking_level.name()});
             } else if (config.ThinkingLevel.fromStr(arg)) |lvl| {
                 self.session.thinking_level = lvl;
+                if (self.session.store) |st_think| st_think.recordThinkingLevel(lvl.name());
                 self.note("Thinking level set to {s}", .{lvl.name()});
             } else {
                 self.note("Unknown level: {s} (off|low|medium|high|xhigh|max)", .{arg});
@@ -3894,7 +4286,9 @@ pub const TUI = struct {
             std.mem.eql(u8, word, "/name") or
             std.mem.eql(u8, word, "/tree") or
             std.mem.eql(u8, word, "/fork") or
+            std.mem.eql(u8, word, "/clone") or
             std.mem.eql(u8, word, "/resume") or
+            std.mem.eql(u8, word, "/import") or
             std.mem.eql(u8, word, "/export") or
             std.mem.eql(u8, word, "/compact");
         const st = if (!is_session_cmd) undefined else self.session.store orelse {
@@ -3926,12 +4320,18 @@ pub const TUI = struct {
         }
 
         if (std.mem.eql(u8, word, "/tree")) {
-            const tree = st.renderTree(self.alloc) catch {
-                self.addMessage("(tree failed)");
+            const st_tree = self.session.store orelse {
+                self.addMessage("\x1b[90m(no session active — started with --no-session)\x1b[0m");
                 self.redraw();
                 return false;
             };
-            self.noteOwned(tree);
+            var chain: [SEL_MAX]ss.Store.ChainItem = undefined;
+            if (st_tree.leafChain(&chain) == 0) {
+                self.note("No entries in session", .{});
+                self.redraw();
+                return false;
+            }
+            self.openTreeMenu();
             self.redraw();
             return false;
         }
@@ -3950,13 +4350,49 @@ pub const TUI = struct {
         }
 
         if (std.mem.eql(u8, word, "/fork")) {
-            const forked = st.fork(self.sessions_dir, self.cwd_abs) catch {
-                self.addMessage("\x1b[91m[fork failed]\x1b[0m");
+            const st_fork = self.session.store orelse {
+                self.addMessage("\x1b[90m(no session active — started with --no-session)\x1b[0m");
                 self.redraw();
                 return false;
             };
-            self.session.adoptStore(forked) catch {};
-            self.note("\x1b[90mforked → session {s}\x1b[0m", .{forked.id});
+            var chain: [SEL_MAX]ss.Store.ChainItem = undefined;
+            const cnt_fork = st_fork.leafChain(&chain);
+            var user_cnt: usize = 0;
+            for (chain[0..cnt_fork]) |ci| {
+                if (ci.is_user_message) user_cnt += 1;
+            }
+            if (user_cnt == 0) {
+                self.note("No user messages to fork from", .{});
+                self.redraw();
+                return false;
+            }
+            self.openForkMenu();
+            self.redraw();
+            return false;
+        }
+
+        // pi /clone: duplicate the current session at its current position.
+        if (std.mem.eql(u8, word, "/clone")) {
+            const cloned = st.fork(self.sessions_dir, self.cwd_abs) catch {
+                self.addMessage("\x1b[91m[clone failed]\x1b[0m");
+                self.redraw();
+                return false;
+            };
+            self.switchToStore(cloned);
+            self.note("\x1b[90mcloned to session {s}\x1b[0m", .{cloned.id});
+            self.redraw();
+            return false;
+        }
+
+        // pi /import <path>: copy a session JSONL into the sessions dir and
+        // switch to it (preserving its id and cwd).
+        if (std.mem.eql(u8, word, "/import")) {
+            if (arg.len == 0) {
+                self.note("Usage: /import <path.jsonl>", .{});
+                self.redraw();
+                return false;
+            }
+            self.importSessionFrom(arg);
             self.redraw();
             return false;
         }
@@ -3967,17 +4403,10 @@ pub const TUI = struct {
                 defer self.freeSessionList(list);
                 if (list.len == 0) {
                     self.addMessage("\x1b[90mno sessions for this directory\x1b[0m");
-                } else {
-                    var header: [128]u8 = undefined;
-                    const h = std.fmt.bufPrint(&header, "\x1b[90mresume a session (use /resume <id>):\x1b[0m", .{}) catch "";
-                    self.addMessage(h);
-                    for (list) |info| {
-                        const label = info.name orelse "(unnamed)";
-                        const line = std.fmt.allocPrint(self.alloc, "  {s}  {s}  {d} msgs", .{ info.id[0..@min(8, info.id.len)], label, info.msg_count }) catch continue;
-                        defer self.alloc.free(line);
-                        self.addMessage(line);
-                    }
+                    self.redraw();
+                    return false;
                 }
+                self.openSessionsMenu();
                 self.redraw();
                 return false;
             }
@@ -4200,7 +4629,11 @@ pub const TUI = struct {
             // runs its own redraws already tick it.
             self.key_reader.poll = self.sv.hide_at_ms != null or self.flash_msg != null or self.wheel_frame_pending;
             const key = self.key_reader.nextKey(0, self.io) catch break;
-            if (key == .unknown) {
+            // Modal dialogs swallow the global bindings (scroll, search,
+            // ctrl+c/d exit, paste...) — only the dialog's own keys respond.
+            const modal_open = self.menu_mode == .settings or self.menu_mode == .sessions or
+                self.menu_mode == .tree or self.menu_mode == .forksel;
+            if (key == .unknown and !modal_open) {
                 // Timer tick (scrollbar hide deadline / throttled wheel-flush
                 // tail). Stats don't change on a timer — the cached-footer
                 // redraw skips the whole-session token walk (turn events and
@@ -4252,7 +4685,7 @@ pub const TUI = struct {
             // overlay's Input rejects control characters, so even ctrl+c is
             // swallowed rather than exiting); the toggle below still closes it.
             if (self.search == null) {
-                if (self.bindings.matches(key, .clear_editor_exit)) {
+                if (!modal_open and self.bindings.matches(key, .clear_editor_exit)) {
                     if (!self.editor.isEmpty()) {
                         self.editor.clear() catch {};
                         self.updateMenu();
@@ -4327,7 +4760,7 @@ pub const TUI = struct {
             // Transcript search (pi: the search binding is checked before
             // anything else; while the box is focused it consumes every key
             // — navigation, close, and the input itself).
-            if (self.bindings.matches(key, .search)) {
+            if (!modal_open and self.bindings.matches(key, .search)) {
                 self.toggleSearch();
                 self.redraw();
                 continue;
@@ -4386,7 +4819,7 @@ pub const TUI = struct {
             }
 
             // Ctrl+O: tool output preview <-> full. Ctrl+T: toggle thinking.
-            if (self.bindings.matches(key, .toggle_tools)) {
+            if (!modal_open and self.bindings.matches(key, .toggle_tools)) {
                 self.setToolsExpanded(!self.tools_expanded);
                 self.redraw();
                 continue;
@@ -4404,11 +4837,11 @@ pub const TUI = struct {
                 self.cycleThinkingLevel();
                 continue;
             }
-            if (self.bindings.matches(key, .model_next)) {
+            if (!modal_open and self.bindings.matches(key, .model_next)) {
                 self.cycleModel(1);
                 continue;
             }
-            if (self.bindings.matches(key, .model_prev)) {
+            if (!modal_open and self.bindings.matches(key, .model_prev)) {
                 self.cycleModel(-1);
                 continue;
             }
@@ -4420,7 +4853,7 @@ pub const TUI = struct {
                 self.copyLastMessage();
                 continue;
             }
-            if (self.bindings.matches(key, .paste_clipboard)) {
+            if (!modal_open and self.bindings.matches(key, .paste_clipboard)) {
 
                 self.handleClipboardPaste();
                 continue;
@@ -4429,7 +4862,7 @@ pub const TUI = struct {
                 self.suspendToBackground();
                 continue;
             }
-            if (self.bindings.matches(key, .exit_empty)) {
+            if (!modal_open and self.bindings.matches(key, .exit_empty)) {
                 if (self.editor.isEmpty()) break;
                 continue;
             }
@@ -4499,6 +4932,62 @@ pub const TUI = struct {
                     continue;
                 }
                 continue; // swallow everything else while the dialog is open
+            }
+            if (self.menu_mode == .sessions or self.menu_mode == .tree or self.menu_mode == .forksel) {
+                // Modal session/tree pickers (pi SessionSelector/
+                // TreeSelector): arrows + Enter; the sessions picker also
+                // filters on typed characters and deletes with ctrl+d.
+                if (self.bindings.matches(key, .menu_up)) {
+                    if (self.menu_selected > 0) self.menu_selected -= 1;
+                    self.scrollSelMenu();
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_down)) {
+                    if (self.menu_selected + 1 < self.sel_len) self.menu_selected += 1;
+                    self.scrollSelMenu();
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_close)) {
+                    self.menu_mode = .hidden;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    const should_exit = self.menuActivate();
+                    if (should_exit) break;
+                    self.redraw();
+                    continue;
+                } else if (key == .char and key.char.ctrl and key.char.c == 'd' and self.menu_mode == .sessions) {
+                    // pi: Ctrl+D deletes the highlighted session.
+                    const path = self.alloc.dupe(u8, self.selRowId()) catch null;
+                    if (path) |p| {
+                        defer self.alloc.free(p);
+                        ss.Store.deleteSessionFile(self.io, p);
+                        self.refilterSessions();
+                        self.note("deleted {s}", .{std.fs.path.basename(p)});
+                    }
+                    self.redraw();
+                    continue;
+                } else if (key == .backspace and self.menu_mode == .sessions) {
+                    // Type-to-filter: backspace trims the filter (keys parse
+                    // 0x7f/0x08 as .backspace, not .char).
+                    if (self.sel_filter_len > 0) self.sel_filter_len -= 1;
+                    self.refilterSessions();
+                    self.redraw();
+                    continue;
+                } else if (key == .char and !key.char.ctrl and self.menu_mode == .sessions) {
+                    // Type-to-filter (pi session selector search).
+                    const c = key.char.c;
+                    if (c >= 0x20 and self.sel_filter_len < self.sel_filter.len) {
+                        self.sel_filter[self.sel_filter_len] = c;
+                        self.sel_filter_len += 1;
+                    } else {
+                        continue;
+                    }
+                    self.refilterSessions();
+                    self.redraw();
+                    continue;
+                }
+                continue; // swallow everything else while a picker is open
             }
             if (self.menu_mode != .hidden) {
                 if (self.bindings.matches(key, .menu_up)) {
@@ -4902,4 +5391,19 @@ test "stableBlockBoundary: blank lines split blocks, fences stay whole" {
     try std.testing.expectEqual(@as(usize, 31), f("para\n\n```zig\nconst x = 1;\n```\n\ntail block", 0));
     // A fence AT the tail is fine: it renders as one growing block.
     try std.testing.expectEqual(@as(usize, 6), f("para\n\n```zig\nconst x = 1;", 0));
+}
+
+/// Case-insensitive substring search (heap-free; used by the session picker).
+fn containsNoCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    outer: while (i + needle.len <= haystack.len) : (i += 1) {
+        for (needle, 0..) |nc, j| {
+            const hc = haystack[i + j];
+            if (std.ascii.toLower(hc) != std.ascii.toLower(nc)) continue :outer;
+        }
+        return true;
+    }
+    return false;
 }
