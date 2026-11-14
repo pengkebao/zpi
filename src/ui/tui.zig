@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const agent = @import("../core/agent.zig");
+const cmsg = @import("../core/message.zig");
 const config = @import("../core/config.zig");
 const ss = @import("../core/session_store.zig");
 const compact = @import("../core/compaction.zig");
@@ -2833,6 +2834,87 @@ pub const TUI = struct {
         }
         // A result without a matching start should not happen; do not leak it.
         self.session.alloc.free(result.content);
+    }
+
+    /// Replay persisted branch messages into the transcript for
+    /// -c/-r/--session continuation (pi: renderInitialMessages →
+    /// renderSessionEntries — assistant text/thinking render as blocks, tool
+    /// calls as tool blocks with their results matched back by id). Context
+    /// restore itself happens in main; this only rebuilds what the user
+    /// sees. No-op without a store or on an empty branch (new sessions).
+    pub fn replaySession(self: *TUI) void {
+        const st = self.session.store orelse return;
+        const alloc = self.session.alloc;
+        const branch = st.branchMessages(alloc) catch return;
+        defer {
+            for (branch) |m| m.deinit();
+            alloc.free(branch);
+        }
+        for (branch) |m| {
+            switch (m.role) {
+                .system => {},
+                .user => {
+                    var buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer buf.deinit(alloc);
+                    for (m.blocks.items) |b| switch (b) {
+                        .text => |t| {
+                            if (buf.items.len > 0) buf.appendSlice(alloc, "\n\n") catch {};
+                            buf.appendSlice(alloc, t) catch {};
+                        },
+                        else => {},
+                    };
+                    if (buf.items.len > 0) self.addUserMessage(buf.items);
+                },
+                .assistant => {
+                    for (m.blocks.items) |b| switch (b) {
+                        .thinking => |t| self.addThinkingBlock(t),
+                        .text => |t| self.addAssistantMessage(t),
+                        .tool_call => |tc| self.replayToolCall(tc),
+                        else => {},
+                    };
+                },
+                .tool => {
+                    for (m.blocks.items) |b| switch (b) {
+                        .tool_result => |tr| self.replayToolResult(tr),
+                        else => {},
+                    };
+                },
+            }
+        }
+    }
+
+    fn replayToolCall(self: *TUI, tc: cmsg.ToolCall) void {
+        const alloc = self.session.alloc;
+        const id = alloc.dupe(u8, tc.id) catch return;
+        const name = alloc.dupe(u8, tc.name) catch {
+            alloc.free(id);
+            return;
+        };
+        const args = alloc.dupe(u8, tc.arguments) catch {
+            alloc.free(id);
+            alloc.free(name);
+            return;
+        };
+        self.tool_calls.append(alloc, .{ .id = id, .name = name, .args = args }) catch {
+            alloc.free(id);
+            alloc.free(name);
+            alloc.free(args);
+            return;
+        };
+        self.renderToolBlockAt(self.tool_calls.items.len - 1);
+    }
+
+    fn replayToolResult(self: *TUI, tr: cmsg.ToolResult) void {
+        const alloc = self.session.alloc;
+        for (self.tool_calls.items, 0..) |*e, i| {
+            if (!e.pending or !std.mem.eql(u8, e.id, tr.tool_call_id)) continue;
+            const copy = alloc.dupe(u8, tr.content) catch return;
+            e.result = copy;
+            e.is_error = tr.is_error;
+            e.pending = false;
+            self.renderToolBlockAt(i);
+            return;
+        }
     }
 
     /// Show tool output in full (true) or as pi's collapsed preview (false),

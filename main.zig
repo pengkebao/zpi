@@ -148,9 +148,9 @@ pub fn main(init: std.process.Init) !void {
             list_models = true;
         } else if (std.mem.eql(u8, arg, "--no-session")) {
             no_session = true;
-        } else if (std.mem.eql(u8, arg, "--continue")) {
+        } else if (std.mem.eql(u8, arg, "--continue") or std.mem.eql(u8, arg, "-c")) {
             continue_last = true;
-        } else if (std.mem.eql(u8, arg, "--resume")) {
+        } else if (std.mem.eql(u8, arg, "--resume") or std.mem.eql(u8, arg, "-r")) {
             resume_mode = true;
         } else if (std.mem.eql(u8, arg, "--session")) {
             if (i + 1 < argv.items.len) session_path = argv.items[i + 1];
@@ -466,6 +466,9 @@ pub fn main(init: std.process.Init) !void {
             std.process.Environ.getPosix(init.minimal.environ, "USERPROFILE");
         var t = tui.TUI.init(io, alloc, &session, model.name, sessions_dir, cwd_abs, home_dir, &cfg, init.minimal.environ);
         defer t.deinit();
+        // Persisted history → visible transcript (pi: renderInitialMessages
+        // runs whenever the session has messages — continue/resume/--session).
+        t.replaySession();
         t.run() catch |e| {
             std.debug.print("[TUI error: {s}]\n", .{@errorName(e)});
         };
