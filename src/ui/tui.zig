@@ -54,6 +54,7 @@ const USER_FG = "\x1b[38;2;222;224;225m"; // text
 const THINKING_TEXT = "\x1b[38;2;150;160;164m"; // thinkingText // violet (spinner, cursor)
 const MUTED = "\x1b[38;2;108;118;123m"; // muted text ("Working" label)
 const FG_MUTED = "\x1b[38;2;157;165;169m"; // muted (customMessageText)
+pub const VERSION = "0.1.0";
 const CUSTOM_MSG_BG = "\x1b[48;2;58;48;85m"; // customMessageBg okhsl(295 42% 24%)
 const FG_ERROR = "\x1b[38;2;234;127;129m"; // error (red)
 // Scrollbar (pi dark theme tokens).
@@ -2836,6 +2837,19 @@ pub const TUI = struct {
         self.session.alloc.free(result.content);
     }
 
+    /// The transcript's first block: startup header (pi: headerContainer is
+    /// a child of documentContainer — it scrolls WITH the document, so a
+    /// continued session only shows it at the very top, never between the
+    /// history and the input). Content follows pi's compact header: bold
+    /// wordmark + dim version, muted key hints, dim onboarding line.
+    pub fn addWelcomeHeader(self: *TUI) void {
+        const text = "\x1b[1mrpi\x1b[0m" ++ FG_MUTED ++ " v" ++ VERSION ++
+            "\x1b[0m  " ++ FG_MUTED ++
+            "esc interrupt · ctrl+c clear/exit · / commands · ctrl+o tools · ctrl+t thinking\x1b[0m\n" ++
+            FG_MUTED ++ "Ask rpi how to use or extend it — it can explain its own features.\x1b[0m";
+        self.addMessage(text);
+    }
+
     /// Replay persisted branch messages into the transcript for
     /// -c/-r/--session continuation (pi: renderInitialMessages →
     /// renderSessionEntries — assistant text/thinking render as blocks, tool
@@ -2853,6 +2867,7 @@ pub const TUI = struct {
             defer self.render_mutex.unlock(self.io);
             self.measureSize();
         }
+        self.addWelcomeHeader();
         const st = self.session.store orelse return;
         const alloc = self.session.alloc;
         const branch = st.branchMessages(alloc) catch return;
@@ -3502,10 +3517,9 @@ pub const TUI = struct {
         defer self.restoreTerminal();
         self.refreshGitBranch();
 
-        // Startup header so the screen isn't empty and the user knows the layout.
-        var hbuf: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(&hbuf, "\x1b[1mrpi\x1b[0m \x1b[90m· {s}\x1b[0m\n\x1b[90mType a message and press Enter · /help for commands · Ctrl+C to clear/exit\x1b[0m", .{self.model_name}) catch return;
-        self.addMessage(header);
+        // The startup header lives at the top of the document (added by
+        // replaySession before any history, pi: headerContainer inside
+        // documentContainer); the model is shown in the footer like pi.
 
         self.redraw();
 
