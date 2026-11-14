@@ -141,7 +141,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | 页脚（cwd、session、model、context%、cost） | ✅ | ✅ | cwd+git 分支+session 名；↑↓R/W/CH$、ctx% 变色+(auto)；右侧 (provider) model • thinking |
 | 启动 header（欢迎 + 已加载资源清单） | ✅ | 🚧 | 欢迎头✅：文档首块（pi headerContainer 语义，继续会话钉底不可见）、compact 文案（wordmark+版本+快捷键+onboarding）；"已加载资源清单"（Context/Skills/Extensions）⏳ |
 | 会话继续界面回放（-c/-r） | ✅ | ✅ | replaySession 对齐 pi renderInitialMessages：user/assistant/thinking 块 + 工具块按 id 配对回填 |
-| markdown 渲染 + 代码高亮 + diff 视图 | ✅ | ⚠️ | markdown 全块（标题/列表/嵌套/表格全边框/引用/hr/链接）；轻量代码高亮；diff 行级红绿；**流式块级增量渲染（自研增强，帧成本与流长度解耦）**；待：diff word 级高亮、OSC8、LaTeX |
+| markdown 渲染 + 代码高亮 + diff 视图 | ✅ | ✅ | markdown 全块（标题/列表/嵌套/表格全边框/引用/hr/链接）；轻量代码高亮；diff 行级红绿 + **word 级反色（1:1 修改对，pi renderIntraLineDiff 语义）**；**OSC8 终端超链接**（链接+裸 URL；tmux/dumb 自动关闭，断行重开，truncateToWidth OSC 撕裂修复）；**LaTeX→unicode**（latex.zig：符号表/frac/sqrt/上下标/\left\right/\text；块级 $$…$$、\[…\ 与内联 $…$、\(…\；流式未闭合按原文渲染）；**流式块级增量渲染（自研增强）**；简化：无 pi 的 2D 分数堆叠排版（超宽回退原文同为 pi 行为） |
 | 主题系统（JSON 主题文件、/settings 切换） | ✅ | ⚠️ | theme.zig 仅颜色枚举 |
 | 快捷键管理器（keybindings.json） | ✅ | ✅ | Action 全集（含滚动/搜索/菜单/本轮 7 个新键位）、keybindings.json 加载覆盖、pi 默认键位 |
 | 鼠标、IME、OSC8 链接 | ✅ | 🚧 | 鼠标✅：点击折叠、拖拽选区、松开复制（OSC52）、滚轮加速、水平滚轮过滤（pi parity）；IME/OSC8 ⏳ |
