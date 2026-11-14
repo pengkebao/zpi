@@ -17,6 +17,8 @@ const shell = @import("../tools/shell.zig");
 const clipboard = @import("../core/clipboard.zig");
 const ptmod = @import("../core/prompt_template.zig");
 const compact = @import("../core/compaction.zig");
+const skills = @import("../core/skills.zig");
+const sp = @import("../core/system_prompt.zig");
 const ansi = @import("ansi.zig");
 const spinner = @import("spinner.zig");
 const keys = @import("keys.zig");
@@ -210,6 +212,7 @@ pub const TUI = struct {
         .{ .name = "/resume", .desc = "Resume a session (picker, or /resume <id>)" },
         .{ .name = "/export", .desc = "Export session to HTML", .takes_arg = true },
         .{ .name = "/compact", .desc = "Compact the conversation" },
+        .{ .name = "/reload", .desc = "Reload skills + rebuild system prompt" },
         .{ .name = "/copy", .desc = "Copy last reply to clipboard" },
         .{ .name = "/settings", .desc = "Open settings (Enter cycles values)" },
         .{ .name = "/debug", .desc = "Write debug log" },
@@ -361,6 +364,10 @@ pub const TUI = struct {
     user_blocks: std.ArrayListUnmanaged(usize) = .empty,
     /// Home directory (owned), abbreviated to `~` in tool paths.
     home_dir: ?[]const u8 = null,
+    /// CLI `--append-system-prompt` / `--system-prompt` (borrowed from cfg /
+    /// startup), preserved across `/reload`.
+    append_system_prompt: ?[]const u8 = null,
+    system_prompt_override: ?[]const u8 = null,
     /// Git branch of the working directory (owned); null outside a repository.
     git_branch: ?[]u8 = null,
     /// The footer's session-derived numbers. Computed on the main thread (the
@@ -1658,7 +1665,7 @@ pub const TUI = struct {
         self.redraw();
     }
 
-    pub fn init(io: std.Io, alloc: std.mem.Allocator, session: *agent.Session, model_name: []const u8, sessions_dir: []const u8, cwd_abs: []const u8, home_dir: ?[]const u8, cfg: ?*config.Config, environ: std.process.Environ) TUI {
+    pub fn init(io: std.Io, alloc: std.mem.Allocator, session: *agent.Session, model_name: []const u8, sessions_dir: []const u8, cwd_abs: []const u8, home_dir: ?[]const u8, cfg: ?*config.Config, environ: std.process.Environ, append_system_prompt: ?[]const u8, system_prompt_override: ?[]const u8) TUI {
         // Abbreviate the home dir in the display path (~/Projects/...).
         const cwd_display: []const u8 = blk: {
             if (home_dir) |h| {
@@ -1733,6 +1740,8 @@ pub const TUI = struct {
             .cwd_abs = cwd_abs,
             .cwd_display = cwd_display,
             .home_dir = if (home_dir) |h| (alloc.dupe(u8, h) catch null) else null,
+            .append_system_prompt = append_system_prompt,
+            .system_prompt_override = system_prompt_override,
             .multi_provider = multi_provider,
             .working = false,
             .spinner_frame = 0,
@@ -3860,6 +3869,58 @@ pub const TUI = struct {
         return self.cfg.?.base_dir;
     }
 
+    /// Expand a `/skill:name [args]` submission (pi _expandSkillCommand). The
+    /// skill's SKILL.md body is wrapped in a `<skill>` block and (optionally)
+    /// followed by the args as a user request. Returns an owned slice, or null
+    /// when the skill is unknown (caller passes the input through unchanged).
+    fn expandSkillCommand(self: *TUI, text: []const u8) ?[]u8 {
+        if (!std.mem.startsWith(u8, text, "/skill:")) return null;
+        const rest = text[7..];
+        const space = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        const skill_name = rest[0..space];
+        const args = if (space < rest.len) std.mem.trim(u8, rest[space + 1 ..], " ") else "";
+        const list = skills.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs, self.home_dir) catch return null;
+        defer skills.freeAll(self.alloc, list);
+        for (list) |s| {
+            if (!std.mem.eql(u8, s.name, skill_name)) continue;
+            const body = skills.loadBody(self.alloc, self.io, s.file_path) orelse return null;
+            defer self.alloc.free(body);
+            const block = std.fmt.allocPrint(self.alloc, "<skill name=\"{s}\" location=\"{s}\">\nReferences are relative to {s}.\n\n{s}\n</skill>", .{ s.name, s.file_path, s.base_dir, body }) catch return null;
+            defer self.alloc.free(block);
+            if (args.len > 0) {
+                const final = std.mem.concat(self.alloc, u8, &.{ block, "\n\n", args }) catch return null;
+                return final;
+            }
+            return self.alloc.dupe(u8, block) catch null;
+        }
+        return null; // unknown skill: pass through
+    }
+
+    /// Re-discover skills and rebuild the system prompt (pi `/reload`). Reports
+    /// the number of visible skills. Returns an error string on failure.
+    fn reloadResources(self: *TUI) !void {
+        const cfg = self.cfg orelse return;
+        const list = try skills.discover(self.alloc, self.io, cfg.base_dir, self.cwd_abs, self.home_dir);
+        defer skills.freeAll(self.alloc, list);
+        const block = try skills.formatForPrompt(self.alloc, list);
+        defer {
+            if (block) |b| self.alloc.free(b);
+        }
+        var tool_snippets = std.array_list.Managed(sp.ToolSnippet).init(self.alloc);
+        defer tool_snippets.deinit();
+        for (self.session.registry.tools.items) |t| {
+            try tool_snippets.append(.{ .name = t.name, .snippet = t.description });
+        }
+        const new_prompt = try sp.buildFromSnippets(self.alloc, self.io, tool_snippets.items, self.cwd_abs, cfg.base_dir, self.append_system_prompt, self.system_prompt_override, block);
+        try self.session.setSystemPrompt(new_prompt);
+        self.alloc.free(new_prompt);
+        var visible: usize = 0;
+        for (list) |s| {
+            if (!s.disable_model_invocation) visible += 1;
+        }
+        self.note("Reloaded resources: {d} skill(s) advertised in the system prompt.", .{visible});
+    }
+
     /// Send text as a user prompt with the full submit ceremony (display,
     /// scroll-to-end, spinner, watch). Frees the caller-owned text.
     fn submitText(self: *TUI, text: []const u8) void {
@@ -4161,6 +4222,28 @@ pub const TUI = struct {
         const arg = parsed.arg;
 
         if (std.mem.eql(u8, word, "/exit") or std.mem.eql(u8, word, "/quit")) return true;
+
+        // /skill:name [args] — force-load a skill (pi _expandSkillCommand).
+        if (std.mem.startsWith(u8, word, "/skill:")) {
+            if (self.expandSkillCommand(cmd)) |expanded| {
+                defer self.alloc.free(expanded);
+                self.submitText(expanded);
+                return false;
+            }
+            self.note("Unknown skill: {s}", .{ word[7..] });
+            self.redraw();
+            return false;
+        }
+
+        // /reload — re-discover skills and rebuild the system prompt (pi).
+        if (std.mem.eql(u8, word, "/reload")) {
+            self.reloadResources() catch |e| {
+                self.note("reload failed: {s}", .{@errorName(e)});
+                self.redraw();
+            };
+            self.redraw();
+            return false;
+        }
 
         // pi: an unknown `/name` is first checked against prompt templates —
         // a match sends the expansion as a normal message (handled here by
@@ -5336,7 +5419,7 @@ test "liveBlockLocked: incremental stream render matches a full render" {
     var registry = tools_test.Registry.init(alloc);
     try tools_test.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     t.width = 90;
     t.height = 30;
     t.working = true;

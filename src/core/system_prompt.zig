@@ -37,6 +37,9 @@ pub const Options = struct {
     /// Full override: replaces preamble + tools + rules (pi's `customPrompt`).
     custom_prompt: ?[]const u8 = null,
     context_files: []const ContextFile = &.{},
+    /// Pre-formatted `<available_skills>` block (skills.formatForPrompt), or
+    /// null when there are no visible skills. Rendered as a `<skills>` section.
+    skills_block: ?[]const u8 = null,
 };
 
 const CONTEXT_CANDIDATES = [_][]const u8{ "AGENTS.override.md", "AGENTS.md", "CLAUDE.md" };
@@ -67,6 +70,10 @@ pub fn buildSystemPrompt(alloc: std.mem.Allocator, opts: Options) ![]u8 {
         rules_str = try buildRulesSection(alloc, opts.tools);
         try sections.append(.{ .name = "tools", .content = tools_str.? });
         try sections.append(.{ .name = "rules", .content = rules_str.? });
+    }
+
+    if (opts.skills_block) |sb| {
+        try sections.append(.{ .name = "skills", .content = sb });
     }
 
     if (opts.append_system_prompt.len > 0) {
@@ -100,6 +107,38 @@ const Section = struct {
     name: []const u8,
     content: []const u8,
 };
+
+/// Build the full sectioned system prompt from pre-extracted tool snippets,
+/// the cwd ancestor context files, and an optional skills block. Shared by
+/// startup (main.zig) and `/reload` (tui.zig). Returns an owned slice
+/// (caller frees).
+pub fn buildFromSnippets(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    tool_snippets: []const ToolSnippet,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    append_system_prompt: ?[]const u8,
+    system_prompt_override: ?[]const u8,
+    skills_block: ?[]const u8,
+) ![]u8 {
+    const ctx_files = try loadProjectContextFiles(alloc, io, cwd, agent_dir);
+    defer {
+        for (ctx_files) |cf| {
+            alloc.free(cf.path);
+            alloc.free(cf.content);
+        }
+        alloc.free(ctx_files);
+    }
+    return try buildSystemPrompt(alloc, .{
+        .cwd = cwd,
+        .tools = tool_snippets,
+        .append_system_prompt = append_system_prompt orelse "",
+        .custom_prompt = system_prompt_override,
+        .context_files = ctx_files,
+        .skills_block = skills_block,
+    });
+}
 
 fn buildToolsSection(alloc: std.mem.Allocator, tools: []const ToolSnippet) ![]u8 {
     var out = std.array_list.Managed(u8).init(alloc);

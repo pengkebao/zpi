@@ -23,7 +23,7 @@ test "TUI batch2 leak" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test system prompt");
-    var t = tui.TUI.init(io, alloc, &session, model.name, "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, model.name, "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     // Exercise the new editor + footer + multi-line transcript.
     t.addUserMessage("hello world");

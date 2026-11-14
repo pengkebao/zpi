@@ -13,6 +13,7 @@ const ss = @import("src/core/session_store.zig");
 const sp = @import("src/core/system_prompt.zig");
 const msgmod = @import("src/core/message.zig");
 const ptmod = @import("src/core/prompt_template.zig");
+const skills = @import("src/core/skills.zig");
 
 fn getCwdAlloc(alloc: std.mem.Allocator) ![]u8 {
     var buf: [4096]u8 = undefined;
@@ -41,41 +42,6 @@ fn detectImageMime(data: []const u8) ?[]const u8 {
     if (data.len >= 6 and (std.mem.eql(u8, data[0..6], "GIF87a") or std.mem.eql(u8, data[0..6], "GIF89a"))) return "image/gif";
     if (data.len >= 12 and std.mem.eql(u8, data[0..4], "RIFF") and std.mem.eql(u8, data[8..12], "WEBP")) return "image/webp";
     return null;
-}
-
-/// Build the sectioned system prompt (Phase D): tool snippets from the registry,
-/// context files (AGENTS.md/CLAUDE.md) discovered in agent_dir + cwd ancestors,
-/// plus optional append/override. Returns an owned slice.
-fn buildSystemPromptFor(
-    alloc: std.mem.Allocator,
-    io: std.Io,
-    registry: *tools.Registry,
-    cwd_abs: []const u8,
-    agent_dir: []const u8,
-    append_system_prompt: ?[]const u8,
-    system_prompt_override: ?[]const u8,
-) ![]u8 {
-    var snippets = std.array_list.Managed(sp.ToolSnippet).init(alloc);
-    defer snippets.deinit();
-    for (registry.tools.items) |t| {
-        try snippets.append(.{ .name = t.name, .snippet = t.description });
-    }
-    const ctx_files = try sp.loadProjectContextFiles(alloc, io, cwd_abs, agent_dir);
-    defer {
-        for (ctx_files) |cf| {
-            alloc.free(cf.path);
-            alloc.free(cf.content);
-        }
-        alloc.free(ctx_files);
-    }
-    const opts = sp.Options{
-        .cwd = cwd_abs,
-        .tools = snippets.items,
-        .append_system_prompt = append_system_prompt orelse "",
-        .custom_prompt = system_prompt_override,
-        .context_files = ctx_files,
-    };
-    return try sp.buildSystemPrompt(alloc, opts);
 }
 
 /// SIGINT/SIGTERM: request a graceful agent abort instead of dying.
@@ -227,6 +193,10 @@ pub fn main(init: std.process.Init) !void {
     // Load config
     var cfg = try config.load(io, alloc, init.minimal.environ);
     defer cfg.deinit(alloc);
+
+    // Home dir (for user-level skill discovery: ~/.agents/skills).
+    const home_dir = std.process.Environ.getPosix(init.minimal.environ, "HOME") orelse
+        std.process.Environ.getPosix(init.minimal.environ, "USERPROFILE");
 
     if (list_models) {
         std.debug.print("models ({s}):\n", .{cfg.base_dir});
@@ -440,8 +410,20 @@ pub fn main(init: std.process.Init) !void {
     }
 
 
-    // Build the sectioned system prompt (Phase D)
-    const system_prompt = try buildSystemPromptFor(alloc, io, &registry, cwd_abs, cfg.base_dir, append_system_prompt, system_prompt_override);
+    // Build the sectioned system prompt (Phase D) + advertise skills (Phase H1).
+    const skills_list = try skills.discover(alloc, io, cfg.base_dir, cwd_abs, home_dir);
+    defer skills.freeAll(alloc, skills_list);
+    var skills_block: ?[]u8 = null;
+    defer {
+        if (skills_block) |b| alloc.free(b);
+    }
+    skills_block = try skills.formatForPrompt(alloc, skills_list);
+    var tool_snippets = std.array_list.Managed(sp.ToolSnippet).init(alloc);
+    defer tool_snippets.deinit();
+    for (registry.tools.items) |t| {
+        try tool_snippets.append(.{ .name = t.name, .snippet = t.description });
+    }
+    const system_prompt = try sp.buildFromSnippets(alloc, io, tool_snippets.items, cwd_abs, cfg.base_dir, append_system_prompt, system_prompt_override, skills_block);
 
     // Create session
     const model_ptr = &model;
@@ -610,9 +592,7 @@ pub fn main(init: std.process.Init) !void {
         }
     } else {
         // TUI mode
-        const home_dir = std.process.Environ.getPosix(init.minimal.environ, "HOME") orelse
-            std.process.Environ.getPosix(init.minimal.environ, "USERPROFILE");
-        var t = tui.TUI.init(io, alloc, &session, model.name, sessions_dir, cwd_abs, home_dir, &cfg, init.minimal.environ);
+        var t = tui.TUI.init(io, alloc, &session, model.name, sessions_dir, cwd_abs, home_dir, &cfg, init.minimal.environ, append_system_prompt, system_prompt_override);
         defer t.deinit();
         // Persisted history → visible transcript (pi: renderInitialMessages
         // runs whenever the session has messages — continue/resume/--session).

@@ -114,7 +114,7 @@ test "live block renders the full streaming markdown (pushes the viewport)" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
     t.stream_thinking.appendSlice("reasoning step one\nreasoning step two") catch {};
@@ -167,7 +167,7 @@ test "tool call: the pending box is repainted in place by its result" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     const pending_bg = "\x1b[48;2;52;56;58m";
     const success_bg = "\x1b[48;2;37;65;49m";
@@ -239,7 +239,7 @@ test "selection: drag selects doc text, highlight reverses the range" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
     t.width = 40;
@@ -292,7 +292,7 @@ test "streaming: the document size does not depend on the viewport" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
     t.width = 60;
@@ -350,7 +350,7 @@ test "thinking: click collapses streaming and finished thinking blocks" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
     t.width = 60;
@@ -417,7 +417,7 @@ test "selection: clicking a tool block toggles its expansion" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
     t.width = 80;
@@ -479,7 +479,7 @@ test "resize: rerenderAtWidth re-wraps blocks and full-width backgrounds" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
     const user_bg = "\x1b[48;2;33;59;73m"; // userMessageBg
@@ -534,7 +534,7 @@ test "scroll: the viewport saturates at both ends instead of wrapping" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     t.addMessage("one\ntwo\nthree\nfour\nfive");
     // A 20-row document in a 10-row viewport; the ScrollView is the single
@@ -573,7 +573,7 @@ test "scroll: scrolled-up viewport stays anchored when content grows" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     t.addMessage("head");
     // A 20-row document in a 10-row viewport; scroll up 4 rows from the end.
@@ -630,7 +630,7 @@ test "scroll: jump hint rect is hit only on the label" {
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
     var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
-    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty);
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     // Nothing shown: no hit anywhere.
     try std.testing.expect(!t.jumpHintHit(40, 3));

@@ -157,6 +157,14 @@ pub const Session = struct {
         return s;
     }
 
+    /// Replace the system prompt (pi: `/reload` section patch). Updates both the
+    /// context and the stable system_blocks pointer (which borrows the context
+    /// buffer). Takes ownership of `new_prompt`.
+    pub fn setSystemPrompt(self: *Session, new_prompt: []const u8) !void {
+        try self.context.setSystemPrompt(new_prompt);
+        self.system_blocks[0].text = self.context.system_prompt;
+    }
+
     pub fn deinit(self: *Session) void {
         self.clearTurnEvents();
         self.turn_events.deinit(self.alloc);

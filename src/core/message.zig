@@ -239,6 +239,14 @@ pub const Context = struct {
         self.alloc.free(self.system_prompt);
     }
 
+    /// Replace the system prompt (pi: system-prompt section patch on `/reload`).
+    /// Takes ownership of `new_prompt` (a fresh allocation).
+    pub fn setSystemPrompt(self: *Context, new_prompt: []const u8) !void {
+        const copy = self.alloc.dupe(u8, new_prompt) catch return error.OutOfMemory;
+        self.alloc.free(self.system_prompt);
+        self.system_prompt = copy;
+    }
+
     /// Deep-copy append: the Context owns its own buffers; the caller keeps
     /// ownership of `msg` and must deinit it independently.
     pub fn append(self: *Context, msg: Message) !void {
