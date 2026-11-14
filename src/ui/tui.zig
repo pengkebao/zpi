@@ -899,6 +899,16 @@ pub const TUI = struct {
         };
         var bindings = keybindings.Bindings.default();
         if (cfg) |c| bindings = keybindings.Bindings.load(alloc, io, c.base_dir);
+        // OSC 8 hyperlinks leak as raw text in environments that do not
+        // forward them (tmux without passthrough); dumb terminals too.
+        {
+            const term = std.process.Environ.getPosix(environ, "TERM") orelse "";
+            if (std.process.Environ.getPosix(environ, "TMUX") != null or
+                std.mem.startsWith(u8, term, "tmux") or std.mem.eql(u8, term, "dumb"))
+            {
+                markdown.hyperlinks_enabled = false;
+            }
+        }
         // pi names the provider in the footer only when there is a choice.
         var multi_provider = false;
         if (cfg) |c| {
@@ -3980,17 +3990,32 @@ fn truncateToWidth(alloc: std.mem.Allocator, line: []const u8, width: usize) ![]
     var cut = false;
     while (i < line.len) {
         if (line[i] == 0x1b) {
-            // Copy the whole escape sequence. Skip ESC + introducer ('[' or 'O')
-            // before scanning for the final byte, or CSI params get torn apart.
-            var k = if (i + 1 < line.len) i + 2 else i + 1;
-            while (k < line.len) {
-                const c = line[k];
-                if (c >= 0x40 and c <= 0x7E) break;
+            // Copy the whole escape sequence: CSI (params + final byte),
+            // OSC (terminated by BEL or ST — an OSC 8 hyperlink must not be
+            // torn apart or the URL leaks into the cell math), and plain
+            // two-byte escapes.
+            var k = i + 1;
+            if (k < line.len and line[k] == '[') {
+                k += 1;
+                while (k < line.len and !(line[k] >= 0x40 and line[k] <= 0x7E)) k += 1;
+                k = @min(k + 1, line.len);
+            } else if (k < line.len and (line[k] == ']' or line[k] == 'P' or line[k] == '_' or line[k] == '^')) {
+                k += 1;
+                while (k < line.len) : (k += 1) {
+                    if (line[k] == 0x07) {
+                        k += 1;
+                        break;
+                    }
+                    if (line[k] == 0x1b and k + 1 < line.len and line[k + 1] == '\\') {
+                        k += 2;
+                        break;
+                    }
+                }
+            } else if (k < line.len) {
                 k += 1;
             }
-            if (k >= line.len) k = line.len - 1;
-            out.appendSlice(alloc, line[i .. k + 1]) catch return error.OutOfMemory;
-            i = k + 1;
+            out.appendSlice(alloc, line[i..k]) catch return error.OutOfMemory;
+            i = k;
             continue;
         }
         const end = wmod.nextCharEnd(line, i);

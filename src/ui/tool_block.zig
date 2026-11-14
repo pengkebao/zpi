@@ -232,7 +232,162 @@ fn renderEdit(b: *Builder, view: ToolView, args: Args) !void {
     const lines = trimTrailingEmpty(try splitLines(b.arena, diff));
     if (lines.len == 0) return;
     try b.blank();
-    for (lines) |l| try b.text(diffStyle(l), l);
+    // Group the diff: a hunk of exactly one removed and one added line is a
+    // single-line modification — pi highlights the changed WORDS with
+    // inverse instead of coloring the whole lines (pi: renderIntraLineDiff).
+    var i: usize = 0;
+    while (i < lines.len) {
+        const kind = diffKind(lines[i]);
+        if (kind == .removed) {
+            var removed_end = i;
+            while (removed_end < lines.len and diffKind(lines[removed_end]) == .removed) removed_end += 1;
+            var added_end = removed_end;
+            while (added_end < lines.len and diffKind(lines[added_end]) == .added) added_end += 1;
+            const removed_count = removed_end - i;
+            const added_count = added_end - removed_end;
+            if (removed_count == 1 and added_count == 1) {
+                const old_line = lineContent(lines[i]);
+                const new_line = lineContent(lines[removed_end]);
+                if (wordDiffLines(b.arena, old_line, new_line) catch null) |pair| {
+                    defer b.arena.free(pair.removed);
+                    defer b.arena.free(pair.added);
+                    // Keep each row's `-N ` prefix; the word-level inverses
+                    // ride on the row color (7m/27m only touch the reverse bit).
+                    const rem = try std.fmt.allocPrint(b.arena, FG_DIFF_REMOVED ++ "{s}{s}", .{ lines[i][0 .. lines[i].len - old_line.len], pair.removed });
+                    const add = try std.fmt.allocPrint(b.arena, FG_DIFF_ADDED ++ "{s}{s}", .{ lines[removed_end][0 .. lines[removed_end].len - new_line.len], pair.added });
+                    try b.text("", rem);
+                    try b.text("", add);
+                    i = added_end;
+                    continue;
+                }
+            }
+            // Fallback: whole-line colors.
+            for (lines[i..added_end]) |l| try b.text(diffStyle(l), l);
+            i = added_end;
+            continue;
+        }
+        try b.text(diffStyle(lines[i]), lines[i]);
+        i += 1;
+    }
+}
+
+// ---- Intra-line (word) diff (pi: renderIntraLineDiff with jsdiff.diffWords) ----
+
+/// A whitespace-separated word / single punctuation token.
+const Token = struct { text: []const u8 };
+
+fn tokenizeWords(arena: std.mem.Allocator, line: []const u8) ![]Token {
+    var out: std.ArrayListUnmanaged(Token) = .empty;
+    var i: usize = 0;
+    while (i < line.len) {
+        const start = i;
+        if (std.ascii.isAlphanumeric(line[i]) or line[i] == '_') {
+            while (i < line.len and (std.ascii.isAlphanumeric(line[i]) or line[i] == '_')) i += 1;
+        } else {
+            i += 1;
+        }
+        try out.append(arena, .{ .text = line[start..i] });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+const WordPair = struct { removed: []u8, added: []u8 };
+
+const INV_ON = "\x1b[7m";
+const INV_OFF = "\x1b[27m";
+
+/// Word-level diff of two lines, rendered with inverse on the changed tokens
+/// (pi: jsdiff.diffWords + theme.inverse). Returns null when either line is
+/// too long for the DP table — the caller keeps whole-line colors then.
+fn wordDiffLines(arena: std.mem.Allocator, old_line: []const u8, new_line: []const u8) !?WordPair {
+    const MAX_TOKENS = 400;
+    const a = try tokenizeWords(arena, old_line);
+    const b = try tokenizeWords(arena, new_line);
+    if (a.len > MAX_TOKENS or b.len > MAX_TOKENS) return null;
+
+    // LCS table (tokens compared by content).
+    const table = try arena.alloc(u16, (a.len + 1) * (b.len + 1));
+    defer arena.free(table);
+    @memset(table, 0);
+    var ai = a.len;
+    while (ai > 0) {
+        ai -= 1;
+        var bi = b.len;
+        while (bi > 0) {
+            bi -= 1;
+            table[ai * (b.len + 1) + bi] = if (std.mem.eql(u8, a[ai].text, b[bi].text))
+                table[(ai + 1) * (b.len + 1) + bi + 1] + 1
+            else
+                @max(table[(ai + 1) * (b.len + 1) + bi], table[ai * (b.len + 1) + bi + 1]);
+        }
+    }
+
+    // Walk the LCS path emitting per-side text: same runs plain, changed runs
+    // inverse. The leading whitespace of the first changed run stays outside
+    // the inverse (pi strips it so indentation is not highlighted).
+    var removed: std.ArrayListUnmanaged(u8) = .empty;
+    var added: std.ArrayListUnmanaged(u8) = .empty;
+    var first_removed = true;
+    var first_added = true;
+    ai = 0;
+    var bi: usize = 0;
+    const Ctx = struct {
+        fn appendChanged(list: *std.ArrayListUnmanaged(u8), al: std.mem.Allocator, value: []const u8, strip_leading_ws: *bool) !void {
+            var value_v = value;
+            if (strip_leading_ws.*) {
+                var k: usize = 0;
+                while (k < value_v.len and (value_v[k] == ' ' or value_v[k] == '\t')) k += 1;
+                if (k > 0) try list.appendSlice(al, value_v[0..k]);
+                value_v = value_v[k..];
+                strip_leading_ws.* = false;
+            }
+            if (value_v.len > 0) {
+                try list.appendSlice(al, INV_ON);
+                try list.appendSlice(al, value_v);
+                try list.appendSlice(al, INV_OFF);
+            }
+        }
+    };
+
+    while (ai < a.len or bi < b.len) {
+        if (ai < a.len and bi < b.len and std.mem.eql(u8, a[ai].text, b[bi].text)) {
+            try removed.appendSlice(arena, a[ai].text);
+            try added.appendSlice(arena, b[bi].text);
+            first_removed = false;
+            first_added = false;
+            ai += 1;
+            bi += 1;
+        } else if (bi >= b.len or (ai < a.len and table[(ai + 1) * (b.len + 1) + bi] >= table[ai * (b.len + 1) + bi + 1])) {
+            try Ctx.appendChanged(&removed, arena, a[ai].text, &first_removed);
+            ai += 1;
+        } else {
+            try Ctx.appendChanged(&added, arena, b[bi].text, &first_added);
+            bi += 1;
+        }
+    }
+    return .{ .removed = try removed.toOwnedSlice(arena), .added = try added.toOwnedSlice(arena) };
+}
+
+/// The diff row class (pi: parseDiffLine): `+N `, `-N ` are changes; an
+/// optional number after a space prefix is context; anything else "other".
+fn diffKind(line: []const u8) enum { removed, added, context, other } {
+    if (line.len == 0) return .other;
+    const prefix = line[0];
+    if (prefix != '+' and prefix != '-') return if (prefix == ' ') .context else .other;
+    var j: usize = 1;
+    while (j < line.len and line[j] == ' ') j += 1;
+    while (j < line.len and line[j] >= '0' and line[j] <= '9') j += 1;
+    if (j >= line.len or line[j] != ' ') return .other;
+    return if (prefix == '+') .added else .removed;
+}
+
+/// The text after `-N `/`+N `/`N ` numbering.
+fn lineContent(line: []const u8) []const u8 {
+    var j: usize = 1;
+    while (j < line.len and line[j] == ' ') j += 1;
+    while (j < line.len and line[j] >= '0' and line[j] <= '9') j += 1;
+    if (j < line.len and line[j] == ' ') return line[j + 1 ..];
+    return line[j..];
 }
 
 /// `write <path>`, then a preview of the content being written.
@@ -956,8 +1111,9 @@ test "edit: shows the colored diff without the success line" {
     }, .{ .width = 40 });
     defer t.allocator.free(block);
     try expectRows(&.{ "", "", " edit a.txt", "", "  1 keep", " -2 old", " +2 new", "" }, block);
-    try t.expect(std.mem.indexOf(u8, block, FG_DIFF_ADDED ++ "+2 new") != null);
-    try t.expect(std.mem.indexOf(u8, block, FG_DIFF_REMOVED ++ "-2 old") != null);
+    // A 1:1 modification pair gets word-level inverse on the changed token.
+    try t.expect(std.mem.indexOf(u8, block, FG_DIFF_REMOVED ++ "-2 " ++ INV_ON ++ "old" ++ INV_OFF) != null);
+    try t.expect(std.mem.indexOf(u8, block, FG_DIFF_ADDED ++ "+2 " ++ INV_ON ++ "new" ++ INV_OFF) != null);
     try t.expect(std.mem.indexOf(u8, block, FG_DIFF_CONTEXT ++ " 1 keep") != null);
 }
 

@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const width_mod = @import("width.zig");
+const latex_mod = @import("latex.zig");
 
 // ---- pi dark theme (okhsl converted to sRGB with pi-tui's color pipeline) ----
 const C_RESET = "\x1b[0m";
@@ -68,13 +69,13 @@ pub fn render(alloc: std.mem.Allocator, src: []const u8, width: usize) ![][]u8 {
 }
 
 /// The block kind of a source line (exposed for incremental rendering).
-pub const BlockKind = enum { blank, fence, heading, hr, quote, list, table, para };
+pub const BlockKind = enum { blank, fence, heading, hr, quote, list, table, para, latex };
 
 /// Whether a blank row separates a block of kind `prev` from one of `next`
 /// (pi separates blocks by one blank row even when the source has none).
 fn blocksNeedGap(prev: BlockKind, next: BlockKind) bool {
     return switch (prev) {
-        .heading, .fence, .table, .hr, .quote => next != .blank,
+        .heading, .fence, .table, .hr, .quote, .latex => next != .blank,
         // Paragraph lines stay together, and a list may follow directly.
         .para => next != .blank and next != .para and next != .list,
         .list, .blank => false,
@@ -120,6 +121,44 @@ pub fn renderSegment(
     var i: usize = 0;
     var last: ?BlockKind = null;
     while (i < lines.items.len) {
+        // Display math ($$…$$ / \[…\]) before the regular classifier: the
+        // converted unicode block otherwise reads as a plain paragraph.
+        if (classify(lines.items, i) != .fence) {
+            if (latexBlockEnd(lines.items, i)) |end| {
+                const opener = std.mem.trimStart(u8, lines.items[i], " ");
+                const closer: []const u8 = if (std.mem.startsWith(u8, opener, "\\")) "\\]" else "$$";
+                var body: std.ArrayListUnmanaged(u8) = .empty;
+                defer body.deinit(alloc);
+                for (lines.items[i..end], i..) |l, li| {
+                    var row = l;
+                    if (li == i) {
+                        row = row[2..];
+                    } else {
+                        try body.append(alloc, '\n');
+                    }
+                    if (li == end - 1) {
+                        if (std.mem.lastIndexOf(u8, row, closer)) |pos| row = row[0..pos];
+                    }
+                    try body.appendSlice(alloc, std.mem.trim(u8, row, " "));
+                }
+                const converted = latex_mod.render(alloc, body.items) catch null;
+                r.list_depth = 0;
+                if (converted) |conv_text| {
+                    defer alloc.free(conv_text);
+                    var nl = std.mem.splitScalar(u8, conv_text, '\n');
+                    while (nl.next()) |row| {
+                        try r.paragraph(row);
+                    }
+                } else {
+                    // Conversion failed: the raw source (pi falls back too).
+                    for (lines.items[i..end]) |l| try r.paragraph(l);
+                }
+                try r.gapAfter(.latex, lines.items, end);
+                last = .latex;
+                i = end;
+                continue;
+            }
+        }
         const kind = classify(lines.items, i);
         if (i == 0) {
             // Splice boundary: the gap between the previous segment's last
@@ -164,6 +203,8 @@ pub fn renderSegment(
                 try r.paragraph(lines.items[i]);
                 i += 1;
             },
+            // Intercepted above (before the classifier); unreachable here.
+            .latex => unreachable,
         }
         try r.gapAfter(kind, lines.items, i);
         last = kind;
@@ -194,6 +235,22 @@ pub fn renderWith(alloc: std.mem.Allocator, src: []const u8, width: usize, opts:
 const Kind = BlockKind; // (public alias — renderSegment splicing exposes it)
 
 /// The block that starts at `lines[i]`.
+
+/// Whether a display-math block starts at `lines[i]`: up to three spaces,
+/// then `$$` or `\[`. Returns the exclusive end line index when closed
+/// (and no table starts inside, so a stray `$$` cannot swallow a table).
+pub fn latexBlockEnd(lines: []const []const u8, i: usize) ?usize {
+    const opener = std.mem.trimStart(u8, lines[i], " ");
+    const closer: []const u8 = if (std.mem.startsWith(u8, opener, "$$")) "$$" else if (std.mem.startsWith(u8, opener, "\\")) "\\]" else return null;
+    var j = i;
+    while (j < lines.len) : (j += 1) {
+        const scan = if (j == i) opener[closer.len..] else lines[j];
+        if (std.mem.indexOf(u8, scan, closer) != null) return j + 1;
+        if (j > i and isTableStart(lines[j - 1], lines[j])) return null;
+    }
+    return null; // unclosed: paragraph (pi's pending state renders raw too)
+}
+
 fn classify(lines: []const []const u8, i: usize) Kind {
     const line = lines[i];
     if (isBlank(line)) return .blank;
@@ -751,6 +808,20 @@ fn listMarker(line: []const u8) ?ListMarker {
 
 // ---- inline ----
 
+/// Terminal hyperlinks (OSC 8) on rendered links and bare URLs. Enabled by
+/// default; the TUI turns it off for environments that do not forward OSC 8
+/// (tmux without passthrough, dumb terminals) where the raw sequence would
+/// leak into the text.
+pub var hyperlinks_enabled: bool = true;
+
+fn osc8(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, url: []const u8, styled_text: []const u8) !void {
+    try out.appendSlice(alloc, "\x1b]8;;");
+    try out.appendSlice(alloc, url);
+    try out.appendSlice(alloc, "\x1b\\");
+    try out.appendSlice(alloc, styled_text);
+    try out.appendSlice(alloc, "\x1b]8;;\x1b\\");
+}
+
 /// Render inline markdown (code spans, bold, italic, strikethrough, links)
 /// into `out`.
 pub fn renderInline(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
@@ -820,15 +891,24 @@ fn renderInlineBase(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
             if (parseLink(text, i)) |link| {
                 const label = text[i + 1 .. link.text_end];
                 const url = text[link.url_start..link.url_end];
-                try out.appendSlice(alloc, C_LINK ++ C_UNDER);
-                try renderInlineBase(alloc, out, label, C_LINK ++ C_UNDER, true);
-                try out.appendSlice(alloc, C_UNDER_OFF ++ C_FG_OFF);
-                // The target is shown unless the label already is the target.
-                const shown = if (std.mem.startsWith(u8, url, "mailto:")) url["mailto:".len..] else url;
-                if (!std.mem.eql(u8, label, url) and !std.mem.eql(u8, label, shown)) {
-                    try out.appendSlice(alloc, C_LINK_URL ++ " (");
-                    try out.appendSlice(alloc, url);
-                    try out.appendSlice(alloc, ")" ++ C_FG_OFF);
+                var link_body: std.ArrayListUnmanaged(u8) = .empty;
+                defer link_body.deinit(alloc);
+                try link_body.appendSlice(alloc, C_LINK ++ C_UNDER);
+                try renderInlineBase(alloc, &link_body, label, C_LINK ++ C_UNDER, true);
+                try link_body.appendSlice(alloc, C_UNDER_OFF ++ C_FG_OFF);
+                if (hyperlinks_enabled) {
+                    // OSC 8 wraps the whole styled label (pi: hyperlink of the
+                    // themed link); the URL stays out of the text.
+                    try osc8(out, alloc, url, link_body.items);
+                } else {
+                    try out.appendSlice(alloc, link_body.items);
+                    // The target is shown unless the label already is the target.
+                    const shown = if (std.mem.startsWith(u8, url, "mailto:")) url["mailto:".len..] else url;
+                    if (!std.mem.eql(u8, label, url) and !std.mem.eql(u8, label, shown)) {
+                        try out.appendSlice(alloc, C_LINK_URL ++ " (");
+                        try out.appendSlice(alloc, url);
+                        try out.appendSlice(alloc, ")" ++ C_FG_OFF);
+                    }
                 }
                 try out.appendSlice(alloc, base);
                 i = link.url_end + 1;
@@ -839,9 +919,17 @@ fn renderInlineBase(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
         // A bare URL is a link to itself.
         if (!in_link and c == 'h' and (i == 0 or !std.ascii.isAlphanumeric(text[i - 1]))) {
             if (bareUrlEnd(text, i)) |end| {
-                try out.appendSlice(alloc, C_LINK ++ C_UNDER);
-                try out.appendSlice(alloc, text[i..end]);
-                try out.appendSlice(alloc, C_UNDER_OFF ++ C_FG_OFF);
+                const url_text = text[i..end];
+                var body: std.ArrayListUnmanaged(u8) = .empty;
+                defer body.deinit(alloc);
+                try body.appendSlice(alloc, C_LINK ++ C_UNDER);
+                try body.appendSlice(alloc, url_text);
+                try body.appendSlice(alloc, C_UNDER_OFF ++ C_FG_OFF);
+                if (hyperlinks_enabled) {
+                    try osc8(out, alloc, url_text, body.items);
+                } else {
+                    try out.appendSlice(alloc, body.items);
+                }
                 try out.appendSlice(alloc, base);
                 i = end;
                 continue;
@@ -1088,6 +1176,9 @@ fn wrapStyled(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged([]u8), line
     // SGR sequences since the last reset: replaying them restores the style.
     var active: std.ArrayListUnmanaged([]const u8) = .empty;
     defer active.deinit(alloc);
+    // Open OSC 8 hyperlink (its URL), if a break happens mid-link: close it
+    // at the end of the row and re-open at the head of the next one.
+    var active_link_url: ?[]const u8 = null;
     var col: usize = 0;
     var continuation = false;
 
@@ -1100,13 +1191,25 @@ fn wrapStyled(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged([]u8), line
             try cur.appendSlice(alloc, seq);
             if (isSgr(seq)) {
                 if (isSgrReset(seq)) active.clearRetainingCapacity() else try active.append(alloc, seq);
+            } else if (seq.len > 5 and seq[1] == ']' and std.mem.startsWith(u8, seq[2..], "8;")) {
+                // OSC 8: the payload after "8;;" up to the terminator is the
+                // URL; an empty URL closes the link.
+                const term = std.mem.lastIndexOf(u8, seq, "\x1b\\") orelse seq.len;
+                const payload = if (term >= 4 and term <= seq.len) seq[4..term] else "";
+                if (payload.len == 0) {
+                    if (active_link_url) |u| alloc.free(u);
+                    active_link_url = null;
+                } else {
+                    if (active_link_url) |u| alloc.free(u);
+                    active_link_url = try alloc.dupe(u8, payload);
+                }
             }
             i = end;
             continue;
         }
         if (c == ' ') {
             if (col + 1 > width) {
-                try breakRow(alloc, out, &cur, active.items);
+                try breakRow(alloc, out, &cur, active.items, active_link_url);
                 col = 0;
                 continuation = true;
             } else if (!(continuation and col == 0)) {
@@ -1122,7 +1225,7 @@ fn wrapStyled(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged([]u8), line
         const word_end = wordEnd(line, i);
         const w = width_mod.visualWidth(line[i..word_end]);
         if (col + w > width and col > 0 and w <= width) {
-            try breakRow(alloc, out, &cur, active.items);
+            try breakRow(alloc, out, &cur, active.items, active_link_url);
             col = 0;
             continuation = true;
         }
@@ -1136,7 +1239,7 @@ fn wrapStyled(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged([]u8), line
                 const char_end = width_mod.nextCharEnd(line, j);
                 const cw = width_mod.visualWidth(line[j..char_end]);
                 if (col + cw > width and col > 0) {
-                    try breakRow(alloc, out, &cur, active.items);
+                    try breakRow(alloc, out, &cur, active.items, active_link_url);
                     col = 0;
                     continuation = true;
                 }
@@ -1154,14 +1257,20 @@ fn wrapStyled(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged([]u8), line
 
 /// End the current row: drop its trailing spaces, close the open styles, and
 /// start the next row with them reopened.
-fn breakRow(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged([]u8), cur: *std.ArrayListUnmanaged(u8), active: []const []const u8) !void {
+fn breakRow(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged([]u8), cur: *std.ArrayListUnmanaged(u8), active: []const []const u8, active_link_url: ?[]const u8) !void {
     while (cur.items.len > 0 and cur.items[cur.items.len - 1] == ' ') cur.shrinkRetainingCapacity(cur.items.len - 1);
+    if (active_link_url != null) try cur.appendSlice(alloc, "\x1b]8;;\x1b\\");
     if (active.len > 0) try cur.appendSlice(alloc, C_RESET);
     const row = try cur.toOwnedSlice(alloc);
     errdefer alloc.free(row);
     try out.append(alloc, row);
     cur.* = .empty;
     for (active) |sgr| try cur.appendSlice(alloc, sgr);
+    if (active_link_url) |url| {
+        try cur.appendSlice(alloc, "\x1b]8;;");
+        try cur.appendSlice(alloc, url);
+        try cur.appendSlice(alloc, "\x1b\\");
+    }
 }
 
 /// End of the unbreakable unit starting at `line[start]`: a run of narrow
@@ -1342,18 +1451,27 @@ test "links: label with target, bare target once" {
     const link = C_LINK ++ C_UNDER;
     const end = C_UNDER_OFF ++ C_FG_OFF;
 
+    // OSC 8 hyperlinks are on by default: the label is wrapped, the URL is
+    // not printed inline (pi parity).
     try renderInline(t.allocator, &out, "see [docs](https://x.y) ok");
-    try t.expectEqualStrings("see " ++ link ++ "docs" ++ end ++ C_LINK_URL ++ " (https://x.y)" ++ C_FG_OFF ++ " ok", out.items);
+    try t.expectEqualStrings("see " ++ "\x1b]8;;https://x.y\x1b\\" ++ link ++ "docs" ++ end ++ "\x1b]8;;\x1b\\" ++ " ok", out.items);
 
     // The label is the target: it is not repeated.
     out.clearRetainingCapacity();
     try renderInline(t.allocator, &out, "[https://x.y](https://x.y)");
-    try t.expectEqualStrings(link ++ "https://x.y" ++ end, out.items);
+    try t.expectEqualStrings("\x1b]8;;https://x.y\x1b\\" ++ link ++ "https://x.y" ++ end ++ "\x1b]8;;\x1b\\", out.items);
 
     // A bare URL is a link; the sentence's full stop stays outside.
     out.clearRetainingCapacity();
     try renderInline(t.allocator, &out, "at https://x.y/a?b=1. Done");
-    try t.expectEqualStrings("at " ++ link ++ "https://x.y/a?b=1" ++ end ++ ". Done", out.items);
+    try t.expectEqualStrings("at " ++ "\x1b]8;;https://x.y/a?b=1\x1b\\" ++ link ++ "https://x.y/a?b=1" ++ end ++ "\x1b]8;;\x1b\\" ++ ". Done", out.items);
+
+    // Disabled (tmux/dumb terminals): the legacy "(url)" fallback.
+    hyperlinks_enabled = false;
+    defer hyperlinks_enabled = true;
+    out.clearRetainingCapacity();
+    try renderInline(t.allocator, &out, "see [docs](https://x.y) ok");
+    try t.expectEqualStrings("see " ++ link ++ "docs" ++ end ++ C_LINK_URL ++ " (https://x.y)" ++ C_FG_OFF ++ " ok", out.items);
 }
 
 test "code fence: language on the fence row, highlighted code" {
