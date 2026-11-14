@@ -3976,10 +3976,19 @@ pub const TUI = struct {
 
             // Translate configured newline/submit keys into canonical editor
             // keys so the editor stays mapping-agnostic.
+            // pi handleFollowUp (interactive-mode.js): idle Alt+Enter acts
+            // like regular Enter (submit); while streaming the watcher
+            // queues it as follow-up instead.
+            const is_alt_enter = switch (key) {
+                .char => |c| c.c == '\r' and c.alt,
+                else => false,
+            };
             var editor_key = key;
             if (self.bindings.matches(key, .newline)) {
                 editor_key = .shift_enter;
             } else if (self.bindings.matches(key, .submit)) {
+                editor_key = .enter;
+            } else if (is_alt_enter) {
                 editor_key = .enter;
             } else if (key == .enter and !self.bindings.matches(.enter, .submit)) {
                 // Enter is no longer bound to submit: fall back to newline.
