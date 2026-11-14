@@ -161,7 +161,7 @@ fn writeUsage(out: *std.array_list.Managed(u8), u: msg.Usage) !void {
     });
 }
 
-fn writeMessageJson(out: *std.array_list.Managed(u8), m: *const msg.Message) !void {
+pub fn writeMessageJson(out: *std.array_list.Managed(u8), m: *const msg.Message) !void {
     const ts: i64 = m.timestamp_ms;
     switch (m.role) {
         .user => {

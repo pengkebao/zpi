@@ -178,6 +178,57 @@ pub const Config = struct {
         }
         return null;
     }
+
+    /// Set the default provider/model (owned copies).
+    pub fn setDefaultProviderModel(self: *Config, alloc: std.mem.Allocator, provider: []const u8, model: []const u8) !void {
+        if (self.default_provider) |dp| alloc.free(dp);
+        if (self.default_model) |dm| alloc.free(dm);
+        self.default_provider = try alloc.dupe(u8, provider);
+        self.default_model = try alloc.dupe(u8, model);
+    }
+
+    /// Persist current settings (compaction, default model) to
+    /// <agent-dir>/settings.json, preserving unrelated fields.
+    pub fn persistSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io) !void {
+        const path = try std.fmt.allocPrint(alloc, "{s}/settings.json", .{self.base_dir});
+        defer alloc.free(path);
+        const buf: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch null;
+        defer if (buf) |b| alloc.free(b);
+
+        var root: std.json.Value = if (buf) |b| blk: {
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, b, .{}) catch break :blk .{ .object = std.json.ObjectMap.empty };
+            break :blk parsed.value;
+        } else .{ .object = std.json.ObjectMap.empty };
+
+        var comp = std.json.ObjectMap.empty;
+        try comp.put(alloc, "enabled", .{ .bool = self.compaction.enabled });
+        try comp.put(alloc, "reserveTokens", .{ .integer = @intCast(self.compaction.reserve_tokens) });
+        try comp.put(alloc, "keepRecentTokens", .{ .integer = @intCast(self.compaction.keep_recent_tokens) });
+        // Preserve unknown compaction sub-fields.
+        if (root.object.get("compaction")) |old_c| {
+            if (old_c == .object) {
+                var it = old_c.object.iterator();
+                while (it.next()) |e| {
+                    const keep = [_][]const u8{ "enabled", "reserveTokens", "keepRecentTokens" };
+                    var known = false;
+                    for (keep) |k| {
+                        if (std.mem.eql(u8, e.key_ptr.*, k)) {
+                            known = true;
+                            break;
+                        }
+                    }
+                    if (!known) try comp.put(alloc, e.key_ptr.*, e.value_ptr.*);
+                }
+            }
+        }
+        try root.object.put(alloc, "compaction", .{ .object = comp });
+        if (self.default_provider) |dp| try root.object.put(alloc, "defaultProvider", .{ .string = dp });
+        if (self.default_model) |dm| try root.object.put(alloc, "defaultModel", .{ .string = dm });
+
+        const json_text = try std.json.Stringify.valueAlloc(alloc, root, .{});
+        defer alloc.free(json_text);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json_text });
+    }
 };
 
 // ── Built-in providers (subset of pi's catalog, verified values) ────

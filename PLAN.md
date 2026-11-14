@@ -136,8 +136,8 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | `/` 命令菜单 + 模糊搜索 | ✅ | ✅ | 13 条命令（/help /clear /exit /model /think /session /name /new /tree /fork /resume /compact /hotkeys）+ `/` 补全菜单 + 模型名补全 |
 | `/model`（Ctrl+L）、`/thinking`（Shift+Tab 循环） | ✅ | ✅ | /model 模糊匹配切换 + ctrl+p/shift+ctrl+p 循环 + ctrl+l 列表；/think + shift+tab 档位循环；全屏 selector 🚧 |
 | `/hotkeys` | ✅ | ✅ | |
-| `/settings` 对话框、`/debug` | ✅ | ❌ | |
-| `!cmd` / `!!cmd`、`@file` 补全、Tab 路径补全 | ✅ | ❌ | |
+| `/settings` 对话框、`/debug` | ✅ | ✅ | /settings：模态选择器（菜单基建复用，Up/Down/Enter/Esc）——Auto-compact 开关、reserve/keepRecent tokens 档位循环、Default model 循环；Enter 生效并**保真写回 settings.json**（未知字段保留）；/debug：终端尺寸 + 全部渲染行（含可见宽度）+ 会话消息 JSONL → /tmp/rpi-debug-*.log |
+| `!cmd` / `!!cmd`、`@file` 补全、Tab 路径补全 | ✅ | ✅ | !cmd/!!cmd（本轮已实现，见上下文组装节）；编辑器 @path Tab 补全（G4，common-prefix）；CLI `@file` 位置参数（文本+图片附件） |
 | Ctrl+G 外部编辑器 | ✅ | ✅ | $EDITOR/VISUAL，挂起→编辑→恢复全量重绘 |
 | 运行中输入（steering/follow-up/Escape 中断） | ✅ | ✅ | Escape/Ctrl+C 中断✅；**steering 队列**✅（运行中 Enter → 下一 LLM 请求前注入 context，pi getSteeringMessages 语义）；**follow-up 队列**✅（alt+enter 排队 → 回合结束自动续跑为新回合，pi followUpQueue）；**alt+up/alt+v 恢复排队消息到编辑器**✅（app.message.dequeue）；运行中编辑器 live（watcher 分发编辑器键，光标常驻输入框） |
 | Ctrl+O 折叠工具输出、Ctrl+T 隐藏 thinking | ✅ | ✅ | Ctrl+O 预览↔全文；Ctrl+T 全局显隐 + 单块点击折叠 |

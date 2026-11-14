@@ -121,7 +121,7 @@ pub const MousePoint = struct { col: usize, row: usize };
 pub const TUI = struct {
     // ---- Completion menu types (G4) ----
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null };
-    const MenuMode = enum { hidden, commands, models };
+    const MenuMode = enum { hidden, commands, models, settings };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
 
     /// How a scrollback block can be re-rendered (a terminal resize
@@ -198,6 +198,8 @@ pub const TUI = struct {
         .{ .name = "/export", .desc = "Export session to HTML", .takes_arg = true },
         .{ .name = "/compact", .desc = "Compact the conversation" },
         .{ .name = "/copy", .desc = "Copy last reply to clipboard" },
+        .{ .name = "/settings", .desc = "Open settings (Enter cycles values)" },
+        .{ .name = "/debug", .desc = "Write debug log" },
         .{ .name = "/exit", .desc = "Quit" },
         .{ .name = "/quit", .desc = "Quit" },
     };
@@ -373,6 +375,8 @@ pub const TUI = struct {
     // ---- Completion menu state (G4) ----
     menu_mode: MenuMode = .hidden,
     menu_items: [16]MenuEntry = undefined,
+    /// Storage for formatted settings descriptions (menu_items' desc points here).
+    settings_desc_buf: [16][64]u8 = undefined,
     menu_len: usize = 0,
     menu_selected: usize = 0,
 
@@ -397,6 +401,7 @@ pub const TUI = struct {
 
     /// Recompute the completion menu from the current editor text.
     pub fn updateMenu(self: *TUI) void {
+        if (self.menu_mode == .settings) return; // modal: not driven by editor text
         self.menu_len = 0;
         self.menu_selected = 0;
         const text = self.editor.getText() catch {
@@ -507,9 +512,144 @@ pub const TUI = struct {
                 self.editor.clear() catch {};
                 return false;
             },
+            .settings => {
+                const label = e.name;
+                self.cycleSetting(self.menu_selected);
+                // Refresh the row's current-value description, then report
+                // the NEW value (desc buffer is reused across rows — read
+                // after the refresh, never the stale `e` copy).
+                const labels = self.settingsLabels();
+                if (self.menu_selected < labels.len) {
+                    self.menu_items[self.menu_selected].desc = labels[self.menu_selected].desc;
+                    self.note("{s} set to {s}", .{ label, labels[self.menu_selected].desc });
+                }
+                return false;
+            },
             .hidden => return false,
         }
     }
+
+    // ---- /settings (pi settings-selector: Enter cycles a value) ----
+
+    /// Current label/description rows for the settings menu (owned by
+    /// menu_items' static slices + formatted descs in a small buffer).
+    fn settingsLabels(self: *TUI) []MenuEntry {
+        const cfg = self.cfg;
+        var n: usize = 0;
+        // Static labels with dynamic descs formatted into rows_buf.
+        for (settingsKinds(), 0..) |kind, i| {
+            if (n >= self.menu_items.len) break;
+            var db: [64]u8 = undefined;
+            const desc: []const u8 = switch (kind) {
+                .autocompact => if (cfg) |c| (if (c.compaction.enabled) "true" else "false") else "true",
+                .reserve_tokens => std.fmt.bufPrint(&db, "{d}", .{if (cfg) |c| c.compaction.reserve_tokens else 16384}) catch "?",
+                .keep_recent => std.fmt.bufPrint(&db, "{d}", .{if (cfg) |c| c.compaction.keep_recent_tokens else 20000}) catch "?",
+                .default_model => if (cfg) |c| blk: {
+                    if (c.findDefaultModel()) |m| {
+                        break :blk std.fmt.bufPrint(&db, "{s}/{s}", .{ m.provider, m.id }) catch "(session)";
+                    }
+                    break :blk "(session)";
+                } else "(session)",
+            };
+            // desc must outlive this call: copy into settings_desc_buf.
+            const dst = self.settings_desc_buf[i][0..desc.len];
+            @memcpy(dst, desc);
+            self.menu_items[n] = .{
+                .name = switch (kind) {
+                    .autocompact => "Auto-compact",
+                    .reserve_tokens => "Context reserve tokens",
+                    .keep_recent => "Keep recent tokens",
+                    .default_model => "Default model",
+                },
+                .desc = self.settings_desc_buf[i][0..desc.len],
+            };
+            n += 1;
+        }
+        self.menu_len = n;
+        return self.menu_items[0..n];
+    }
+
+    fn openSettingsMenu(self: *TUI) void {
+        _ = self.settingsLabels();
+        self.menu_selected = 0;
+        self.menu_mode = .settings;
+        self.editor.clear() catch {};
+    }
+
+    /// Enter on a settings row: cycle to the next value, apply in memory and
+    /// persist to settings.json (pi settings-selector semantics).
+    fn cycleSetting(self: *TUI, idx: usize) void {
+        const kinds = settingsKinds();
+        if (idx >= kinds.len) return;
+        const cfg = self.cfg orelse return;
+        switch (kinds[idx]) {
+            .autocompact => {
+                cfg.compaction.enabled = !cfg.compaction.enabled;
+            },
+            .reserve_tokens => {
+                const choices = &[_]usize{ 8192, 16384, 32768, 65536 };
+                cfg.compaction.reserve_tokens = @intCast(nextSettingChoice(choices, cfg.compaction.reserve_tokens));
+            },
+            .keep_recent => {
+                const choices = &[_]usize{ 4096, 10000, 20000, 40000 };
+                cfg.compaction.keep_recent_tokens = @intCast(nextSettingChoice(choices, cfg.compaction.keep_recent_tokens));
+            },
+            .default_model => {
+                if (cfg.models.items.len > 0) {
+                    // Find current default position, then advance (wrap).
+                    var pos: usize = 0;
+                    for (cfg.models.items, 0..) |m, i| {
+                        if (cfg.default_provider != null and cfg.default_model != null and
+                            std.mem.eql(u8, m.provider, cfg.default_provider.?) and
+                            std.mem.eql(u8, m.id, cfg.default_model.?))
+                        {
+                            pos = i;
+                            break;
+                        }
+                    }
+                    const nm = &cfg.models.items[(pos + 1) % cfg.models.items.len];
+                    cfg.setDefaultProviderModel(self.alloc, nm.provider, nm.id) catch {};
+                }
+            },
+        }
+        cfg.persistSettings(self.alloc, self.io) catch |err| {
+            self.note("settings save failed: {s}", .{@errorName(err)});
+        };
+        _ = self.settingsLabels(); // refresh descs
+    }
+
+    /// /debug (pi handleDebugCommand): dump terminal size, every scrollback
+    /// row with its visible width, and the session messages (JSONL) to a log
+    /// file; report the path.
+    fn writeDebugLog(self: *TUI) void {
+        const alloc = self.alloc;
+        var out = std.array_list.Managed(u8).init(alloc);
+        defer out.deinit();
+        var buf: [160]u8 = undefined;
+        const head = std.fmt.bufPrint(&buf, "Debug output\nTerminal: {d}x{d}\nTotal rows: {d}\n\n=== All rendered rows with visible widths ===\n", .{ self.width, self.height, self.scrollback.items.len }) catch return;
+        out.appendSlice(head) catch return;
+        for (self.scrollback.items, 0..) |row, idx| {
+            const vw = wmod.visualWidth(row);
+            const line = std.fmt.allocPrint(alloc, "[{d}] (w={d}) {s}\n", .{ idx, vw, row }) catch break;
+            out.appendSlice(line) catch break;
+            alloc.free(line);
+        }
+        out.appendSlice("\n=== Agent messages (JSONL) ===\n") catch {};
+        for (self.session.context.messages.items) |*m| {
+            ss.writeMessageJson(&out, m) catch break;
+            out.appendSlice("\n") catch break;
+        }
+        const path = std.fmt.allocPrint(alloc, "/tmp/rpi-debug-{d}.log", .{ss.nowMs(self.io)}) catch return;
+        defer alloc.free(path);
+        self.note("debug: writing {d} bytes to {s}", .{ out.items.len, path });
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = out.items }) catch {
+            self.note("{s}", .{"debug log write failed"});
+            return;
+        };
+        self.note("debug log written", .{});
+    }
+
+    /// Add an owned one-line note to the scrollback, then free it.
 
     /// Switch the active model (creates a provider, swaps into the session).
     fn switchModel(self: *TUI, idx: usize) !void {
@@ -3757,6 +3897,18 @@ pub const TUI = struct {
             return false;
         }
 
+        if (std.mem.eql(u8, word, "/settings")) {
+            self.openSettingsMenu();
+            self.redraw();
+            return false;
+        }
+
+        if (std.mem.eql(u8, word, "/debug")) {
+            self.writeDebugLog();
+            self.redraw();
+            return false;
+        }
+
         // pi: an unrecognized slash command is sent as a normal message
         // (the clipboard paste flow inserts /tmp paths that start with "/").
         self.submitText(cmd);
@@ -4121,6 +4273,28 @@ pub const TUI = struct {
             }
 
             // Completion menu navigation (takes precedence over editor keys).
+            if (self.menu_mode == .settings) {
+                // Modal settings selector: only menu keys respond.
+                if (self.bindings.matches(key, .menu_up)) {
+                    if (self.menu_selected > 0) self.menu_selected -= 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_down)) {
+                    if (self.menu_selected + 1 < self.menu_len) self.menu_selected += 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_close)) {
+                    self.menu_mode = .hidden;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    const should_exit = self.menuActivate();
+                    if (should_exit) break;
+                    self.redraw();
+                    continue;
+                }
+                continue; // swallow everything else while the dialog is open
+            }
             if (self.menu_mode != .hidden) {
                 if (self.bindings.matches(key, .menu_up)) {
                     if (self.menu_selected > 0) self.menu_selected -= 1;
@@ -4273,6 +4447,19 @@ pub const TUI = struct {
 
 /// Visible line count of a scrollback block: the blocks are '\n'-joined rows
 /// (appendTranscript splits them the same way).
+const SettingsKind = enum { autocompact, reserve_tokens, keep_recent, default_model };
+
+fn settingsKinds() []const SettingsKind {
+    return &.{ .autocompact, .reserve_tokens, .keep_recent, .default_model };
+}
+
+fn nextSettingChoice(choices: []const usize, current: usize) usize {
+    for (choices, 0..) |c, i| {
+        if (c == current) return choices[(i + 1) % choices.len];
+    }
+    return choices[0];
+}
+
 pub fn countLines(block: []const u8) usize {
     var n: usize = 1;
     for (block) |c| {
