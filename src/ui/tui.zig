@@ -4435,6 +4435,20 @@ pub const TUI = struct {
             }
 
             // Completion menu navigation (takes precedence over editor keys).
+            if (key == .tab and self.menu_mode == .hidden) {
+                // Tab manually opens the @file menu (pi: Tab lists files at
+                // the cursor's '@' token). Without a pending token the key
+                // falls through to the editor (no-op).
+                if (self.at_suppress) |sup| {
+                    self.alloc.free(sup);
+                    self.at_suppress = null;
+                }
+                self.updateMenu();
+                if (self.menu_mode == .files) {
+                    self.redraw();
+                    continue;
+                }
+            }
             if (self.menu_mode == .files) {
                 if (self.bindings.matches(key, .menu_up)) {
                     if (self.menu_selected > 0) self.menu_selected -= 1;

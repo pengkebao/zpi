@@ -186,6 +186,7 @@ pub const Editor = struct {
 
     /// Handle a key. Returns `.submit` if the user pressed Enter to submit.
     pub fn handleKey(self: *Editor, key: keys.Key, io: std.Io) !EditorAction {
+        _ = io; // file completion lives in the TUI's file menu now
         switch (key) {
             .char => |c| {
                 if (c.ctrl and !c.alt) {
@@ -223,7 +224,7 @@ pub const Editor = struct {
                 }
             },
             .shift_enter => self.newLine() catch return .none,
-            .tab => self.completeAt(io) catch {},
+            // Tab is handled by the TUI layer (file menu trigger/application).
             .up => {
                 if (self.isSingleLine() and (self.isEmpty() or self.history_index > -1 or self.cursor_col == 0)) {
                     self.navigateHistory(-1) catch {};
@@ -520,61 +521,6 @@ pub const Editor = struct {
         const owned = nl.toOwnedSlice(self.alloc) catch return;
         self.alloc.free(line);
         self.lines.items[self.cursor_line] = owned;
-    }
-
-    /// Tab: complete the `@path` on the current line (common prefix of matches).
-    fn completeAt(self: *Editor, io: std.Io) !void {
-        const line = self.lines.items[self.cursor_line];
-        const before = line[0..self.cursor_col];
-        // Find the last '@' on this line before the cursor.
-        var at_pos: ?usize = null;
-        for (before, 0..) |ch, i| {
-            if (ch == '@') at_pos = i;
-        }
-        if (at_pos) |ap| {
-            const partial = before[ap + 1 ..];
-            const match = commonFilePrefix(self.alloc, io, partial) catch return;
-            defer self.alloc.free(match);
-            if (std.mem.eql(u8, match, partial)) return; // no change
-            const new_line = std.fmt.allocPrint(self.alloc, "{s}@{s}{s}", .{ before[0..ap], match, line[self.cursor_col..] }) catch return;
-            self.alloc.free(line);
-            self.lines.items[self.cursor_line] = new_line;
-            self.cursor_col = ap + 1 + match.len;
-        }
-    }
-
-    /// The longest common prefix among files in the cwd matching `partial`.
-    /// Returns `partial` itself if no match. Owned.
-    fn commonFilePrefix(alloc: std.mem.Allocator, io: std.Io, partial: []const u8) ![]u8 {
-        var matches: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer {
-            for (matches.items) |m| alloc.free(m);
-            matches.deinit(alloc);
-        }
-        const dir = std.Io.Dir.cwd();
-        var it = dir.iterate();
-        while (it.next(io) catch null) |entry| {
-            const name = entry.name;
-            if (std.mem.startsWith(u8, name, partial)) {
-                const owned = alloc.dupe(u8, name) catch return error.OutOfMemory;
-                matches.append(alloc, owned) catch return error.OutOfMemory;
-            }
-        }
-        if (matches.items.len == 0) return alloc.dupe(u8, partial);
-        if (matches.items.len == 1) return alloc.dupe(u8, matches.items[0]);
-        // Common prefix of all matches.
-        var prefix_len = if (matches.items[0].len < matches.items[1].len) matches.items[0].len else matches.items[1].len;
-        for (matches.items[2..]) |m| {
-            prefix_len = if (prefix_len < m.len) prefix_len else m.len;
-        }
-        var i: usize = 0;
-        while (i < prefix_len) : (i += 1) {
-            const c = matches.items[0][i];
-            for (matches.items[1..]) |m| {
-                if (m[i] != c) return alloc.dupe(u8, partial[0..0]);
-            }
-        }
-        return alloc.dupe(u8, matches.items[0][0..i]);
     }
 };
 
