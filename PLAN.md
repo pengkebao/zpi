@@ -50,7 +50,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
-| 系统 prompt 分节（preamble/tools/cwd/skills...） | ✅ | ✅ | `system_prompt.zig`：preamble/tools/rules/addendum/project_context/cwd；skills 段随扩展系统 |
+| 系统 prompt 分节（preamble/tools/cwd/skills...） | ✅ | ✅ | `system_prompt.zig`：preamble/tools/rules/addendum/project_context/cwd/skills；skills 段 `<available_skills>` 广告（`skills.zig`，`/reload` 可重建） |
 | AGENTS.md / CLAUDE.md 发现（cwd+祖先+agent 目录） | ✅ | ✅ | AGENTS.override.md 优先；root→cwd 去重 |
 | `--system-prompt` / `--append-system-prompt` | ✅ | ✅ | 整体覆盖 / addendum 段 |
 | @file 附件（文本+图片） | ✅ | ✅ | CLI 位置参数 `@path`：文本 `<file name>` 包裹（BOM 剥离）、图片魔数检测 → base64 ImageBlock 入首条消息（pi processFileArguments/buildInitialMessage 组装顺序 stdin→fileText→prompt） |
@@ -142,7 +142,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | 运行中输入（steering/follow-up/Escape 中断） | ✅ | ✅ | Escape/Ctrl+C 中断✅；**steering 队列**✅（运行中 Enter → 下一 LLM 请求前注入 context，pi getSteeringMessages 语义）；**follow-up 队列**✅（alt+enter 排队 → 回合结束自动续跑为新回合，pi followUpQueue）；**alt+up/alt+v 恢复排队消息到编辑器**✅（app.message.dequeue）；运行中编辑器 live（watcher 分发编辑器键，光标常驻输入框） |
 | Ctrl+O 折叠工具输出、Ctrl+T 隐藏 thinking | ✅ | ✅ | Ctrl+O 预览↔全文；Ctrl+T 全局显隐 + 单块点击折叠 |
 | 页脚（cwd、session、model、context%、cost） | ✅ | ✅ | cwd+git 分支+session 名；↑↓R/W/CH$、ctx% 变色+(auto)；右侧 (provider) model • thinking |
-| 启动 header（欢迎 + 已加载资源清单） | ✅ | 🚧 | 欢迎头✅：文档首块（pi headerContainer 语义，继续会话钉底不可见）、compact 文案（wordmark+版本+快捷键+onboarding）；"已加载资源清单"（Context/Skills/Extensions）⏳ |
+| 启动 header（欢迎 + 已加载资源清单） | ✅ | 🚧 | 欢迎头✅：文档首块（pi headerContainer 语义，继续会话钉底不可见）、compact 文案（wordmark+版本+快捷键+onboarding）；技能已加载并进系统提示（`skills.zig`）；"已加载资源清单"（Context/Skills/Extensions）header 展示 ⏳ |
 | 会话继续界面回放（-c/-r） | ✅ | ✅ | replaySession 对齐 pi renderInitialMessages：user/assistant/thinking 块 + 工具块按 id 配对回填 |
 | markdown 渲染 + 代码高亮 + diff 视图 | ✅ | ✅ | markdown 全块（标题/列表/嵌套/表格全边框/引用/hr/链接）；轻量代码高亮；diff 行级红绿 + **word 级反色（1:1 修改对，pi renderIntraLineDiff 语义）**；**OSC8 终端超链接**（链接+裸 URL；tmux/dumb 自动关闭，断行重开，truncateToWidth OSC 撕裂修复）；**LaTeX→unicode**（latex.zig：符号表/frac/sqrt/上下标/\left\right/\text；块级 $$…$$、\[…\ 与内联 $…$、\(…\；流式未闭合按原文渲染）；**流式块级增量渲染（自研增强）**；简化：无 pi 的 2D 分数堆叠排版（超宽回退原文同为 pi 行为） |
 | 主题系统（JSON 主题文件、/settings 切换） | ✅ | ⚠️ | theme.zig 仅颜色枚举 |
@@ -165,11 +165,11 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
 | 扩展：registerTool / 命令 / 事件钩子（tool_call 拦截）/ 自定义渲染 / UI 组件 | ✅ TS 进程内 | ❌ | 决策点：Zig 动态库 or 内嵌脚本解释器，见 Phase 9 |
-| Skills（SKILL.md、agentskills.io 规范、/skill:name、按需加载） | ✅ | ❌ | 纯文件协议，可较早做 |
-| Prompt templates（Markdown、$1/$@/默认值） | ✅ | ❌ | |
-| 主题 JSON 文件 | ✅ | ❌ | |
+| Skills（SKILL.md、agentskills.io 规范、/skill:name、按需加载） | ✅ | ✅ | `skills.zig`：4 处发现（agent/skills、~/.agents/skills、cwd/.pi/skills、cwd/.agents/skills）+ 递归（含 SKILL.md 目录=根）+ 最小 frontmatter 解析 + 名字校验 + 无描述跳过 + 同名去重；系统提示 `<available_skills>` 广告；`/skill:name [args]` 读正文包 `<skill>` 块发送（pi invokeSkill）；`/skill:<tab>` 补全；6 单测 + E2E |
+| Prompt templates（Markdown、$1/$@/默认值） | ✅ | ✅ | Phase D：agent-dir/prompts + cwd/.pi/prompts；`/name args` 展开 $1..$n/$@/$ARGUMENTS/${N:-default}/${@:N[:L]}（bash 引号解析）；未识别 slash 回退模板 |
+| 主题 JSON 文件 | ✅ | ⚠️ | theme.zig 仅硬编码 ANSI 暗色；JSON 主题发现/加载 + /settings 切换 + truecolor 迁移 ⏳（H3） |
 | Pi packages（npm/git/local 安装分发、`pi install/remove/update/list`） | ✅ | ❌ | 依赖扩展机制成型 |
-| `/reload` 热重载 | ✅ | ❌ | |
+| `/reload` 热重载 | ✅ | ✅ | 重新发现技能 + 重建系统提示 + 更新 context（模板本就每次提交时新鲜发现，无需缓存） |
 
 ### 10. MCP
 
@@ -460,7 +460,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | /compact [hint] | ✓ | ✓ | 已实现（runCompaction + auto-compact 阈值） |
 | /changelog | ✓ | — | 无版本日志体系，不适用 |
 | /export /copy /share | ✓ | /copy 未做 | 缺口（copy/export 低成本可加） |
-| /themes /settings /skills /trust /login /logout /scoped-models /mcp | ✓ | — | 暂缓（依赖主题/技能/扩展体系） |
+| /themes /settings /skills /trust /login /logout /scoped-models /mcp | ✓ | — | /settings ✅、/skills（`/skill:name`）✅；/themes /trust /login /logout /scoped-models /mcp 暂缓（依赖主题/trust/扩展体系） |
 | /bug /debug /clone /import /reload /fork-easter-eggs | ✓ | — | 暂缓 |
 
 ### 全局键位（主界面）
