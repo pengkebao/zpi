@@ -2843,6 +2843,16 @@ pub const TUI = struct {
     /// restore itself happens in main; this only rebuilds what the user
     /// sees. No-op without a store or on an empty branch (new sessions).
     pub fn replaySession(self: *TUI) void {
+        // Runs BEFORE run()/setupTerminal, where width is still the init
+        // default (80). Measure now — otherwise every replayed block renders
+        // at 80 columns and stays there (the first frame's refreshSize sees
+        // setupTerminal's measureSize as a no-op, so rerenderAtWidth never
+        // fires). Caller holds no locks; the add* helpers take their own.
+        {
+            self.render_mutex.lock(self.io) catch {};
+            defer self.render_mutex.unlock(self.io);
+            self.measureSize();
+        }
         const st = self.session.store orelse return;
         const alloc = self.session.alloc;
         const branch = st.branchMessages(alloc) catch return;
