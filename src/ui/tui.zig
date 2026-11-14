@@ -437,6 +437,12 @@ pub const TUI = struct {
     /// server names are manager-owned and stable for the session).
     mcp_server_name: [64]u8 = undefined,
     mcp_server_name_len: usize = 0,
+    /// Snapshot of the editor text the menu was last built from (pi
+    /// rebuilds suggestions only on editor onChange; the main loop calls
+    /// updateMenu after EVERY key, and rebuilding unconditionally would
+    /// reset menu_selected on navigation keys — the menu would snap back to
+    /// the first row on every up/down).
+    menu_text_cache: ?[]u8 = null,
 
     const SlashExtra = struct { name: []u8, desc: []u8 };
 
@@ -516,7 +522,9 @@ pub const TUI = struct {
         return ctx.bare(i);
     }
 
-    /// Recompute the completion menu from the current editor text.
+    /// Recompute the completion menu from the current editor text. Skipped
+    /// when the text has not changed since the last build (navigation only
+    /// moves the selection; pi updateAutocomplete semantics).
     pub fn updateMenu(self: *TUI) void {
         // Modal dialogs (settings, session/tree/fork pickers, the /mcp
         // manager) are not driven by editor text.
@@ -524,13 +532,23 @@ pub const TUI = struct {
             .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure => return,
             else => {},
         }
-        self.menu_len = 0;
-        self.menu_selected = 0;
         const text = self.editor.getText() catch {
             self.menu_mode = .hidden;
             return;
         };
         defer self.alloc.free(text);
+        if (self.menu_text_cache) |c| {
+            if (std.mem.eql(u8, c, text)) {
+                // Text unchanged: keep the current items and selection.
+                return;
+            }
+            self.alloc.free(c);
+        }
+        if (self.alloc.dupe(u8, text)) |copy| {
+            self.menu_text_cache = copy;
+        } else |_| {}
+        self.menu_len = 0;
+        self.menu_selected = 0;
         const single_line = std.mem.indexOfScalar(u8, text, '\n') == null;
 
         // Commands: "/query" with no space yet (pi slash autocomplete:
@@ -549,6 +567,13 @@ pub const TUI = struct {
             }
             for (self.slash_extras.items) |e| {
                 if (n >= values.len) break;
+                // pi: an extra conflicting with a built-in command is skipped
+                // (getBuiltInCommandConflictDiagnostics) — the built-in wins.
+                var conflict = false;
+                for (COMMANDS) |c| {
+                    if (std.mem.eql(u8, c.name, e.name)) conflict = true;
+                }
+                if (conflict) continue;
                 self.menu_items[n] = .{ .name = e.name, .desc = e.desc, .value = e.name[1..] };
                 values[n] = e.name[1..];
                 n += 1;
@@ -2064,6 +2089,7 @@ pub const TUI = struct {
             self.alloc.free(e.desc);
         }
         self.slash_extras.deinit(self.alloc);
+        if (self.menu_text_cache) |c| self.alloc.free(c);
         self.editor.deinit();
         self.stream_text.deinit();
         self.stream_thinking.deinit();
