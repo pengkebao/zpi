@@ -387,11 +387,11 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
   - **顺手修**：基准脚本 `buildTui` 把 model/provider/registry 放在函数作用域 → Session 持栈指针悬垂（ReleaseFast 才崩，lldb 定位）；提升为堆上 Fixture；新增 `bench_scroll.zig`（markdown vs plain 滚动帧）、`bench_stream.zig`(流式帧 vs 流长度)、`bench_markdown.zig`（单块渲染成本）三个性能工具
 
 ### Phase H — 资源系统（~1.5k 行）
-- [ ] H1 Skills：SKILL.md 解析（frontmatter/校验/发现顺序）、系统 prompt 广告、按需读取、`/skill:name`
-- [ ] H2 Prompt templates：`${1}`/`$@`/默认值展开、命令注册
-- [ ] H3 主题文件发现与加载
+- [x] H1 Skills：`skills.zig` 发现/解析/校验/去重 + 系统提示广告 + `/skill:name` + `/skill:<tab>` + 6 单测 + E2E（`15ade5a`）
+- [x] H2 Prompt templates：Phase D 完成（发现/$1/$@/默认值/未识别 slash 回退）
+- [ ] H3 主题文件发现与加载（JSON 主题 + /settings 切换）
 - [ ] H4 `.pi/` 项目配置 + trust 门控（`-a/-na`、`/trust`）
-- [ ] H5 `/reload`
+- [x] H5 `/reload`：重载技能 + 重建系统提示 + 更新 context
 
 ### Phase I — 扩展系统（~1.5k 行，零依赖方案）
 > 决策（已定）：**不用内嵌解释器，不 vendor QuickJS**。扩展 = 声明式配置 + 钩子脚本 + 编译期注册三层，覆盖 pi 扩展 80% 实用场景。
