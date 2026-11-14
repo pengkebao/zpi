@@ -89,9 +89,9 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | `--resume` 选择器 | ✅ | ⚠️ | CLI 有 --resume/--session <id>；交互选择器在 TUI /resume |
 | `--session`/`--fork`/`--no-session`/`--name`/`--session-dir` | ✅ | ✅ | 支持 path 或 partial id |
 | `/new` `/resume` `/name` `/session` `/tree` `/fork` `/clone` `/import` | ✅ | ⚠️ | 缺 /clone /import |
-| 树导航 + 分支摘要 | ✅ | ⚠️ | /tree 只读展示；无交互导航/分支摘要 |
+| 树导航 + 分支摘要 | ✅ | ✅ | /tree=交互选择器（leaf 链+图标+预览+视口滚动）；选中点分支 → **LLM 生成被弃路径摘要** → branch_summary entry（pi branchWithSummary）→ transcript 重建；选中 leaf 提示 "Already at this point" |
 | /export（HTML/JSONL）、/copy、/share（gist/radius） | ✅ | ❌ | 均未实现；复制场景由 ctrl+x（选区/最后回复，OSC52）覆盖 |
-| 会话按 cwd 分组、选择器搜索/改名/删除 | ✅ | ⚠️ | cwd 分组 + /name 改名已有；选择器搜索/删除待补 |
+| 会话按 cwd 分组、选择器搜索/改名/删除 | ✅ | ✅ | /resume=modal 选择器：↑↓+视口、**输入实时过滤**（id+name 大小写不敏感）、**ctrl+d 删除**（pi SessionSelector 语义）、Enter 恢复（重建 context+transcript，回放 model_change/thinking_level） |
 
 ### 5. 压缩（Compaction）
 
