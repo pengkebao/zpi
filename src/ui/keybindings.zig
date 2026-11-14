@@ -57,6 +57,7 @@ pub const Action = enum(u8) {
     model_prev, // shift+ctrl+p: previous model (pi: app.model.cycleBackward)
     model_select, // ctrl+l: show the model list (pi: app.model.select)
     copy_message, // ctrl+x: copy selection or last reply (pi: app.message.copy)
+    paste_clipboard, // ctrl+v: paste clipboard image-as-path / text (pi: app.clipboard.pasteImage)
     suspend_bg, // ctrl+z: suspend to background (pi: app.suspend)
     exit_empty, // ctrl+d: exit when the editor is empty (pi: app.exit)
 
@@ -113,6 +114,7 @@ pub const Bindings = struct {
         b.set(.model_prev, parseKeyStr("shift+ctrl+p") orelse .{ .char = .{ .c = 'p', .ctrl = true, .alt = false, .shift = true } });
         b.set(.model_select, parseKeyStr("ctrl+l") orelse .{ .char = .{ .c = 'l', .ctrl = true, .alt = false } });
         b.set(.copy_message, parseKeyStr("ctrl+x") orelse .{ .char = .{ .c = 'x', .ctrl = true, .alt = false } });
+    b.set(.paste_clipboard, .{ .char = .{ .c = 'v', .ctrl = true, .alt = false } }); // ctrl+v
         b.set(.suspend_bg, parseKeyStr("ctrl+z") orelse .{ .char = .{ .c = 'z', .ctrl = true, .alt = false } });
         b.set(.exit_empty, parseKeyStr("ctrl+d") orelse .{ .char = .{ .c = 'd', .ctrl = true, .alt = false } });
         return b;

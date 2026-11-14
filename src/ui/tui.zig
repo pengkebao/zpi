@@ -14,6 +14,7 @@ const cmsg = @import("../core/message.zig");
 const config = @import("../core/config.zig");
 const ss = @import("../core/session_store.zig");
 const shell = @import("../tools/shell.zig");
+const clipboard = @import("../core/clipboard.zig");
 const ptmod = @import("../core/prompt_template.zig");
 const compact = @import("../core/compaction.zig");
 const ansi = @import("ansi.zig");
@@ -3187,6 +3188,30 @@ pub const TUI = struct {
         self.redraw();
     }
 
+    /// pi handleClipboardPaste (ctrl+v): clipboard image → temp file path
+    /// inserted at cursor (the model Reads the path; the read tool attaches
+    /// images); file paths and plain text fall back to direct insertion.
+    fn handleClipboardPaste(self: *TUI) void {
+        const alloc = self.alloc;
+        if (clipboard.readClipboardImage(alloc, self.io)) |img| {
+            defer alloc.free(img.bytes);
+            const path = clipboard.writeImageTempFile(alloc, self.io, img, if (std.mem.eql(u8, img.mime, "image/jpeg")) "jpg" else "png") orelse {
+                self.note("{s}", .{"failed to write clipboard image"});
+                return;
+            };
+            self.editor.insertBytes(path) catch {};
+            alloc.free(path);
+            self.redraw();
+            return;
+        }
+        if (clipboard.readClipboardText(alloc, self.io)) |text| {
+            defer alloc.free(text);
+            self.editor.insertBytes(text) catch {};
+            self.redraw();
+            return;
+        }
+    }
+
     /// Run a user `!cmd` synchronously (pi handleBashCommand): execute via
     /// the shell executor (30s cap), record a bashExecution message, and
     /// render a block. `!!` records excluded-from-context (pi prefix).
@@ -3560,8 +3585,17 @@ pub const TUI = struct {
             return false;
         }
 
-        // Session commands require an active store.
-        const st = self.session.store orelse {
+        // Session commands require an active store; unrecognized slash
+        // commands fall through to send-as-message (pi semantics — a pasted
+        // `/tmp/...` path is a message, not a command).
+        const is_session_cmd = std.mem.eql(u8, word, "/session") or
+            std.mem.eql(u8, word, "/name") or
+            std.mem.eql(u8, word, "/tree") or
+            std.mem.eql(u8, word, "/fork") or
+            std.mem.eql(u8, word, "/resume") or
+            std.mem.eql(u8, word, "/export") or
+            std.mem.eql(u8, word, "/compact");
+        const st = if (!is_session_cmd) undefined else self.session.store orelse {
             self.addMessage("\x1b[90m(no session active — started with --no-session)\x1b[0m");
             self.redraw();
             return false;
@@ -3723,12 +3757,14 @@ pub const TUI = struct {
             return false;
         }
 
-        self.addMessage(std.fmt.allocPrint(self.alloc, "\x1b[91munknown command: {s}\x1b[0m", .{word}) catch "unknown");
-        self.redraw();
+        // pi: an unrecognized slash command is sent as a normal message
+        // (the clipboard paste flow inserts /tmp paths that start with "/").
+        self.submitText(cmd);
         return false;
     }
 
     /// Add an owned one-line note to the scrollback, then free it.
+
     fn noteOwned(self: *TUI, text: []const u8) void {
         self.addMessage(text);
         self.alloc.free(text);
@@ -4068,6 +4104,11 @@ pub const TUI = struct {
             }
             if (self.bindings.matches(key, .copy_message)) {
                 self.copyLastMessage();
+                continue;
+            }
+            if (self.bindings.matches(key, .paste_clipboard)) {
+
+                self.handleClipboardPaste();
                 continue;
             }
             if (self.bindings.matches(key, .suspend_bg)) {
