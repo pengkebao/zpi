@@ -114,7 +114,12 @@ pub const Bindings = struct {
         b.set(.model_prev, parseKeyStr("shift+ctrl+p") orelse .{ .char = .{ .c = 'p', .ctrl = true, .alt = false, .shift = true } });
         b.set(.model_select, parseKeyStr("ctrl+l") orelse .{ .char = .{ .c = 'l', .ctrl = true, .alt = false } });
         b.set(.copy_message, parseKeyStr("ctrl+x") orelse .{ .char = .{ .c = 'x', .ctrl = true, .alt = false } });
-    b.set(.paste_clipboard, .{ .char = .{ .c = 'v', .ctrl = true, .alt = false } }); // ctrl+v
+    // pi: windowsKeybindings use alt+v (ctrl+v is the terminal's native paste).
+    if (@import("builtin").os.tag == .windows) {
+        b.set(.paste_clipboard, parseKeyStr("alt+v") orelse Key.escape);
+    } else {
+        b.set(.paste_clipboard, .{ .char = .{ .c = 'v', .ctrl = true, .alt = false } }); // ctrl+v
+    }
         b.set(.suspend_bg, parseKeyStr("ctrl+z") orelse .{ .char = .{ .c = 'z', .ctrl = true, .alt = false } });
         b.set(.exit_empty, parseKeyStr("ctrl+d") orelse .{ .char = .{ .c = 'd', .ctrl = true, .alt = false } });
         return b;

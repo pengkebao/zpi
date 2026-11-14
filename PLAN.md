@@ -55,7 +55,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | `--system-prompt` / `--append-system-prompt` | ✅ | ✅ | 整体覆盖 / addendum 段 |
 | @file 附件（文本+图片） | ✅ | ✅ | CLI 位置参数 `@path`：文本 `<file name>` 包裹（BOM 剥离）、图片魔数检测 → base64 ImageBlock 入首条消息（pi processFileArguments/buildInitialMessage 组装顺序 stdin→fileText→prompt） |
 | 图片消息（base64 ImageContent） | ✅ | ✅ | ImageBlock 全链路（@file 图片 + read 工具图片）；wire image_url data URI |
-| 粘贴图片 / 拖放 | ✅ | ✅ 图片粘贴（拖放留待） | ctrl+v（pi app.clipboard.pasteImage）：macOS osascript PNGf hex 解码 → /tmp/rpi-clipboard-*.png → 路径插入编辑器（模型经 read 工具读图，pi 同款"临时文件+路径"流）；文本回退 pbpaste；Linux 尽力 xclip/wl-paste；拖放需终端上报协议，留待 |
+| 粘贴图片 / 拖放 | ✅ | ✅ 图片粘贴（拖放留待） | ctrl+v（pi app.clipboard.pasteImage；Windows 下 alt+v 同 pi windowsKeybindings）：macOS osascript PNGf hex 解码；Windows/WSL PowerShell Clipboard::GetImage → Save %TEMP% → 读回（WSL 经 wslpath 转换读 /mnt）；文本回退 pbpaste/Get-Clipboard/xclip；路径插入编辑器，模型经 read 工具读图（pi 同款"临时文件+路径"流）；拖放需终端上报协议，留待。注：Windows 分支代码就位，随整个应用的 Windows 移植里程碑启用（TUI 终端层目前 POSIX 专属） |
 | 管道 stdin 并入首条 prompt | ✅ | ✅ | 非 TTY stdin 读入并入首条；interactive 下有 stdin 降级 print（pi readPipedStdin + resolveAppMode） |
 | 未识别 `/命令` 作为消息发送 | ✅ | ✅ | 本轮修复：`--no-session` 下 store 检查拦截所有 `/xxx` 的 bug；未识别 slash 命令（含粘贴的 /tmp 路径）作为普通消息发送（pi 语义） |
 | `!cmd` 输出进会话 / `!!` 静默执行 | ✅ | ✅ | shell.exec（30s 上限）→ bashExecution 消息（pi JSONL 格式 command/output/exitCode/excludeFromContext）→ wire user 文本（bashExecutionToText）；`!!` 排除；回放渲染 |

@@ -72,49 +72,108 @@ pub fn decodeOsascriptData(alloc: std.mem.Allocator, text: []const u8) ?[]u8 {
     return bytes;
 }
 
-/// Read an image from the system clipboard (macOS PNGf via osascript; Linux
-/// xclip/wl-paste). Returns null when the clipboard holds no supported image.
-pub fn readClipboardImage(alloc: std.mem.Allocator, io: std.Io) ?ImageData {
+/// True under WSL (interop with the Windows clipboard via powershell.exe).
+fn isWsl(environ: std.process.Environ) bool {
+    return std.process.Environ.getPosix(environ, "WSL_DISTRO_NAME") != null;
+}
+
+/// Run a PowerShell script capturing stdout (windows/WSL). `shell` is
+/// "powershell" (native) or "powershell.exe" (WSL interop).
+fn runPowerShell(alloc: std.mem.Allocator, io: std.Io, shell_name: []const u8, script: []const u8, out: *std.array_list.Managed(u8)) bool {
+    const res = shell.exec(alloc, io, .{ .shell = shell_name, .args = &.{ "-NoProfile", "-Command" } }, script, .{
+        .timeout = 5,
+    }, out) catch return false;
+    return !res.aborted and !res.timed_out;
+}
+
+/// Read an image from the system clipboard (macOS PNGf via osascript; native
+/// Windows/WSL via PowerShell GetImage; Linux xclip/wl-paste). Returns null
+/// when the clipboard holds no supported image.
+pub fn readClipboardImage(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ) ?ImageData {
     var raw = std.array_list.Managed(u8).init(alloc);
     defer raw.deinit();
 
-    if (@import("builtin").os.tag == .macos) {
-        if (runCapture(alloc, io, "osascript -e 'the clipboard as «class PNGf»'", 3, &raw)) {
-            if (decodeOsascriptData(alloc, raw.items)) |bytes| {
-                return .{ .bytes = bytes, .mime = "image/png" };
+    switch (@import("builtin").os.tag) {
+        .macos => {
+            if (runCapture(alloc, io, "osascript -e 'the clipboard as «class PNGf»'", 3, &raw)) {
+                if (decodeOsascriptData(alloc, raw.items)) |bytes| {
+                    return .{ .bytes = bytes, .mime = "image/png" };
+                }
             }
-        }
-    } else {
-        // Linux best effort: Wayland then X11.
-        if (runCapture(alloc, io, "wl-paste --type image/png --no-newline", 2, &raw)) {
-            if (raw.items.len > 8 and raw.items[0] == 0x89 and std.mem.eql(u8, raw.items[1..4], "PNG")) {
-                const bytes = alloc.dupe(u8, raw.items) catch return null;
-                return .{ .bytes = bytes, .mime = "image/png" };
+        },
+        .windows => {
+            // Native Windows: PowerShell saves the clipboard image (if any)
+            // to %TEMP%\rpi-clip.png; we read the file back as PNG bytes.
+            const temp = std.process.Environ.getPosix(environ, "TEMP") orelse "C:\\Windows\\Temp";
+            const win_path = std.fmt.allocPrint(alloc, "{s}\\rpi-clipboard.png", .{temp}) catch return null;
+            defer alloc.free(win_path);
+            const script = std.fmt.allocPrint(alloc, "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $i = [System.Windows.Forms.Clipboard]::GetImage(); if ($i) {{ $i.Save('{s}', [System.Drawing.Imaging.ImageFormat]::Png); Write-Output ok }} else {{ Write-Output empty }}", .{win_path}) catch return null;
+            defer alloc.free(script);
+            raw.clearRetainingCapacity();
+            if (runPowerShell(alloc, io, "powershell", script, &raw)) {
+                if (std.mem.indexOf(u8, raw.items, "ok") != null) {
+                    const bytes = std.Io.Dir.cwd().readFileAlloc(io, win_path, alloc, .limited(32 * 1024 * 1024)) catch return null;
+                    return .{ .bytes = bytes, .mime = "image/png" };
+                }
             }
-        }
-        raw.clearRetainingCapacity();
-        if (runCapture(alloc, io, "xclip -selection clipboard -t image/png -o", 2, &raw)) {
-            if (raw.items.len > 8 and raw.items[0] == 0x89 and std.mem.eql(u8, raw.items[1..4], "PNG")) {
-                const bytes = alloc.dupe(u8, raw.items) catch return null;
-                return .{ .bytes = bytes, .mime = "image/png" };
+        },
+        else => {
+            // Linux: WSL first (Windows screenshots never reach the X11/Wayland
+            // clipboard — pi uses the same PowerShell fallback), then Wayland/X11.
+            if (isWsl(environ)) {
+                const win_path = "C:\\Windows\\Temp\\rpi-clipboard.png";
+                const script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $i = [System.Windows.Forms.Clipboard]::GetImage(); if ($i) { $i.Save('" ++ win_path ++ "', [System.Drawing.Imaging.ImageFormat]::Png); Write-Output ok } else { Write-Output empty }";
+                raw.clearRetainingCapacity();
+                if (runPowerShell(alloc, io, "powershell.exe", script, &raw)) {
+                    if (std.mem.indexOf(u8, raw.items, "ok") != null) {
+                        // Convert the Windows path to its /mnt/... form and read.
+                        var conv = std.array_list.Managed(u8).init(alloc);
+                        defer conv.deinit();
+                        if (runCapture(alloc, io, "wslpath -u '" ++ win_path ++ "'", 2, &conv)) {
+                            const wsl_path = std.mem.trim(u8, conv.items, " \t\r\n");
+                            if (wsl_path.len > 0) {
+                                const bytes = std.Io.Dir.cwd().readFileAlloc(io, wsl_path, alloc, .limited(32 * 1024 * 1024)) catch return null;
+                                return .{ .bytes = bytes, .mime = "image/png" };
+                            }
+                        }
+                    }
+                }
             }
-        }
+            if (runCapture(alloc, io, "wl-paste --type image/png --no-newline", 2, &raw)) {
+                if (raw.items.len > 8 and raw.items[0] == 0x89 and std.mem.eql(u8, raw.items[1..4], "PNG")) {
+                    const bytes = alloc.dupe(u8, raw.items) catch return null;
+                    return .{ .bytes = bytes, .mime = "image/png" };
+                }
+            }
+            raw.clearRetainingCapacity();
+            if (runCapture(alloc, io, "xclip -selection clipboard -t image/png -o", 2, &raw)) {
+                if (raw.items.len > 8 and raw.items[0] == 0x89 and std.mem.eql(u8, raw.items[1..4], "PNG")) {
+                    const bytes = alloc.dupe(u8, raw.items) catch return null;
+                    return .{ .bytes = bytes, .mime = "image/png" };
+                }
+            }
+        },
     }
     return null;
 }
 
-/// Read plain text from the system clipboard (macOS pbpaste; Linux
-/// xclip/wl-paste). Returns null when empty/unavailable. Owned by alloc.
-pub fn readClipboardText(alloc: std.mem.Allocator, io: std.Io) ?[]u8 {
+/// Read plain text from the system clipboard (macOS pbpaste; Windows/WSL
+/// PowerShell Get-Clipboard; Linux xclip). Returns null when
+/// empty/unavailable. Owned by alloc.
+pub fn readClipboardText(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ) ?[]u8 {
     var raw = std.array_list.Managed(u8).init(alloc);
     errdefer raw.deinit();
-    const cmd_line: []const u8 = if (@import("builtin").os.tag == .macos)
-        "pbpaste"
-    else if (@import("builtin").os.tag == .linux)
-        "xclip -selection clipboard -o"
-    else
-        return null;
-    if (!runCapture(alloc, io, cmd_line, 2, &raw)) {
+    var ok = false;
+    switch (@import("builtin").os.tag) {
+        .macos => ok = runCapture(alloc, io, "pbpaste", 2, &raw),
+        .windows => ok = runPowerShell(alloc, io, "powershell", "Get-Clipboard", &raw),
+        .linux => {
+            if (isWsl(environ)) ok = runPowerShell(alloc, io, "powershell.exe", "Get-Clipboard", &raw);
+            if (!ok) ok = runCapture(alloc, io, "xclip -selection clipboard -o", 2, &raw);
+        },
+        else => return null,
+    }
+    if (!ok) {
         raw.deinit();
         return null;
     }
@@ -130,7 +189,8 @@ pub fn readClipboardText(alloc: std.mem.Allocator, io: std.Io) ?[]u8 {
 /// return the path (owned). The model Reads the path (read tool attaches
 /// images), matching pi's "images are attached via temporary files" flow.
 pub fn writeImageTempFile(alloc: std.mem.Allocator, io: std.Io, data: ImageData, ext: []const u8) ?[]u8 {
-    const path = std.fmt.allocPrint(alloc, "/tmp/rpi-clipboard-{d}.{s}", .{ std.Io.Timestamp.now(io, .real).nanoseconds, ext }) catch return null;
+    const dir: []const u8 = if (@import("builtin").os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
+    const path = std.fmt.allocPrint(alloc, "{s}/rpi-clipboard-{d}.{s}", .{ dir, @as(u64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, 1_000_000))), ext }) catch return null;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data.bytes }) catch {
         alloc.free(path);
         return null;

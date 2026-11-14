@@ -3193,7 +3193,7 @@ pub const TUI = struct {
     /// images); file paths and plain text fall back to direct insertion.
     fn handleClipboardPaste(self: *TUI) void {
         const alloc = self.alloc;
-        if (clipboard.readClipboardImage(alloc, self.io)) |img| {
+        if (clipboard.readClipboardImage(alloc, self.io, self.environ)) |img| {
             defer alloc.free(img.bytes);
             const path = clipboard.writeImageTempFile(alloc, self.io, img, if (std.mem.eql(u8, img.mime, "image/jpeg")) "jpg" else "png") orelse {
                 self.note("{s}", .{"failed to write clipboard image"});
@@ -3204,7 +3204,7 @@ pub const TUI = struct {
             self.redraw();
             return;
         }
-        if (clipboard.readClipboardText(alloc, self.io)) |text| {
+        if (clipboard.readClipboardText(alloc, self.io, self.environ)) |text| {
             defer alloc.free(text);
             self.editor.insertBytes(text) catch {};
             self.redraw();
