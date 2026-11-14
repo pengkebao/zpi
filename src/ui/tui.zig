@@ -13,6 +13,8 @@ const agent = @import("../core/agent.zig");
 const cmsg = @import("../core/message.zig");
 const config = @import("../core/config.zig");
 const ss = @import("../core/session_store.zig");
+const shell = @import("../tools/shell.zig");
+const ptmod = @import("../core/prompt_template.zig");
 const compact = @import("../core/compaction.zig");
 const ansi = @import("ansi.zig");
 const spinner = @import("spinner.zig");
@@ -3085,8 +3087,127 @@ pub const TUI = struct {
                         else => {},
                     };
                 },
+                .bash_execution => {
+                    const cmd = m.bash_command orelse "";
+                    const out_text = if (m.blocks.items.len > 0) blk: {
+                        for (m.blocks.items) |b| switch (b) {
+                            .text => |t| break :blk t,
+                            else => {},
+                        };
+                        break :blk "";
+                    } else "";
+                    self.addBashBlock(cmd, out_text, m.bash_exit_code, m.bash_exclude);
+                },
             }
         }
+    }
+
+    /// Render one !cmd execution block (pi BashExecutionComponent look):
+    /// command line + truncated output + exit status, dim/colored.
+    pub fn addBashBlock(self: *TUI, command: []const u8, output: []const u8, exit_code: ?i32, exclude: bool) void {
+        var block: std.ArrayListUnmanaged(u8) = .empty;
+        defer block.deinit(self.alloc);
+        const a = self.alloc;
+        const tag: []const u8 = if (exclude) "bash (excluded)" else "bash";
+        block.appendSlice(a, "\x1b[2m[") catch return;
+        block.appendSlice(a, tag) catch return;
+        block.appendSlice(a, "] $ ") catch return;
+        block.appendSlice(a, command) catch return;
+        block.appendSlice(a, "\x1b[0m\n") catch return;
+        if (output.len > 0) {
+            // Indent the first 20 lines; dim them.
+            var it = std.mem.splitScalar(u8, output, '\n');
+            var n: usize = 0;
+            while (it.next()) |line| {
+                if (n >= 20) {
+                    block.appendSlice(a, "\x1b[2m…\x1b[0m\n") catch {};
+                    break;
+                }
+                block.appendSlice(a, "  \x1b[2m") catch break;
+                block.appendSlice(a, line[0..@min(line.len, 200)]) catch break;
+                block.appendSlice(a, "\x1b[0m\n") catch break;
+                n += 1;
+            }
+        } else {
+            block.appendSlice(a, "\x1b[2m  (no output)\x1b[0m\n") catch {};
+        }
+        if (exit_code) |code| {
+            if (code != 0) {
+                var eb: [64]u8 = undefined;
+                const row = std.fmt.bufPrint(&eb, "\x1b[31m  exited {d}\x1b[0m\n", .{code}) catch "";
+                block.appendSlice(a, row) catch {};
+            }
+        }
+        self.finishBlock(&block, .plain);
+    }
+
+    fn isPromptTemplate(self: *TUI, word: []const u8) bool {
+        if (!std.mem.startsWith(u8, word, "/")) return false;
+        const name = word[1..];
+        if (name.len == 0) return false;
+        const templates = ptmod.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs);
+        defer ptmod.freeAll(self.alloc, templates);
+        for (templates) |t| {
+            if (std.mem.eql(u8, t.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Expand a `/name args` submission against discovered prompt templates
+    /// (pi expandPromptTemplate). Returns the input unchanged when no
+    /// template matches; the caller frees the returned slice.
+    fn expandTemplate(self: *TUI, text: []const u8) ![]u8 {
+        const templates = ptmod.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs);
+        defer ptmod.freeAll(self.alloc, templates);
+        return ptmod.expand(self.alloc, text, templates);
+    }
+
+    fn agent_dir_for_templates(self: *TUI) []const u8 {
+        return self.cfg.?.base_dir;
+    }
+
+    /// Send text as a user prompt with the full submit ceremony (display,
+    /// scroll-to-end, spinner, watch). Frees the caller-owned text.
+    fn submitText(self: *TUI, text: []const u8) void {
+        self.addUserMessage(text);
+        self.loader.start();
+        self.render_mutex.lock(self.io) catch {};
+        self.sv.scrollToEnd(ss.nowMs(self.io));
+        self.render_mutex.unlock(self.io);
+        self.startSpinner();
+        self.startWatch();
+        self.redraw();
+        const run_err: ?anyerror = if (self.session.runPrompt(text)) |_| null else |e| e;
+        _ = run_err;
+        // Same post-turn ceremony as the editor path.
+        self.drainTurnEvents();
+        self.stopWatch();
+        self.stopSpinner();
+        self.loader.stop();
+        self.redraw();
+    }
+
+    /// Run a user `!cmd` synchronously (pi handleBashCommand): execute via
+    /// the shell executor (30s cap), record a bashExecution message, and
+    /// render a block. `!!` records excluded-from-context (pi prefix).
+    fn runUserBash(self: *TUI, command: []const u8, exclude: bool) void {
+        if (self.working) {
+            self.note("{s}", .{"A bash command is already running. Press Esc to cancel it first."});
+            return;
+        }
+        var out = std.array_list.Managed(u8).init(self.alloc);
+        defer out.deinit();
+        const res = shell.exec(self.alloc, self.io, shell.defaultConfig(), command, .{
+            .timeout = 30,
+        }, &out) catch {
+            self.note("{s}", .{"failed to spawn shell"});
+            return;
+        };
+        const exit_code: ?i32 = if (res.aborted or res.timed_out) null else if (res.exit_code) |c| @as(i32, c) else null;
+        if (res.timed_out) out.appendSlice("\n[timed out after 30s]") catch {};
+        if (res.aborted) out.appendSlice("\n[cancelled]") catch {};
+        self.addBashBlock(command, out.items, exit_code, exclude);
+        self.session.appendBashExecution(command, out.items, exit_code, exclude);
     }
 
     fn replayToolCall(self: *TUI, tc: cmsg.ToolCall) void {
@@ -3322,6 +3443,18 @@ pub const TUI = struct {
         const arg = parsed.arg;
 
         if (std.mem.eql(u8, word, "/exit") or std.mem.eql(u8, word, "/quit")) return true;
+
+        // pi: an unknown `/name` is first checked against prompt templates —
+        // a match sends the expansion as a normal message (handled here by
+        // falling through to the editor path with the expansion applied).
+        if (self.isPromptTemplate(word)) {
+            const expanded = self.expandTemplate(cmd) catch null;
+            if (expanded) |ex| {
+                defer self.alloc.free(ex);
+                self.submitText(ex);
+                return false;
+            }
+        }
 
         if (std.mem.eql(u8, word, "/help")) {
             self.addMessage("Commands:\n"
@@ -4007,7 +4140,27 @@ pub const TUI = struct {
                         self.redraw();
                         continue;
                     }
-                    self.addUserMessage(input);
+                    // pi handleBashCommand: `!cmd` runs locally and records a
+                    // bashExecution message; `!!cmd` is excluded from context.
+                    if (std.mem.startsWith(u8, input, "!")) {
+                        const is_excluded = std.mem.startsWith(u8, input, "!!");
+                        const command = std.mem.trim(u8, if (is_excluded) input[2..] else input[1..], " \t");
+                        if (command.len > 0) {
+                            self.runUserBash(command, is_excluded);
+                        }
+                        self.alloc.free(input);
+                        self.redraw();
+                        continue;
+                    }
+                    // pi expandPromptTemplate: `/name args` submissions expand
+                    // against discovered prompt templates before sending.
+                    if (std.mem.startsWith(u8, input, "/") == false and input.len > 1 and input[0] == '/') {}
+                    const expanded_input = self.expandTemplate(input) catch input;
+                    const text_to_send: []const u8 = if (expanded_input.ptr != input.ptr) blk: {
+                        self.alloc.free(input);
+                        break :blk expanded_input;
+                    } else expanded_input;
+                    self.addUserMessage(text_to_send);
                     self.loader.start();
                     // Jump back to the end and re-follow: the reply must be
                     // visible even if the user had scrolled up (or a search
@@ -4019,7 +4172,12 @@ pub const TUI = struct {
                     self.startSpinner();
                     self.startWatch();
                     self.redraw();
-                    const run_err: ?anyerror = if (self.session.runPrompt(input)) |_| null else |e| e;
+                    const run_err: ?anyerror = if (self.session.runPrompt(text_to_send)) |_| null else |e| e;
+                    if (expanded_input.ptr != text_to_send.ptr or expanded_input.ptr != input.ptr) {
+                        // text_to_send is the expanded allocation; input was
+                        // freed when expansion succeeded.
+                        self.alloc.free(text_to_send);
+                    }
                     // The callback rendered events as they came; take the rest.
                     self.drainTurnEvents();
                     // The events normally cover everything that streamed. What

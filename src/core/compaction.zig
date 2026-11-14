@@ -279,6 +279,10 @@ pub fn serializeConversation(alloc: std.mem.Allocator, messages: []const msg.Mes
                 const text = firstText(&m) orelse continue;
                 rendered = std.fmt.bufPrint(&part, "[User]: {s}", .{text}) catch null;
             },
+            .bash_execution => {
+                const text = firstText(&m) orelse continue;
+                rendered = std.fmt.bufPrint(&part, "[Bash]: {s}", .{text}) catch null;
+            },
             .assistant => {
                 // text block
                 if (firstText(&m)) |t| {

@@ -126,6 +126,8 @@ pub const Session = struct {
     /// injected into the context before the next LLM request, steering the
     /// current run). The TUI watcher thread pushes; the agent thread drains
     /// between tool-call rounds.
+    /// CLI @file image attachments for the next user message (not owned).
+    pending_images: ?[]const msg.ImageBlock = null,
     steering_queue: std.ArrayListUnmanaged([]u8) = .empty,
     queue_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Messages queued to start a NEW turn after the current one ends
@@ -497,6 +499,15 @@ pub const Session = struct {
     }
 
     /// Run a user prompt through the agent loop.
+    /// Run a user prompt with image attachments (CLI @file images).
+    /// images are owned by the caller; blocks copy them into the message.
+    pub fn runPromptWithImages(self: *Session, prompt: []const u8, images: []const msg.ImageBlock) !void {
+        // Stash images for the user-message construction inside runPrompt.
+        self.pending_images = images;
+        defer self.pending_images = null;
+        return self.runPrompt(prompt);
+    }
+
     pub fn runPrompt(self: *Session, prompt: []const u8) !void {
         clearAbort();
         // Events nobody took belong to an earlier turn.
@@ -517,6 +528,14 @@ pub const Session = struct {
         user_msg.role = .user;
         const prompt_copy = self.alloc.dupe(u8, current_prompt) catch return error.OutOfMemory;
         try user_msg.blocks.append(.{ .text = prompt_copy });
+        if (self.pending_images) |imgs| {
+            for (imgs) |img| {
+                try user_msg.blocks.append(.{ .image = .{
+                    .data = self.alloc.dupe(u8, img.data) catch break,
+                    .mime = self.alloc.dupe(u8, img.mime) catch break,
+                } });
+            }
+        }
         try self.appendAndRecord(&user_msg);
 
         var rounds: usize = 0;
@@ -764,6 +783,24 @@ pub const Session = struct {
         self.emit(.tool_info, "\n[interrupted]\n");
     }
 
+    /// Record a user-initiated `!cmd` execution (pi recordBashResult):
+    /// role=.bash_execution message with command/output/exit metadata.
+    /// The text block carries the raw output; wire conversion renders it.
+    pub fn appendBashExecution(self: *Session, command: []const u8, output: []const u8, exit_code: ?i32, exclude: bool) void {
+        var bm = msg.Message.init(self.alloc);
+        defer bm.deinit();
+        bm.role = .bash_execution;
+        bm.timestamp_ms = ss.nowMs(self.io);
+        bm.bash_command = self.alloc.dupe(u8, command) catch return;
+        bm.bash_exclude = exclude;
+        bm.bash_exit_code = exit_code;
+        if (output.len > 0) {
+            const copy = self.alloc.dupe(u8, output) catch return;
+            bm.blocks.append(.{ .text = copy }) catch return;
+        }
+        self.appendAndRecord(&bm) catch return;
+    }
+
     /// Append is_error tool results for every tool call of the message.
     fn appendAbortedToolResults(self: *Session, assistant_msg: *msg.Message) void {
         for (assistant_msg.blocks.items) |b| {
@@ -845,7 +882,25 @@ pub const Session = struct {
 
     fn buildWireMessages(self: *Session, out: *std.array_list.Managed(ai.OpenAiProvider.ChatMessage)) !void {
         try out.append(.{ .role = .system, .blocks = &self.system_blocks });
-        for (self.context.messages.items) |m| {
+        for (self.context.messages.items) |*m| {
+            if (m.role == .bash_execution) {
+                // pi convertToLlm: `!!` executions stay out of the context;
+                // others become user text (bashExecutionToText format).
+                if (m.bash_exclude) continue;
+                const text = msg.bashExecutionToText(self.alloc, m.bash_command orelse "", if (m.blocks.items.len > 0) blk: {
+                    for (m.blocks.items) |b| switch (b) {
+                        .text => |t| break :blk t,
+                        else => {},
+                    };
+                    break :blk "";
+                } else "", m.bash_exit_code, false, null) catch continue;
+                // The wire messages live until the request completes, longer
+                // than this loop iteration — intentionally not freed here.
+                var blocks = std.array_list.Managed(msg.ContentBlock).init(self.alloc);
+                blocks.append(.{ .text = text }) catch continue;
+                try out.append(.{ .role = .user, .blocks = blocks.toOwnedSlice() catch continue });
+                continue;
+            }
             try out.append(.{ .role = m.role, .blocks = m.blocks.items });
         }
     }

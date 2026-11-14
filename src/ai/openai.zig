@@ -253,6 +253,23 @@ pub const OpenAiProvider = struct {
             self.alloc.free(role_part);
 
             switch (m.role) {
+                .bash_execution => {
+                    // pi convertToLlm: bashExecution → user text (excluded
+                    // messages were already filtered by buildWireMessages).
+                    try body.appendSlice("\"role\":\"user\",\"content\":\"");
+                    var text_parts2 = std.array_list.Managed([]const u8).init(self.alloc);
+                    defer text_parts2.deinit();
+                    for (m.blocks) |block| {
+                        switch (block) {
+                            .text => |t| try text_parts2.append(t),
+                            else => {},
+                        }
+                    }
+                    const joined = std.mem.concat(self.alloc, u8, text_parts2.items) catch return error.OutOfMemory;
+                    defer self.alloc.free(joined);
+                    try writeJsonStr(body, joined);
+                    try body.appendSlice("\",\"name\":null}");
+                },
                 .system, .user => {
                     // Simple text content
                     var text_parts = std.array_list.Managed([]const u8).init(self.alloc);

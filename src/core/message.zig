@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-pub const Role = enum { system, user, assistant, tool };
+pub const Role = enum { system, user, assistant, tool, bash_execution };
 
 /// Token usage and cost for one assistant response (pi: Usage).
 pub const Usage = struct {
@@ -88,6 +88,38 @@ pub const ToolResult = struct {
     tool_name: ?[]u8 = null,
 };
 
+/// Convert a bash execution message to user text for LLM context
+/// (pi messages.js bashExecutionToText).
+pub fn bashExecutionToText(alloc: std.mem.Allocator, command: []const u8, output: []const u8, exit_code: ?i32, cancelled: bool, truncated_path: ?[]const u8) error{OutOfMemory}![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+    try out.appendSlice("Ran \x60");
+    try out.appendSlice(command);
+    try out.appendSlice("\x60\n");
+    if (output.len > 0) {
+        try out.appendSlice("```\n");
+        try out.appendSlice(output);
+        try out.appendSlice("\n```");
+    } else {
+        try out.appendSlice("(no output)");
+    }
+    if (cancelled) {
+        try out.appendSlice("\n\n(command cancelled)");
+    } else if (exit_code) |code| {
+        if (code != 0) {
+            var b: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&b, "\n\nCommand exited with code {d}", .{code}) catch "";
+            try out.appendSlice(s);
+        }
+    }
+    if (truncated_path) |fp| {
+        try out.appendSlice("\n\n[Output truncated. Full output: ");
+        try out.appendSlice(fp);
+        try out.appendSlice("]");
+    }
+    return out.toOwnedSlice();
+}
+
 pub const Message = struct {
     role: Role,
     blocks: std.array_list.Managed(ContentBlock),
@@ -97,6 +129,12 @@ pub const Message = struct {
     timestamp_ms: i64 = 0,
     /// Static "stop"/"toolUse"/... (assistant only).
     stop_reason: ?[]const u8 = null,
+    /// Bash execution message (role == .bash_execution): the command line.
+    bash_command: ?[]u8 = null,
+    /// Exit code; null = cancelled or unknown.
+    bash_exit_code: ?i32 = null,
+    /// pi `!!` prefix: displayed but excluded from LLM context.
+    bash_exclude: bool = false,
     /// pi compat wire fields (assistant); owned.
     provider: ?[]u8 = null,
     model_id: ?[]u8 = null,
@@ -130,6 +168,7 @@ pub const Message = struct {
             }
         }
         self.blocks.deinit();
+        if (self.bash_command) |bc| self.blocks.allocator.free(bc);
         if (self.stop_reason) |sr| self.blocks.allocator.free(sr);
         if (self.provider) |p| self.blocks.allocator.free(p);
         if (self.model_id) |mid| self.blocks.allocator.free(mid);
@@ -171,6 +210,9 @@ pub const Message = struct {
         if (self.stop_reason) |sr| out.stop_reason = try alloc.dupe(u8, sr);
         if (self.provider) |p| out.provider = try alloc.dupe(u8, p);
         if (self.model_id) |mid| out.model_id = try alloc.dupe(u8, mid);
+        if (self.bash_command) |bc| out.bash_command = try alloc.dupe(u8, bc);
+        out.bash_exit_code = self.bash_exit_code;
+        out.bash_exclude = self.bash_exclude;
         // Usage is a value type (no pointers) → shallow copy.
         out.usage = self.usage;
         return out;

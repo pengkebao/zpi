@@ -53,12 +53,12 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | 系统 prompt 分节（preamble/tools/cwd/skills...） | ✅ | ✅ | `system_prompt.zig`：preamble/tools/rules/addendum/project_context/cwd；skills 段随扩展系统 |
 | AGENTS.md / CLAUDE.md 发现（cwd+祖先+agent 目录） | ✅ | ✅ | AGENTS.override.md 优先；root→cwd 去重 |
 | `--system-prompt` / `--append-system-prompt` | ✅ | ✅ | 整体覆盖 / addendum 段 |
-| @file 附件（文本+图片） | ✅ | ❌ | D3 |
-| 图片消息（base64 ImageContent） | ✅ | ❌ | |
-| 粘贴图片 / 拖放 | ✅ | ❌ | |
-| 管道 stdin 并入首条 prompt | ✅ | ❌ | `git diff \| pi -p "review"` |
-| `!cmd` 输出进会话 / `!!` 静默执行 | ✅ | ❌ | D4，TUI 编辑器功能 |
-| prompt 模板展开 | ✅ | ❌ | |
+| @file 附件（文本+图片） | ✅ | ✅ | CLI 位置参数 `@path`：文本 `<file name>` 包裹（BOM 剥离）、图片魔数检测 → base64 ImageBlock 入首条消息（pi processFileArguments/buildInitialMessage 组装顺序 stdin→fileText→prompt） |
+| 图片消息（base64 ImageContent） | ✅ | ✅ | ImageBlock 全链路（@file 图片 + read 工具图片）；wire image_url data URI |
+| 粘贴图片 / 拖放 | ✅ | ❌ | 依赖终端剪贴板协议（OSC52 读回/kitty clipboard），留待 |
+| 管道 stdin 并入首条 prompt | ✅ | ✅ | 非 TTY stdin 读入并入首条；interactive 下有 stdin 降级 print（pi readPipedStdin + resolveAppMode） |
+| `!cmd` 输出进会话 / `!!` 静默执行 | ✅ | ✅ | shell.exec（30s 上限）→ bashExecution 消息（pi JSONL 格式 command/output/exitCode/excludeFromContext）→ wire user 文本（bashExecutionToText）；`!!` 排除；回放渲染 |
+| prompt 模板展开 | ✅ | ✅ | `agent-dir/prompts` + `cwd/.pi/prompts` 的 .md（frontmatter 剥离）；提交时 `/name args` 展开：$1..$n、$@/$ARGUMENTS、${N:-default}、${@:N[:L]} 切片（pi substituteArgs bash 引号解析）；未识别 `/` 命令回退模板检查 |
 
 ### 3. 工具
 

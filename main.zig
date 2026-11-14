@@ -11,6 +11,8 @@ const selection = @import("src/tools/selection.zig");
 const tui = @import("src/ui/tui.zig");
 const ss = @import("src/core/session_store.zig");
 const sp = @import("src/core/system_prompt.zig");
+const msgmod = @import("src/core/message.zig");
+const ptmod = @import("src/core/prompt_template.zig");
 
 fn getCwdAlloc(alloc: std.mem.Allocator) ![]u8 {
     var buf: [4096]u8 = undefined;
@@ -30,6 +32,15 @@ fn splitComma(alloc: std.mem.Allocator, s: []const u8) ![]const []const u8 {
         if (trimmed.len > 0) try list.append(trimmed);
     }
     return list.toOwnedSlice();
+}
+
+/// Detect a supported image MIME type from magic bytes (png/jpeg/gif/webp).
+fn detectImageMime(data: []const u8) ?[]const u8 {
+    if (data.len >= 8 and data[0] == 0x89 and std.mem.eql(u8, data[1..4], "PNG")) return "image/png";
+    if (data.len >= 3 and data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF) return "image/jpeg";
+    if (data.len >= 6 and (std.mem.eql(u8, data[0..6], "GIF87a") or std.mem.eql(u8, data[0..6], "GIF89a"))) return "image/gif";
+    if (data.len >= 12 and std.mem.eql(u8, data[0..4], "RIFF") and std.mem.eql(u8, data[8..12], "WEBP")) return "image/webp";
+    return null;
 }
 
 /// Build the sectioned system prompt (Phase D): tool snippets from the registry,
@@ -103,6 +114,16 @@ pub fn main(init: std.process.Init) !void {
     // Parse args
     var print_mode = false;
     var prompt: ?[]const u8 = null;
+    var file_args = std.array_list.Managed([]const u8).init(alloc);
+    defer file_args.deinit();
+    var image_attachments = std.array_list.Managed(msgmod.ImageBlock).init(alloc);
+    defer {
+        for (image_attachments.items) |img| {
+            alloc.free(img.data);
+            alloc.free(img.mime);
+        }
+        image_attachments.deinit();
+    }
     var model_name: ?[]const u8 = null;
     var cli_thinking: ?config.ThinkingLevel = null;
     var model_id: ?[]const u8 = null;
@@ -131,9 +152,8 @@ pub fn main(init: std.process.Init) !void {
     while (i < argv.items.len) : (i += 1) {
         const arg = argv.items[i];
         if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print")) {
+            // pi: -p takes no value; the message text is a positional arg.
             print_mode = true;
-            if (i + 1 < argv.items.len) prompt = argv.items[i + 1];
-            i += 1;
         } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--model")) {
             if (i + 1 < argv.items.len) model_name = argv.items[i + 1];
             i += 1;
@@ -194,6 +214,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--system-prompt")) {
             if (i + 1 < argv.items.len) system_prompt_override = argv.items[i + 1];
             i += 1;
+        } else {
+            // pi positional args: @files and message text.
+            if (arg.len > 1 and arg[0] == '@') {
+                file_args.append(arg[1..]) catch {};
+            } else if (prompt == null) {
+                prompt = arg;
+            }
         }
     }
 
@@ -327,6 +354,91 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+
+    // ---- Initial prompt assembly (pi buildInitialMessage) ----
+    // piped stdin (non-TTY); stdin presence downgrades interactive → print.
+    var stdin_content: ?[]u8 = null;
+    {
+        const stdin_file = std.Io.File.stdin();
+        const is_tty = stdin_file.isTty(io) catch false;
+        if (!is_tty) {
+            var buf = std.array_list.Managed(u8).init(alloc);
+            var rbuf: [4096]u8 = undefined;
+            var fr = stdin_file.reader(io, &rbuf);
+            while (true) {
+                const n = fr.interface.readSliceShort(&rbuf) catch break;
+                if (n == 0) break;
+                buf.appendSlice(rbuf[0..n]) catch break;
+            }
+            const trimmed = std.mem.trim(u8, buf.items, " \t\r\n");
+            if (trimmed.len > 0) {
+                stdin_content = alloc.dupe(u8, trimmed) catch null;
+            }
+            buf.deinit();
+            if (stdin_content != null and !print_mode) print_mode = true;
+        }
+    }
+
+    // @file arguments → <file name> text wrap + image attachments
+    var file_text: ?[]u8 = null;
+    if (file_args.items.len > 0) {
+        var fbuf = std.array_list.Managed(u8).init(alloc);
+        for (file_args.items) |fa| {
+            const abs = if (std.mem.startsWith(u8, fa, "/")) try alloc.dupe(u8, fa) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ cwd_abs, fa });
+            defer alloc.free(abs);
+            const raw = std.Io.Dir.cwd().readFileAlloc(io, abs, alloc, .limited(64 * 1024 * 1024)) catch {
+                std.debug.print("error: file not found: {s}\n", .{abs});
+                return error.FileNotFound;
+            };
+            defer alloc.free(raw);
+            if (raw.len == 0) continue;
+            if (detectImageMime(raw)) |mime| {
+                const enc = std.base64.standard.Encoder;
+                const b64 = try alloc.alloc(u8, enc.calcSize(raw.len));
+                defer alloc.free(b64);
+                _ = enc.encode(b64, raw);
+                image_attachments.append(.{
+                    .data = try alloc.dupe(u8, b64),
+                    .mime = try alloc.dupe(u8, mime),
+                }) catch {};
+                try fbuf.appendSlice("<file name=\"");
+                try fbuf.appendSlice(abs);
+                try fbuf.appendSlice("\"></file>\n");
+            } else {
+                try fbuf.appendSlice("<file name=\"");
+                try fbuf.appendSlice(abs);
+                try fbuf.appendSlice("\">\n");
+                const content = std.mem.trimStart(u8, raw, "\xef\xbb\xbf");
+                try fbuf.appendSlice(content);
+                try fbuf.appendSlice("\n</file>\n");
+            }
+        }
+        if (fbuf.items.len > 0) file_text = try fbuf.toOwnedSlice() else fbuf.deinit();
+    }
+
+    // Combine [stdin, @file text, prompt] (pi order), then expand templates.
+    {
+        const templates = ptmod.discover(alloc, io, cfg.base_dir, cwd_abs);
+        defer ptmod.freeAll(alloc, templates);
+        var combined = std.array_list.Managed(u8).init(alloc);
+        defer combined.deinit();
+        if (stdin_content) |sc| {
+            combined.appendSlice(sc) catch {};
+            combined.append('\n') catch {};
+        }
+        if (file_text) |ft| {
+            combined.appendSlice(ft) catch {};
+        }
+        if (prompt) |pp| {
+            combined.appendSlice(pp) catch {};
+        }
+        if (combined.items.len > 0) {
+            // expand always returns a fresh allocation (or propagates OOM),
+            // so releasing `combined` afterwards is always safe.
+            prompt = try ptmod.expand(alloc, combined.items, templates);
+        }
+    }
+
 
     // Build the sectioned system prompt (Phase D)
     const system_prompt = try buildSystemPromptFor(alloc, io, &registry, cwd_abs, cfg.base_dir, append_system_prompt, system_prompt_override);
@@ -483,7 +595,7 @@ pub fn main(init: std.process.Init) !void {
     if (print_mode) {
         if (prompt) |p| {
             // Text streams to stdout; tool activity/thinking go to stderr.
-            session.runPrompt(p) catch |e| {
+            session.runPromptWithImages(p, image_attachments.items) catch |e| {
                 if (e != error.Aborted) {
                     std.debug.print("\n[error: {s}]\n", .{@errorName(e)});
                 }

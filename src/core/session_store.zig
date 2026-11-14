@@ -236,6 +236,30 @@ fn writeMessageJson(out: *std.array_list.Managed(u8), m: *const msg.Message) !vo
             try appendFmt(out, out.allocator, "{d}", .{ts});
             try out.append('}');
         },
+        .bash_execution => {
+            // pi bashExecution entry: role + command/output/exitCode/exclude
+            try out.appendSlice("{\"role\":\"bashExecution\",\"command\":");
+            try writeJsonStr(out, m.bash_command orelse "");
+            try out.appendSlice(",\"output\":");
+            var bout = std.array_list.Managed(u8).init(out.allocator);
+            defer bout.deinit();
+            for (m.blocks.items) |b| switch (b) {
+                .text => |t| bout.appendSlice(t) catch {},
+                else => {},
+            };
+            try writeJsonStr(out, bout.items);
+            try out.appendSlice(",\"exitCode\":");
+            if (m.bash_exit_code) |c| {
+                try appendFmt(out, out.allocator, "{d}", .{c});
+            } else {
+                try out.appendSlice("null");
+            }
+            try out.appendSlice(",\"excludeFromContext\":");
+            try out.appendSlice(if (m.bash_exclude) "true" else "false");
+            try out.appendSlice(",\"timestamp\":");
+            try appendFmt(out, out.allocator, "{d}", .{ts});
+            try out.append('}');
+        },
         .tool => {
             // One entry per tool_result block (pi: one message per result)
             var first = true;
@@ -406,6 +430,27 @@ pub fn messageFromJson(alloc: std.mem.Allocator, v: std.json.Value) !msg.Message
         };
         if (o.get("model")) |mv| switch (mv) {
             .string => |s| m.model_id = try alloc.dupe(u8, s),
+            else => {},
+        };
+    } else if (std.mem.eql(u8, role, "bashExecution")) {
+        m.role = .bash_execution;
+        if (o.get("command")) |cv| switch (cv) {
+            .string => |sv| m.bash_command = try alloc.dupe(u8, sv),
+            else => {},
+        };
+        if (o.get("excludeFromContext")) |ev| switch (ev) {
+            .bool => |b| m.bash_exclude = b,
+            else => {},
+        };
+        if (o.get("exitCode")) |ev| switch (ev) {
+            .integer => |n| m.bash_exit_code = @intCast(n),
+            else => {},
+        };
+        if (o.get("output")) |ov| switch (ov) {
+            .string => |sv| {
+                const copy = try alloc.dupe(u8, sv);
+                try m.blocks.append(.{ .text = copy });
+            },
             else => {},
         };
     } else if (std.mem.eql(u8, role, "toolResult")) {
