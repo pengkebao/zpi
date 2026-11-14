@@ -19,6 +19,7 @@ const ptmod = @import("../core/prompt_template.zig");
 const compact = @import("../core/compaction.zig");
 const skills = @import("../core/skills.zig");
 const sp = @import("../core/system_prompt.zig");
+const mcp = @import("../core/mcp.zig");
 const ansi = @import("ansi.zig");
 const spinner = @import("spinner.zig");
 const keys = @import("keys.zig");
@@ -213,6 +214,7 @@ pub const TUI = struct {
         .{ .name = "/export", .desc = "Export session to HTML", .takes_arg = true },
         .{ .name = "/compact", .desc = "Compact the conversation" },
         .{ .name = "/reload", .desc = "Reload skills + rebuild system prompt" },
+        .{ .name = "/mcp", .desc = "List MCP servers and their state" },
         .{ .name = "/copy", .desc = "Copy last reply to clipboard" },
         .{ .name = "/settings", .desc = "Open settings (Enter cycles values)" },
         .{ .name = "/debug", .desc = "Write debug log" },
@@ -3921,6 +3923,42 @@ pub const TUI = struct {
         self.note("Reloaded resources: {d} skill(s) advertised in the system prompt.", .{visible});
     }
 
+    /// /mcp — list configured MCP servers with their state (pi /mcp).
+    fn showMcpStatus(self: *TUI) void {
+        const mgr = mcp.Manager.getGlobal() orelse {
+            self.addMessage("No MCP servers configured.\nAdd entries to mcp.json under your agent dir or in .pi/mcp.json.");
+            return;
+        };
+        var out = std.array_list.Managed(u8).init(self.alloc);
+        defer out.deinit();
+        if (mgr.servers.items.len == 0) {
+            self.addMessage("No MCP servers configured.");
+            return;
+        }
+        out.appendSlice("MCP servers:\n") catch return;
+        for (mgr.servers.items) |srv| {
+            const state: []const u8 = if (srv.connected) "connected"
+            else if (!srv.enabled) "disabled"
+            else srv.error_msg orelse "disconnected";
+            const line = std.fmt.allocPrint(self.alloc,
+                "  \x1b[1m{s}\x1b[0m — {s} ({d} tool{s}) [{s}]",
+                .{ srv.name, state, srv.tools.len, if (srv.tools.len == 1) "" else "s", srv.source })
+                catch continue;
+            defer self.alloc.free(line);
+            out.appendSlice(line) catch return;
+            if (srv.server_info) |info| {
+                out.appendSlice(" — ") catch return;
+                out.appendSlice(info) catch return;
+            }
+            if (srv.description) |d| {
+                out.appendSlice(" — ") catch return;
+                out.appendSlice(d) catch return;
+            }
+            out.append('\n') catch return;
+        }
+        self.addMessage(out.items);
+    }
+
     /// Send text as a user prompt with the full submit ceremony (display,
     /// scroll-to-end, spinner, watch). Frees the caller-owned text.
     fn submitText(self: *TUI, text: []const u8) void {
@@ -4245,6 +4283,13 @@ pub const TUI = struct {
             return false;
         }
 
+        // /mcp — list configured MCP servers with their state (pi /mcp).
+        if (std.mem.eql(u8, word, "/mcp")) {
+            self.showMcpStatus();
+            self.redraw();
+            return false;
+        }
+
         // pi: an unknown `/name` is first checked against prompt templates —
         // a match sends the expansion as a normal message (handled here by
         // falling through to the editor path with the expansion applied).
@@ -4271,6 +4316,7 @@ pub const TUI = struct {
                 ++ "  /fork          fork current session into a new one\n"
                 ++ "  /resume <id>   resume a session by (partial) id\n"
                 ++ "  /export [path] export session to HTML (default: alongside)\n"
+                ++ "  /mcp           list MCP servers and their state\n"
                 ++ "  /copy          copy last assistant message to clipboard\n"
                 ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)");
             self.redraw();

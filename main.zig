@@ -14,6 +14,7 @@ const sp = @import("src/core/system_prompt.zig");
 const msgmod = @import("src/core/message.zig");
 const ptmod = @import("src/core/prompt_template.zig");
 const skills = @import("src/core/skills.zig");
+const mcp = @import("src/core/mcp.zig");
 
 fn getCwdAlloc(alloc: std.mem.Allocator) ![]u8 {
     var buf: [4096]u8 = undefined;
@@ -190,6 +191,43 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // `rpi mcp <subcommand>` (pi `pi mcp …`). Handled before config load —
+    // it only needs the base dir, not a model.
+    if (argv.items.len >= 2 and std.mem.eql(u8, argv.items[1], "mcp")) {
+        const sub = if (argv.items.len >= 3) argv.items[2] else "";
+        if (std.mem.eql(u8, sub, "list")) {
+            const base = try config.baseDir(alloc, init.minimal.environ);
+            defer alloc.free(base);
+            const user_mcp = try std.fmt.allocPrint(alloc, "{s}/mcp.json", .{base});
+            defer alloc.free(user_mcp);
+            const proj_cwd: []const u8 = getCwdAlloc(alloc) catch "";
+            defer {
+                if (proj_cwd.len > 0) alloc.free(proj_cwd);
+            }
+            const proj_mcp = try std.fmt.allocPrint(alloc, "{s}/.pi/mcp.json", .{proj_cwd});
+            defer alloc.free(proj_mcp);
+            const cfgs = mcp.loadConfig(alloc, io, user_mcp, proj_mcp) catch &[_]mcp.ServerConfig{};
+            defer mcp.freeConfigs(alloc, cfgs);
+            if (cfgs.len == 0) {
+                std.debug.print("no MCP servers configured\n", .{});
+            } else {
+                std.debug.print("MCP servers:\n", .{});
+                for (cfgs) |c| {
+                    const kind = switch (c.kind) {
+                        .stdio => "stdio",
+                        .http => "http",
+                    };
+                    const en = if (c.enabled) "" else " (disabled)";
+                    std.debug.print("  {s} [{s}]{s}\n", .{ c.name, kind, en });
+                    if (c.description) |d| std.debug.print("    {s}\n", .{d});
+                }
+            }
+            return;
+        }
+        std.debug.print("usage: rpi mcp list\n", .{});
+        return;
+    }
+
     // Load config
     var cfg = try config.load(io, alloc, init.minimal.environ);
     defer cfg.deinit(alloc);
@@ -324,6 +362,31 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+
+    // ---- MCP (PLAN 10): load mcp.json, connect stdio servers, register tools ----
+    // The manager is heap-allocated so the shared MCP tool executor (which only
+    // sees its own Tool name) can reach it via the global. It outlives the
+    // session (servers are long-lived) and is retired at the end of main.
+    var mcp_mgr: ?*mcp.Manager = null;
+    blk: {
+        const user_mcp = std.fmt.allocPrint(alloc, "{s}/mcp.json", .{cfg.base_dir}) catch break :blk;
+        defer alloc.free(user_mcp);
+        const proj_mcp = std.fmt.allocPrint(alloc, "{s}/.pi/mcp.json", .{cwd_abs}) catch break :blk;
+        defer alloc.free(proj_mcp);
+        const cfgs = mcp.loadConfig(alloc, io, user_mcp, proj_mcp) catch break :blk;
+        defer mcp.freeConfigs(alloc, cfgs);
+        const mgr = alloc.create(mcp.Manager) catch break :blk;
+        mgr.* = mcp.Manager.init(alloc, io);
+        mgr.connectAll(cfgs);
+        mcp.Manager.setGlobal(mgr);
+        _ = mgr.registerTools(&registry);
+        mcp_mgr = mgr;
+    }
+    defer if (mcp_mgr) |m| {
+        mcp.Manager.setGlobal(null);
+        m.deinit();
+        alloc.destroy(m);
+    };
 
     // ---- Initial prompt assembly (pi buildInitialMessage) ----
     // piped stdin (non-TTY); stdin presence downgrades interactive → print.

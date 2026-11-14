@@ -175,12 +175,12 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
-| stdio server 接入 | ✅ | ❌ | |
-| streamable HTTP + OAuth | ✅ | ❌ | |
-| mcp.json（用户/项目，项目覆盖 user 同名项） | ✅ | ❌ | |
-| `/mcp` 管理、exposure 模式（直接/codemode/deferred） | ✅ | ❌ | |
-| `pi mcp add/remove/list/login/logout` | ✅ | ❌ | |
-| MCP resources（list/read） | ✅ | ❌ | |
+| stdio server 接入（tools/call 全链路） | ✅ | ✅ | initialize 握手→tools/list→注册为 `mcp__<server>__<tool>`→tools/call；E2E 验证 |
+| streamable HTTP + OAuth | ✅ | ❌ | 配置项已识别（标注 "not supported yet"），传输待实现 |
+| mcp.json（用户/项目，项目覆盖 user 同名项） | ✅ | ✅ | `<base>/mcp.json` + `.pi/mcp.json`，同名项目覆盖 |
+| `/mcp` 管理、exposure 模式（直接/codemode/deferred） | ✅ | ⚠️ | `/mcp` 列出服务器状态/工具数/来源；exposure 模式待做 |
+| `pi mcp add/remove/list/login/logout` | ✅ | ⚠️ | `rpi mcp list` 可用；add/remove/login/logout 待做 |
+| MCP resources（list/read） | ✅ | ❌ | 待做 |
 
 ### 11. 配置与安全
 
@@ -404,10 +404,11 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 - [ ] tool_search：移到 J（MCP）阶段，零依赖可实现
 
 ### Phase J — MCP 客户端（~2k 行）
-- [ ] J1 JSON-RPC over stdio；tools/list、tools/call、resources/*
+- [x] J1a JSON-RPC over stdio；tools/list、tools/call（全链路 E2E 验证）
+- [ ] J1b resources/list、resources/read
 - [ ] J2 streamable HTTP + bearer/OAuth（OAuth 可裁剪）
-- [ ] J3 mcp.json 加载（用户/项目覆盖规则）+ `/mcp` 管理
-- [ ] J4 `pi mcp add/remove/list/login/logout` 子命令
+- [x] J3 mcp.json 加载（用户/项目覆盖规则）+ `/mcp` 状态列出
+- [ ] J4 `pi mcp add/remove/login/logout` 子命令（list 已完成）
 - [ ] J5 exposure 模式 + 与 --tools 过滤的交互语义
 
 ### Phase K — JSON/RPC 模式与分发（~2k 行）

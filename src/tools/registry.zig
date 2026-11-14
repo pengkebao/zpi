@@ -48,7 +48,9 @@ pub const Tool = struct {
     name: []const u8,
     description: []const u8,
     parameters_json: []const u8,
-    execute: *const fn (args_json: []const u8, ctx: *ExecutionContext) ToolResult,
+    /// `tool` is the Tool being executed (lets a shared executor, like the MCP
+    /// one, discover its own name). Built-in tools ignore it.
+    execute: *const fn (tool: *const Tool, args_json: []const u8, ctx: *ExecutionContext) ToolResult,
 };
 
 pub const ExecutionContext = struct {
@@ -292,7 +294,7 @@ fn buildTruncationMarker(alloc: std.mem.Allocator, trunc: truncate.TruncationRes
     return std.fmt.allocPrint(alloc, "[Showing lines {d}-{d} of {d}]", .{ start_line, end_line, trunc.total_lines }) catch null;
 }
 
-fn executeBash(args_json: []const u8, ctx: *ExecutionContext) ToolResult {
+fn executeBash(_: *const Tool, args_json: []const u8, ctx: *ExecutionContext) ToolResult {
     var parsed_args = parseArgs(args_json, ctx.alloc) orelse
         return err(ctx.alloc, "error: invalid JSON");
     defer parsed_args.deinit();
@@ -379,7 +381,7 @@ pub fn registerRead(registry: *Registry) !void {
     });
 }
 
-fn executeRead(args_json: []const u8, ctx: *ExecutionContext) ToolResult {
+fn executeRead(_: *const Tool, args_json: []const u8, ctx: *ExecutionContext) ToolResult {
     var parsed_args = parseArgs(args_json, ctx.alloc) orelse
         return err(ctx.alloc, "error: invalid JSON");
     defer parsed_args.deinit();
@@ -516,7 +518,7 @@ pub fn registerWrite(registry: *Registry) !void {
     });
 }
 
-fn executeWrite(args_json: []const u8, ctx: *ExecutionContext) ToolResult {
+fn executeWrite(_: *const Tool, args_json: []const u8, ctx: *ExecutionContext) ToolResult {
     var parsed_args = parseArgs(args_json, ctx.alloc) orelse
         return err(ctx.alloc, "error: invalid JSON");
     defer parsed_args.deinit();
@@ -563,7 +565,7 @@ pub fn registerEdit(registry: *Registry) !void {
     });
 }
 
-pub fn executeEdit(args_json: []const u8, ctx: *ExecutionContext) ToolResult {
+pub fn executeEdit(_: *const Tool, args_json: []const u8, ctx: *ExecutionContext) ToolResult {
     var parsed_args = parseArgs(args_json, ctx.alloc) orelse
         return err(ctx.alloc, "error: invalid JSON");
     defer parsed_args.deinit();
@@ -804,7 +806,7 @@ fn editErrorMessage(alloc: std.mem.Allocator, path: []const u8, code: edit_diff.
     return std.fmt.allocPrint(alloc, "error: {s} in {s}", .{ name, path }) catch name;
 }
 
-fn executeGrep(args_json: []const u8, ctx: *ExecutionContext) ToolResult {
+fn executeGrep(_: *const Tool, args_json: []const u8, ctx: *ExecutionContext) ToolResult {
     var parsed_args = parseArgs(args_json, ctx.alloc) orelse
         return err(ctx.alloc, "error: invalid JSON");
     defer parsed_args.deinit();
@@ -916,7 +918,7 @@ fn executeGrep(args_json: []const u8, ctx: *ExecutionContext) ToolResult {
 
 const FIND_DEFAULT_LIMIT = 1000;
 
-fn executeFind(args_json: []const u8, ctx: *ExecutionContext) ToolResult {
+fn executeFind(_: *const Tool, args_json: []const u8, ctx: *ExecutionContext) ToolResult {
     var parsed_args = parseArgs(args_json, ctx.alloc) orelse
         return err(ctx.alloc, "error: invalid JSON");
     defer parsed_args.deinit();
@@ -1033,7 +1035,7 @@ fn lsLessThan(ctx: void, a: LsEntry, b: LsEntry) bool {
     return a.name.len < b.name.len;
 }
 
-fn executeLs(args_json: []const u8, ctx: *ExecutionContext) ToolResult {
+fn executeLs(_: *const Tool, args_json: []const u8, ctx: *ExecutionContext) ToolResult {
     var parsed_args = parseArgs(args_json, ctx.alloc) orelse
         return err(ctx.alloc, "error: invalid JSON");
     defer parsed_args.deinit();

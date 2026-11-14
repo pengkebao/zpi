@@ -375,6 +375,17 @@ fn resolveValue(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, environ: 
 // ── Load ────────────────────────────────────────────────────────────
 
 /// Load config from the pi agent dir (PI_CODING_AGENT_DIR or ~/.pi/agent).
+/// Compute the base dir without loading models (for CLI subcommands like
+/// `mcp list` that don't need a model configured).
+pub fn baseDir(alloc: std.mem.Allocator, environ: std.process.Environ) ![]u8 {
+    const env_dir = std.process.Environ.getPosix(environ, "PI_CODING_AGENT_DIR") orelse
+        std.process.Environ.getPosix(environ, "RPI_CODING_AGENT_DIR");
+    if (env_dir) |dir| return alloc.dupe(u8, std.mem.sliceTo(dir, 0));
+    const home = std.process.Environ.getPosix(environ, "HOME") orelse
+        std.process.Environ.getPosix(environ, "USERPROFILE") orelse return error.NoHome;
+    return std.fs.path.join(alloc, &.{ std.mem.sliceTo(home, 0), ".pi", "agent" });
+}
+
 pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) !Config {
     var cfg = Config{
         .base_dir = "",

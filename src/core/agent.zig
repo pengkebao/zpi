@@ -916,7 +916,7 @@ pub const Session = struct {
     fn execTool(self: *Session, name: []const u8, args_json: []const u8) tools.ToolResult {
         const tool = self.registry.find(name) orelse
             return .{ .content = std.fmt.allocPrint(self.alloc, "unknown tool: {s}", .{name}) catch "", .is_error = true };
-        return tool.execute(args_json, &self.exec_ctx);
+        return tool.execute(tool, args_json, &self.exec_ctx);
     }
 
     pub fn onStreamEvent(self: *Session, event: ai.StreamEvent) void {
