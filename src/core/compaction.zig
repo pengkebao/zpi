@@ -65,8 +65,72 @@ pub fn estimateContextTokens(messages: []const msg.Message) u64 {
 /// pi: shouldCompact.
 pub fn shouldCompact(context_tokens: u64, context_window: usize, settings: *const Settings) bool {
     if (!settings.enabled) return false;
-    const budget = @as(u64, context_window) - @as(u64, settings.reserve_tokens);
-    return context_tokens > budget;
+    // No subtraction: context_window may be smaller than reserve_tokens
+    // (small local models), where window - reserve would underflow.
+    return context_tokens + settings.reserve_tokens > context_window;
+}
+
+// ── Context overflow detection ──────────────────────────────────────────
+
+/// AND-groups of case-insensitive substrings approximating pi's
+/// OVERFLOW_PATTERNS (pi-ai dist/utils/overflow.js). Each group lists
+/// substrings that must all appear; a single-substring group is a plain
+/// literal match. Covers: Anthropic, z.ai (1261 too long), OpenAI,
+/// LiteLLM, Google, xAI, Groq, OpenRouter, Together, Copilot, llama.cpp,
+/// LM Studio, MiniMax, Kimi, Mistral, DS4, Qwen/DashScope, llama.cpp.
+const OVERFLOW_GROUPS = [_][]const []const u8{
+    &.{"prompt too long"}, // z.ai (1261)
+    &.{"prompt is too long"}, // Anthropic token overflow
+    &.{"prompt exceeds max length"}, // z.ai CN endpoint
+    &.{"request_too_large"}, // Anthropic HTTP 413 byte-size
+    &.{"input is too long for requested model"}, // Amazon Bedrock
+    &.{"exceeds the context window"}, // OpenAI
+    &.{"maximum context length"}, // OpenAI-compat / LiteLLM / OpenRouter / Together
+    &.{"context window exceeded"}, // LiteLLM pre-call check
+    &.{ "input token count", "exceeds the maximum" }, // Google
+    &.{"maximum prompt length is"}, // xAI
+    &.{"reduce the length of the messages"}, // Groq
+    &.{"exceeds the limit of"}, // GitHub Copilot
+    &.{"exceeds the available context size"}, // llama.cpp server
+    &.{"greater than the context length"}, // LM Studio
+    &.{"context window exceeds limit"}, // MiniMax
+    &.{"exceeded model token limit"}, // Kimi For Coding
+    &.{"too large for model with"}, // Mistral
+    &.{"configured context size is"}, // DS4 server
+    &.{"model_context_window_exceeded"}, // z.ai non-standard finish_reason
+    &.{"range of input length should be"}, // DashScope / Qwen Token Plan
+    &.{"context_length_exceeded"}, // OpenAI error type
+};
+
+/// Case-insensitive substring search (Zig 0.17 std has no indexOfIgnoreCase).
+fn indexOfNoCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
+        } else return i;
+    }
+    return null;
+}
+
+/// True if the provider error text matches any known context-overflow
+/// pattern (pi: isContextOverflow on the assistant error message).
+pub fn isOverflowError(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (OVERFLOW_GROUPS) |group| {
+        var all = true;
+        for (group) |pat| {
+            if (indexOfNoCase(text, pat) == null) {
+                all = false;
+                break;
+            }
+        }
+        if (all) return true;
+    }
+    return false;
 }
 
 // ── File tracking ───────────────────────────────────────────────────

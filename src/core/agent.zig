@@ -520,6 +520,8 @@ pub const Session = struct {
         try self.appendAndRecord(&user_msg);
 
         var rounds: usize = 0;
+        // One overflow-recovery attempt per run (pi _overflowRecoveryAttempted).
+        var overflow_recovered = false;
         while (rounds < self.max_tool_rounds) : (rounds += 1) {
             // Auto-compact before building the request if context is large.
             try self.maybeAutoCompact();
@@ -557,6 +559,18 @@ pub const Session = struct {
             ) catch |e| {
                 if (e == error.Aborted) {
                     self.finalizeAbortedRound(&text_buf, &thinking_buf, &tool_calls);
+                } else if (!overflow_recovered and compact.isOverflowError(self.provider.lastErrorText())) {
+                    // Context overflow recovery (pi _checkCompaction →
+                    // _runAutoCompaction("overflow", willRetry=true)): the
+                    // failed request produced no assistant message (pi omits
+                    // it), so compact and retry the same round exactly once.
+                    overflow_recovered = true;
+                    text_buf.deinit();
+                    thinking_buf.deinit();
+                    tool_calls.deinit();
+                    self.emit(.tool_info, "\n[auto-compact: context overflow — compacting and retrying]\n");
+                    _ = self.runCompaction(null) catch {};
+                    continue; // rebuild wire messages against the compacted context
                 } else {
                     // Keep what streamed before the failure on screen.
                     self.recordText(.thinking, thinking_buf.items);

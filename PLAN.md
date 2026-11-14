@@ -28,21 +28,23 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 
 ### 1. Agent 核心循环
 
+> 2026-11 复核：原表大量条目早已落地（steering/follow-up/usage/中断/重试/并行工具等在后续阶段实现），本轮按源码逐项核实并更新。
+
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
 | prompt → LLM → tools → LLM 循环 | ✅ | ✅ | 上限 50 轮 |
-| 流式输出（text delta） | ✅ | ✅ | SSE 解析 |
+| 流式输出（text delta） | ✅ | ✅ | SSE 逐行解析（包级节奏） |
 | 流式 tool_call 增量合并 | ✅ | ✅ | index 合并 |
-| thinking/reasoning 块 | ✅ | ❌ | `reasoning_content` 等字段目前被丢弃；需 thinking block + 回放签名 |
-| thinking 级别 (off…max) + thinkingLevelMap | ✅ | ❌ | 含 `:level` 模型后缀、预算 clamp |
-| steering（运行中插话，引导下一轮） | ✅ | ❌ | Enter 队列，当前 turn 后注入 |
-| follow-up（排队到任务结束后执行） | ✅ | ❌ | Alt+Enter 队列 |
-| 中断（Escape / Ctrl+C 优雅停止） | ✅ | ❌ | 需停止 HTTP 流 + 消息回队列 |
-| usage/cost 统计（input/output/cache/cost） | ✅ | ❌ | 每 assistant 消息带 usage |
-| token 估算与上下文水位显示 | ✅ | ❌ | 页脚 context % |
-| provider 错误重试（429/503 指数退避） | ✅ | ❌ | |
-| 上下文溢出恢复（compact-and-retry） | ✅ | ❌ | |
-| 并行工具执行 | codemode | ❌ | 基础版可先做顺序执行保持 |
+| thinking/reasoning 块 | ✅ | ✅ | reasoning_content/reasoning/reasoning_text 三形态；TUI Ctrl+T 折叠 |
+| thinking 级别 + thinkingLevelMap | ✅ | ⚠️ | off…xhigh 循环（shift+tab）+ reasoning_effort 发送 + 模型默认级别；缺 `--thinking` CLI、`provider/model:level` 后缀、zai/qwen thinkingFormat 映射 |
+| steering（运行中插话） | ✅ | ✅ | Enter 队列；每轮 LLM 请求前注入（drainSteeringIntoContext） |
+| follow-up（任务结束后续跑） | ✅ | ✅ | Alt+Enter 队列（运行中）；空闲时 = 普通提交（pi handleFollowUp 尾分支） |
+| 中断（Escape / Ctrl+C） | ✅ | ✅ | HTTP 流停止；已流出 thinking/text 保留；未执行 tool_call 补 "aborted by user" 错误结果（wire 合法） |
+| usage/cost 统计 | ✅ | ✅ | stream_options.include_usage；input/output/cached/cost 累计 |
+| token 估算与上下文水位 | ✅ | ✅ | 页脚 `x.x%/窗口`（70%/90% 变色） |
+| provider 错误重试 | ✅ | ✅ | 429/408/5xx + 传输错误，250/500ms 指数退避，有输出不重试 |
+| 上下文溢出恢复（compact-and-retry） | ✅ | ✅ | provider 错误文本捕获 + 20 组溢出模式检测（pi OVERFLOW_PATTERNS 近似）→ 强制压缩 → 单次恢复重试；shouldCompact 小窗口下溢防护；单条消息超窗（cut=0）优雅报错 |
+| 并行工具执行 | ✅ | ✅ | Thread.spawn 并行 + 按 call id 重排 |
 
 ### 2. 上下文组装
 

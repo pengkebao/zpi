@@ -28,6 +28,14 @@ pub const OpenAiProvider = struct {
     base_url: []u8,
     api_key: []const u8,
     client: std.http.Client,
+    /// Last HTTP error body (truncated) for overflow detection
+    /// (pi reads the failed assistant error message; we keep the raw text).
+    last_error_buf: [2048]u8 = undefined,
+    last_error_len: usize = 0,
+
+    pub fn lastErrorText(self: *const OpenAiProvider) []const u8 {
+        return self.last_error_buf[0..self.last_error_len];
+    }
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, base_url: []const u8, api_key: []const u8) !OpenAiProvider {
         return .{
@@ -129,8 +137,17 @@ pub const OpenAiProvider = struct {
         if (response.head.status != .ok) {
             var rbuf: [4096]u8 = undefined;
             var reader = response.reader(&rbuf);
-            const err_body = reader.readAllocAll(self.alloc, 8192) catch &[_]u8{};
+            // Read to EOF via fixed buffer: readAllocAll can error out on
+            // short keep-alive responses (empty bodies break detection).
+            var ebuf: [4096]u8 = undefined;
+            const elen: usize = reader.readSliceShort(&ebuf) catch 0;
+            const err_body: []const u8 = self.alloc.dupe(u8, ebuf[0..elen]) catch &[_]u8{};
             defer if (err_body.len > 0) self.alloc.free(err_body);
+            // Keep the body for the agent's overflow detector.
+            self.last_error_len = @min(err_body.len, self.last_error_buf.len);
+            if (self.last_error_len > 0) {
+                @memcpy(self.last_error_buf[0..self.last_error_len], err_body[0..self.last_error_len]);
+            }
             std.debug.print("error: HTTP {d}\n", .{@as(u16, @intFromEnum(response.head.status))});
             if (err_body.len > 0) {
                 std.debug.print("{s}\n", .{err_body});

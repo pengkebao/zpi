@@ -664,3 +664,27 @@ test "kitty: ctrl+shift+enter (mod 6) is still shift_enter" {
     const k = keys.parseKey("\x1b[13;6u") orelse return error.NoKey;
     try std.testing.expect(k == .shift_enter);
 }
+
+test "compaction.isOverflowError matches pi OVERFLOW_PATTERNS subset" {
+    const c = @import("src/core/compaction.zig");
+    // Anthropic / z.ai
+    try std.testing.expect(c.isOverflowError("prompt is too long: 213462 tokens > 200000 maximum"));
+    try std.testing.expect(c.isOverflowError("{\"code\":\"1261\",\"message\":\"Prompt too long\"}"));
+    try std.testing.expect(c.isOverflowError("Prompt exceeds max length"));
+    // OpenAI / LiteLLM / OpenRouter
+    try std.testing.expect(c.isOverflowError("Your input exceeds the context window of this model"));
+    try std.testing.expect(c.isOverflowError("This model's maximum context length is 131072 tokens. However, you requested 537812 tokens"));
+    try std.testing.expect(c.isOverflowError("litellm.ContextWindowExceededError: Context Window exceeded"));
+    try std.testing.expect(c.isOverflowError("Input length (265330) exceeds model's maximum context length (262144)."));
+    // Google / xAI / Groq
+    try std.testing.expect(c.isOverflowError("The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)"));
+    try std.testing.expect(c.isOverflowError("This model's maximum prompt length is 131072 but the request contains 537812 tokens"));
+    try std.testing.expect(c.isOverflowError("Please reduce the length of the messages or completion"));
+    // error-type JSON forms
+    try std.testing.expect(c.isOverflowError("{\"error\":{\"type\":\"context_length_exceeded\"}}"));
+    try std.testing.expect(c.isOverflowError("{\"error\":{\"type\":\"request_too_large\"}}"));
+    // non-overflow errors must not match
+    try std.testing.expect(!c.isOverflowError("rate limit exceeded, retry later"));
+    try std.testing.expect(!c.isOverflowError("connection refused"));
+    try std.testing.expect(!c.isOverflowError(""));
+}
