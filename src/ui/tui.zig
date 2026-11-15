@@ -473,12 +473,18 @@ pub const TUI = struct {
     ms_visible: usize = 0,
     ms_sel: usize = 0,
     ms_scope_all: bool = true,
+    /// /mcp manager viewport start (sel_rows are the FULL list; the manager
+    /// does not use the autocomplete projection).
+    mcp_view_start: usize = 0,
     /// /thinking selector state: visible level indices + selection.
     ts_levels: [7]config.ThinkingLevel = undefined,
     ts_visible: usize = 0,
     ts_sel: usize = 0,
     /// /scoped-models: dirty flag (changes applied live; Ctrl+S persists).
     scoped_dirty: bool = false,
+    /// Set by modal open/close paths: the next redraw hard-clears instead of
+    /// diffing (large view-height swings leave stale rows behind otherwise).
+    force_full_repaint: bool = false,
     /// Backed settings fields (see settingsApply).
     skill_commands: bool = true,
     steering_mode_all: bool = true,
@@ -1502,7 +1508,7 @@ pub const TUI = struct {
                 var clean = std.array_list.Managed(u8).init(self.alloc);
                 defer clean.deinit();
                 clean.appendSlice(if (selected) "\u{2192} " else "  ") catch return;
-                if (selected) clean.appendSlice(accent) catch return;
+                if (selected) clean.appendSlice(ACCENT) catch return;
                 clean.appendSlice(if (self.isCurrentModel(idx)) "\u{2713} " else "  ") catch return;
                 clean.appendSlice(m.id) catch return;
                 clean.appendSlice(reset) catch return;
@@ -2559,8 +2565,8 @@ pub const TUI = struct {
         var h: usize = 2; // blank + title
         if (self.menu_mode == .mcp_server) h += 3; // command / scope file / State
         if (self.menu_mode == .mcp_tools) h += 1; // Exposure details
-        h += @min(self.menu_len, 10);
-        if (self.menu_len > 10) h += 1;
+        h += @min(self.sel_len, 12);
+        if (self.sel_len > 12) h += 1;
         if (self.menu_mode == .mcp_server or self.menu_mode == .mcp_tools) h += 1; // blank before hint
         h += 1; // hint
         return h;
@@ -3458,6 +3464,13 @@ pub const TUI = struct {
     pub fn redrawLocked(self: *TUI) void {
         // A resize (or lost SIGWINCH after suspend) repaints everything at
         // the fresh size; the rest of this function just renders normally.
+        if (self.force_full_repaint) {
+            self.force_full_repaint = false;
+            for (self.prev_lines.items) |l| self.alloc.free(l);
+            self.prev_lines.clearRetainingCapacity();
+            self.prev_transcript_h = 0;
+            self.writeRaw("\x1b[2J");
+        }
         _ = self.refreshSize();
 
         // Render the editor (wrapped visual lines) first to know its height.
@@ -3500,6 +3513,7 @@ pub const TUI = struct {
         // MCP manager chrome: title(+details) + items + hint inside borders.
         const mcp_h: usize = if (self.menu_mode == .mcp or self.menu_mode == .mcp_server or
             self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure) self.mcpViewHeight() else 0;
+        std.debug.print("[BF] mode={s} menu_h={d} mcp_h={d} menu_len={d} sel={d}\n", .{ @tagName(self.menu_mode), menu_h, mcp_h, self.menu_len, self.menu_selected });
         // The "(sel/total)" scroll-indicator row renders under the menu rows
         // (pi SelectList.render appends it after the items) and must be part
         // of the bottom budget — without it the frame is one row taller than
@@ -3661,14 +3675,36 @@ pub const TUI = struct {
             self.renderMcpHeader(&frame, editor_h);
             const mcp_items = mcp_h -| 2; // title(+details) row(s) already added; items+hint below
             _ = mcp_items;
-            for (0..@min(self.menu_len, 10)) |v| {
-                const ml_raw = self.menuLine(v, self.width, 12, 32) catch return;
-                const ml = truncateToWidth(self.alloc, ml_raw, self.width) catch return;
-                self.alloc.free(ml_raw);
-                frame.append(self.alloc, ml) catch return;
+            const visible_items = @min(self.menu_len, 12);
+            const start: usize = if (self.menu_selected >= visible_items)
+                @min(self.menu_selected -| visible_items / 2, self.menu_len -| visible_items)
+            else
+                0;
+            // Render item rows directly from sel_rows (single viewport —
+            // menuLine's menu_view_start path would double-offset here).
+            for (0..visible_items) |v| {
+                const row_i = start + v;
+                if (row_i >= self.menu_len) break;
+                const r = &self.sel_rows[row_i];
+                const selected = row_i == self.menu_selected;
+                var clean = std.array_list.Managed(u8).init(self.alloc);
+                defer clean.deinit();
+                clean.appendSlice(if (selected) "\u{2192} " else "  ") catch return;
+                if (selected) clean.appendSlice(ACCENT) catch return;
+                const nm = r.name[0..r.name_len];
+                const ds = r.desc[0..r.desc_len];
+                const nm_w = wmod.visualWidth(nm);
+                clean.appendSlice(nm) catch return;
+                clean.appendSlice(ansi.RESET) catch return;
+                // Two-column: pad name to 24 then desc in muted.
+                if (nm_w < 24) clean.appendSlice((SPACES48)[0..@min(24 - nm_w, 24)]) catch return;
+                clean.appendSlice(FG_MUTED) catch return;
+                clean.appendSlice(ds) catch return;
+                clean.appendSlice(ansi.RESET) catch return;
+                frame.append(self.alloc, clean.toOwnedSlice() catch return) catch return;
             }
-            if (self.menu_len > 10) {
-                const cnt = std.fmt.allocPrint(self.alloc, "  {s}({d}/{d}){s}", .{ FG_MUTED, self.menu_selected + 1, self.menu_len, ansi.RESET }) catch return;
+            if (self.sel_len > visible_items) {
+                const cnt = std.fmt.allocPrint(self.alloc, "  {s}({d}/{d}){s}", .{ FG_MUTED, self.menu_selected + 1, self.sel_len, ansi.RESET }) catch return;
                 frame.append(self.alloc, cnt) catch return;
             }
             self.renderMcpFooter(&frame);
@@ -5628,6 +5664,8 @@ pub const TUI = struct {
     /// Open the servers menu (pi serversMenu): rows sorted by state
     /// attention, description = state · exposure · scope.
     fn openMcpManager(self: *TUI) void {
+        self.force_full_repaint = true;
+        self.mcp_view_start = 0;
         const mgr = mcp.Manager.getGlobal() orelse return;
         self.menu_mode = .mcp;
         self.menu_selected = 0;
@@ -5675,6 +5713,7 @@ pub const TUI = struct {
     /// tools/reconnect/sign-out/exposure/disable, with transport/scope/state
     /// details.
     fn openMcpServerMenu(self: *TUI, name: []const u8) void {
+        self.force_full_repaint = true;
         const mgr = mcp.Manager.getGlobal() orelse return;
         const srv = mgr.findByName(name) orelse return;
         self.mcpSetServer(name);
@@ -5712,12 +5751,14 @@ pub const TUI = struct {
         }
         self.sel_len = row;
         self.menu_selected = 0;
-        self.refreshSelMenu();
+        self.mcp_view_start = 0;
+        self.menu_len = self.sel_len;
     }
 
     /// The server's tool list (pi showTools): name + first description line;
     /// Enter goes back.
     fn openMcpToolsMenu(self: *TUI) void {
+        self.force_full_repaint = true;
         const mgr = mcp.Manager.getGlobal() orelse return;
         const srv = mgr.findByName(self.mcpServerName()) orelse return;
         self.menu_mode = .mcp_tools;
@@ -5736,12 +5777,14 @@ pub const TUI = struct {
             self.sel_len += 1;
         }
         self.menu_selected = 0;
-        self.refreshSelMenu();
+        self.mcp_view_start = 0;
+        self.menu_len = self.sel_len;
     }
 
     /// Exposure choice list (pi chooseExposure): all four values, the
     /// current one marked ✓.
     fn openMcpExposureMenu(self: *TUI) void {
+        self.force_full_repaint = true;
         const mgr = mcp.Manager.getGlobal() orelse return;
         const srv = mgr.findByName(self.mcpServerName()) orelse return;
         const current = srv.exposure orelse "codemode";
@@ -6006,6 +6049,7 @@ pub const TUI = struct {
 
     /// ESC in the /mcp manager: back one level (servers menu closes).
     fn mcpMenuCancel(self: *TUI) void {
+        self.force_full_repaint = true;
         switch (self.menu_mode) {
             .mcp_server, .mcp_tools, .mcp_exposure => self.openMcpManager(),
             else => self.menu_mode = .hidden,
@@ -7680,13 +7724,24 @@ pub const TUI = struct {
                 if (self.bindings.matches(key, .menu_up)) {
                     self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
                     // MCP manager renders its viewport from menu_view_start —
-                    // keep the selection visible (pi centers the window).
-                    if (is_mcp) self.updateMenuViewport(10);
+                    // keep the selection visible (pi centers the window) and
+                    // re-project menu_items.
+                    if (is_mcp) {
+                        if (self.menu_selected < self.mcp_view_start) {
+                            self.mcp_view_start = self.menu_selected;
+                        } else if (self.menu_selected >= self.mcp_view_start + 12) {
+                            self.mcp_view_start = self.menu_selected - 11;
+                        }
+                    }
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_down)) {
-                    self.menu_selected = if (self.menu_selected + 1 >= self.menu_len) 0 else self.menu_selected + 1;
-                    if (is_mcp) self.updateMenuViewport(10);
+                    if (self.menu_selected + 1 < self.menu_len) self.menu_selected += 1;
+                    if (is_mcp) {
+                        if (self.menu_selected >= self.mcp_view_start + 12) {
+                            self.mcp_view_start = self.menu_selected - 11;
+                        }
+                    }
                     self.redraw();
                     continue;
                 } else if (key == .page_up or key == .page_down) {
