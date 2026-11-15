@@ -3802,7 +3802,7 @@ pub const TUI = struct {
         const cursor_col: u16 = @intCast(if (1 + cursor_vis.col < self.width) 1 + cursor_vis.col else self.width);
         // diffRender adopts the frame's lines (they become the next diff
         // base); afterwards only the array itself needs releasing.
-        self.diffRender(&frame, cursor_row, cursor_col);
+        self.diffRender(&frame, cursor_row, cursor_col, mcp_modal);
         frame.deinit(self.alloc);
     }
 
@@ -4733,7 +4733,7 @@ pub const TUI = struct {
     /// and only the revealed rows are painted. Owns the frame's lines on
     /// return: they move into `prev_lines` (freed when no longer needed), so
     /// the caller must not free them.
-    fn diffRender(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), cursor_row: usize, cursor_col: u16) void {
+    fn diffRender(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), cursor_row: usize, cursor_col: u16, cursor_hidden: bool) void {
         const new_lines = frame.items;
         // The whole frame goes out as ONE write (inside synchronized output):
         // fewer syscalls, and the terminal never shows a half-applied frame.
@@ -4768,7 +4768,7 @@ pub const TUI = struct {
             frame.clearRetainingCapacity();
             self.rendered_scroll_top = self.frame_scroll_top;
             self.prev_transcript_h = th;
-            self.parkCursorInto(&frame_out, cursor_row, cursor_col);
+            self.parkCursorHidden(&frame_out, cursor_row, cursor_col, cursor_hidden);
             return;
         }
 
@@ -4895,7 +4895,7 @@ pub const TUI = struct {
         self.prev_transcript_h = th;
         self.rendered_scroll_top = self.frame_scroll_top;
 
-        self.parkCursorInto(&frame_out, cursor_row, cursor_col);
+        self.parkCursorHidden(&frame_out, cursor_row, cursor_col, cursor_hidden);
     }
 
     /// Park the hardware cursor where it belongs after a frame: hidden while
@@ -4903,10 +4903,18 @@ pub const TUI = struct {
     /// editor's cursor (pi: the cursor is positioned as the last write).
     /// Emits nothing when the park is unchanged (idle ticks stay byte-silent).
     fn parkCursorInto(self: *TUI, out: *std.ArrayListUnmanaged(u8), cursor_row: usize, cursor_col: u16) void {
+        self.parkCursorHidden(out, cursor_row, cursor_col, false);
+    }
+
+    fn parkCursorHidden(self: *TUI, out: *std.ArrayListUnmanaged(u8), cursor_row: usize, cursor_col: u16, hidden: bool) void {
         // The editor stays interactive while the agent runs (steering), so
         // the cursor parks at the editor position in every state; the dedup
-        // below keeps idle ticks silent.
-        const key: u64 = (@as(u64, 1) << 63) | (@as(u64, cursor_row) << 32) | cursor_col;
+        // below keeps idle ticks silent. A modal menu without any input
+        // focus (the MCP manager) hides the cursor instead — parking it
+        // off-frame gets clamped back onto the last screen row, where it
+        // blinks in the corner.
+        const key: u64 = (@as(u64, 1) << 63) | (@as(u64, cursor_row) << 32) | cursor_col |
+            (@as(u64, @intFromBool(hidden)) << 62);
         // ANY other bytes in this frame moved the terminal cursor, so the
         // park must be re-emitted even when the position is unchanged — a
         // frame that only painted scrollbar cells (or revealed content rows
@@ -4915,6 +4923,10 @@ pub const TUI = struct {
         // body, where the screen really still has the cursor parked.
         if (key == self.cursor_park_key and out.items.len == 0) return;
         self.cursor_park_key = key;
+        if (hidden) {
+            out.appendSlice(self.alloc, ansi.HIDE_CURSOR) catch return;
+            return;
+        }
         var mv: [16]u8 = undefined;
         const ml = ansi.moveTo(&mv, @intCast(cursor_row + 1), cursor_col);
         out.appendSlice(self.alloc, mv[0..ml]) catch return;
