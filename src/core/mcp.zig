@@ -426,7 +426,9 @@ fn connectStdio(self: *Server, cfg: ServerConfig) !void {
         teardownProcess(self);
         return error.ToolsParse;
     };
-    self.alloc.free(self.tools); // free the initial empty slice
+    // Reconnect may run over a previous successful tools/list: free each
+    // tool's strings too, not just the slice shell.
+    freeTools(self.alloc, &self.tools);
     self.tools = new_tools;
     self.connected = true;
 }
@@ -489,7 +491,7 @@ fn connectHttp(self: *Server, cfg: ServerConfig) !void {
     const list_res = httpRequest(self, "tools/list", "{}") catch return;
     defer self.alloc.free(list_res);
     const new_tools = parseTools(self.alloc, self.name, list_res) catch return;
-    self.alloc.free(self.tools); // free the initial empty slice
+    freeTools(self.alloc, &self.tools);
     self.tools = new_tools;
     self.connected = true;
 }

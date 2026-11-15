@@ -2562,7 +2562,7 @@ pub const TUI = struct {
     /// blank(server/tools only) + hint.
     fn mcpViewHeight(self: *TUI) usize {
         var h: usize = 2; // blank + title
-        if (self.menu_mode == .mcp_server) h += 3; // command / scope file / State
+        if (self.menu_mode == .mcp_server) h += 2; // scope file / State
         if (self.menu_mode == .mcp_tools) h += 1; // Exposure details
         h += @min(self.sel_len, MCP_MAX_VISIBLE);
         if (self.sel_len > MCP_MAX_VISIBLE) h += 1;
@@ -2589,18 +2589,14 @@ pub const TUI = struct {
         const t = std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ accent, title, reset }) catch return;
         frame.append(self.alloc, t) catch return;
         if (self.menu_mode == .mcp_server) {
-            // pi serverMenu details: command line, scope mcp.json, State.
+            // pi serverMenu details: scope mcp.json, State. (Transport
+            // command line omitted: the local runtime may not exist.)
             const name = self.mcpServerName();
             if (mcp.Manager.getGlobal()) |mgr| {
                 if (mgr.findByName(name)) |srv| {
-                    if (srv.command) |cmd| {
-                        if (cmd.len > 0) {
-                            const d1 = std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ muted, cmd, reset }) catch return;
-                            frame.append(self.alloc, d1) catch return;
-                        }
-                    }
                     const d2 = std.fmt.allocPrint(self.alloc, "{s}global: {s}/mcp.json{s}", .{ muted, self.cfg.?.base_dir, reset }) catch return;
                     frame.append(self.alloc, d2) catch return;
+                    _ = srv;
                 }
             }
             var st_buf: [64]u8 = undefined;

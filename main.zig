@@ -366,6 +366,7 @@ fn trustReloadCb(ctx_ptr: *anyopaque, t: *tui.TUI, trusted: bool) void {
         mgr.auth_path = std.fmt.allocPrint(alloc, "{s}/mcp-auth.json", .{ctx.cfg.base_dir}) catch break :blk;
         mcp.Manager.setGlobal(mgr);
         const cfgs = mcp.loadConfig(alloc, ctx.io, ctx.user_mcp, ctx.proj_mcp) catch break :blk;
+        defer mcp.freeConfigs(alloc, cfgs); // rememberConfigs keeps its own dupe
         mgr.rememberConfigs(cfgs);
         mgr.connectAll(cfgs);
         _ = mgr.registerTools(ctx.registry);
