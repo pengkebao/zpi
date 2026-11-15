@@ -3513,7 +3513,6 @@ pub const TUI = struct {
         // MCP manager chrome: title(+details) + items + hint inside borders.
         const mcp_h: usize = if (self.menu_mode == .mcp or self.menu_mode == .mcp_server or
             self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure) self.mcpViewHeight() else 0;
-        std.debug.print("[BF] mode={s} menu_h={d} mcp_h={d} menu_len={d} sel={d}\n", .{ @tagName(self.menu_mode), menu_h, mcp_h, self.menu_len, self.menu_selected });
         // The "(sel/total)" scroll-indicator row renders under the menu rows
         // (pi SelectList.render appends it after the items) and must be part
         // of the bottom budget — without it the frame is one row taller than
