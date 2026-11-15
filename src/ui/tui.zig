@@ -2551,52 +2551,68 @@ pub const TUI = struct {
         frame.append(self.alloc, ftext.toOwnedSlice() catch return) catch return;
     }
 
-    /// MCP manager view height: header rows + items + count + footer.
+    /// MCP manager view rows inside the borders (must match
+    /// renderMcpHeader/renderMcpFooter exactly): blank + title +
+    /// details(server: 3 rows / tools: 1) + items(viewport 10) + count +
+    /// blank(server/tools only) + hint.
     fn mcpViewHeight(self: *TUI) usize {
-        var h: usize = 1; // title
-        if (self.menu_mode == .mcp_server) h += 1; // details line
-        if (self.menu_mode == .mcp_tools) h += 1; // details line
+        var h: usize = 2; // blank + title
+        if (self.menu_mode == .mcp_server) h += 3; // command / scope file / State
+        if (self.menu_mode == .mcp_tools) h += 1; // Exposure details
         h += @min(self.menu_len, 10);
         if (self.menu_len > 10) h += 1;
+        if (self.menu_mode == .mcp_server or self.menu_mode == .mcp_tools) h += 1; // blank before hint
         h += 1; // hint
         return h;
     }
 
-    /// MCP manager header: title + (server/tools) details line.
+    /// MCP manager header: blank + title + details (server: command /
+    /// scope file / State; tools: Exposure description).
     fn renderMcpHeader(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), editor_h: usize) void {
         _ = editor_h;
         const muted = FG_MUTED;
         const accent = "\x1b[38;2;167;152;215m";
         const reset = ansi.RESET;
         frame.append(self.alloc, "") catch return;
+        var title_buf: [128]u8 = undefined;
         const title: []const u8 = switch (self.menu_mode) {
             .mcp => "MCP servers",
-            .mcp_server => blk: {
-                break :blk std.fmt.allocPrint(self.alloc, "MCP server {s}", .{self.mcpServerName()}) catch "MCP server";
-            },
-            .mcp_tools => blk: {
-                break :blk std.fmt.allocPrint(self.alloc, "Tools of {s}", .{self.mcpServerName()}) catch "Tools";
-            },
+            .mcp_server => std.fmt.bufPrint(&title_buf, "MCP server {s}", .{self.mcpServerName()}) catch "MCP server",
+            .mcp_tools => std.fmt.bufPrint(&title_buf, "Tools of {s}", .{self.mcpServerName()}) catch "Tools",
             else => "Exposure",
         };
         const t = std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ accent, title, reset }) catch return;
         frame.append(self.alloc, t) catch return;
         if (self.menu_mode == .mcp_server) {
-            // pi details: `State: <describeState>` from the selected server.
+            // pi serverMenu details: command line, scope mcp.json, State.
             const name = self.mcpServerName();
+            if (mcp.Manager.getGlobal()) |mgr| {
+                if (mgr.findByName(name)) |srv| {
+                    if (srv.command) |cmd| {
+                        if (cmd.len > 0) {
+                            const d1 = std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ muted, cmd, reset }) catch return;
+                            frame.append(self.alloc, d1) catch return;
+                        }
+                    }
+                    const d2 = std.fmt.allocPrint(self.alloc, "{s}global: {s}/mcp.json{s}", .{ muted, self.cfg.?.base_dir, reset }) catch return;
+                    frame.append(self.alloc, d2) catch return;
+                }
+            }
             var st_txt: []const u8 = "disconnected";
             if (mcp.Manager.getGlobal()) |mgr| {
                 if (mgr.findByName(name)) |srv| {
                     if (!srv.enabled) {
                         st_txt = "disabled";
                     } else if (srv.connected) {
-                        st_txt = std.fmt.allocPrint(self.alloc, "connected \u{b7} {d} tool{s}", .{ srv.tools.len, if (srv.tools.len == 1) "" else "s" }) catch "connected";
-                    } else {
-                        st_txt = "disconnected";
+                        st_txt = std.fmt.allocPrint(self.alloc, "connected \u{b7} {d} tools", .{srv.tools.len}) catch "connected";
                     }
                 }
             }
-            const d = std.fmt.allocPrint(self.alloc, "  {s}State: {s}{s}", .{ muted, st_txt, reset }) catch return;
+            const d3 = std.fmt.allocPrint(self.alloc, "{s}State: {s}{s}", .{ muted, st_txt, reset }) catch return;
+            frame.append(self.alloc, d3) catch return;
+        }
+        if (self.menu_mode == .mcp_tools) {
+            const d = std.fmt.allocPrint(self.alloc, "{s}Exposure direct: tools are registered with the model{s}", .{ muted, reset }) catch return;
             frame.append(self.alloc, d) catch return;
         }
     }
@@ -3450,7 +3466,12 @@ pub const TUI = struct {
         // frame prepend the prompt prefix.
         const settings_search = self.menu_mode == .settings;
         const modal_search = settings_search or self.menu_mode == .model_selector or self.menu_mode == .thinking_selector;
-        const ed_width: usize = if (modal_search) (if (self.width > 2) self.width - 2 else 1) else self.width;
+        // MCP manager modal (pi ui.menu): replaces the editor line entirely.
+        const mcp_modal = switch (self.menu_mode) {
+            .mcp, .mcp_server, .mcp_tools, .mcp_exposure => true,
+            else => false,
+        };
+        const ed_width: usize = if (mcp_modal) self.width else if (modal_search) (if (self.width > 2) self.width - 2 else 1) else self.width;
         var ed = self.editor.render(ed_width) catch return;
         var ed_consumed = false;
         errdefer {
@@ -3460,7 +3481,7 @@ pub const TUI = struct {
             }
         }
         const visual_total = ed.items.len;
-        const editor_h = if (visual_total < self.maxEditorHeight()) visual_total else self.maxEditorHeight();
+        const editor_h = if (mcp_modal) 0 else if (visual_total < self.maxEditorHeight()) visual_total else self.maxEditorHeight();
         const cursor_vis_raw = self.editor.cursorVisualPos(ed_width);
         var cursor_vis = self.editor.cursorVisualPos(self.width);
         cursor_vis.row = cursor_vis_raw.row;
@@ -3585,6 +3606,11 @@ pub const TUI = struct {
         // the Input-component prompt prefix ("> " first line, two spaces on
         // wrapped continuation lines).
         for (ed.items[vis_top..end], 0..) |line, vi| {
+            if (mcp_modal) {
+                // MCP modal: no editor line (pi ui.menu replaces it).
+                self.alloc.free(line);
+                continue;
+            }
             if (!modal_search) {
                 frame.append(self.alloc, line) catch return;
             } else {
@@ -3732,7 +3758,10 @@ pub const TUI = struct {
         // The menu renders below the editor (pi editor.render: autocomplete
         // after the bottom border), so the editor row is transcript_h +
         // top border + row — menu_h no longer shifts it.
-        const cursor_row = transcript_h + 1 + (cursor_vis.row - vis_top);
+        const cursor_row = if (mcp_modal)
+            transcript_h + self.height // park off-frame (pi shows no cursor in the manager)
+        else
+            transcript_h + 1 + (cursor_vis.row - vis_top);
         const cursor_col: u16 = @intCast(if (1 + cursor_vis.col < self.width) 1 + cursor_vis.col else self.width);
         // diffRender adopts the frame's lines (they become the next diff
         // base); afterwards only the array itself needs releasing.
@@ -7650,10 +7679,14 @@ pub const TUI = struct {
                 // move by one page (clamped to the bounds).
                 if (self.bindings.matches(key, .menu_up)) {
                     self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
+                    // MCP manager renders its viewport from menu_view_start —
+                    // keep the selection visible (pi centers the window).
+                    if (is_mcp) self.updateMenuViewport(10);
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_down)) {
                     self.menu_selected = if (self.menu_selected + 1 >= self.menu_len) 0 else self.menu_selected + 1;
+                    if (is_mcp) self.updateMenuViewport(10);
                     self.redraw();
                     continue;
                 } else if (key == .page_up or key == .page_down) {
