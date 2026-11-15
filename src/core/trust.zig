@@ -243,7 +243,7 @@ pub fn hasTrustRequiringResources(
         if (pathExists(io, p)) return true;
     }
     // .agents/skills in cwd or any ancestor (except the user's own).
-    var current_buf = alloc.dupe(u8, cwd) catch return false;
+    const current_buf = alloc.dupe(u8, cwd) catch return false;
     defer alloc.free(current_buf);
     var current: []const u8 = current_buf;
     while (true) {
@@ -261,12 +261,9 @@ pub fn hasTrustRequiringResources(
         }
         const parent = std.fs.path.dirname(current) orelse return false;
         if (std.mem.eql(u8, parent, current)) return false;
-        // copy parent into our owned buffer
-        if (parent.len > current_buf.len) {
-            current_buf = alloc.realloc(current_buf, parent.len) catch return false;
-        }
-        @memcpy(current_buf[0..parent.len], parent);
-        current = current_buf[0..parent.len];
+        // dirname(current) IS a prefix slice of current_buf — just shorten
+        // (a @memcpy of the prefix onto itself is an aliasing error).
+        current = current[0..parent.len];
     }
 }
 
@@ -341,6 +338,13 @@ pub fn optionsFor(alloc: std.mem.Allocator, cwd: []const u8) ![]TrustOption {
 // ---- tests ----
 
 const testing = std.testing;
+var t_threaded: ?std.Io.Threaded = null;
+fn tIo() std.Io {
+    if (t_threaded == null) {
+        t_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    }
+    return t_threaded.?.io();
+}
 
 test "canonicalize resolves relative paths" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -361,6 +365,31 @@ test "optionsFor includes all five choices" {
     try testing.expectEqualStrings("Do not trust (this session only)", opts[4].label);
     try testing.expect(opts[2].saved_path == null); // session-only never writes
     try testing.expect(opts[4].trusted == false);
+}
+
+test "hasTrustRequiringResources walks ancestors without aliasing" {
+    const io = tIo();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [1024]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    // no .pi anywhere in the tmp tree; pass the REAL home so the user's
+    // ~/.agents/skills (if present) is excluded like production does —
+    // otherwise every ancestor walk finds $HOME/.agents/skills and gates.
+    const home_c = std.c.getenv("HOME") orelse "/nonexistent";
+    const home = std.mem.span(home_c);
+    try testing.expectEqual(false, hasTrustRequiringResources(alloc, io, root, home));
+    // .pi/skills at an ANCESTOR of the cwd gates it (project .agents/skills
+    // and cwd/.pi are the same check family — exercise the ancestor walk).
+    const nested = try std.fmt.allocPrint(alloc, "{s}/a/b/c", .{root});
+    std.Io.Dir.cwd().createDirPath(io, nested) catch {};
+    const agents = try std.fmt.allocPrint(alloc, "{s}/a/.agents/skills", .{root});
+    std.Io.Dir.cwd().createDirPath(io, agents) catch {};
+    try testing.expectEqual(true, hasTrustRequiringResources(alloc, io, nested, home));
 }
 
 test "store set/get/inherit roundtrip" {
