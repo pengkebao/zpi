@@ -632,6 +632,13 @@ pub const TUI = struct {
     /// Recompute the completion menu from the current editor text. Skipped
     /// when the text has not changed since the last build (navigation only
     /// moves the selection; pi updateAutocomplete semantics).
+    fn freeMenuTextCache(self: *TUI) void {
+        if (self.menu_text_cache) |c| {
+            self.alloc.free(c);
+            self.menu_text_cache = null;
+        }
+    }
+
     pub fn updateMenu(self: *TUI) void {
         // Modal dialogs (settings, session/tree/fork pickers, the /mcp
         // manager, scoped-models) are not driven by editor text.
@@ -1388,7 +1395,7 @@ pub const TUI = struct {
         self.settings_sel = 0;
         self.menu_mode = .settings;
         self.editor.clear() catch {};
-        self.menu_text_cache = null;
+        self.freeMenuTextCache();
         self.redraw();
     }
 
@@ -2073,7 +2080,7 @@ pub const TUI = struct {
         }
         self.modelSelectorRefilter();
         self.ms_sel = 0;
-        self.menu_text_cache = null;
+        self.freeMenuTextCache();
         self.redraw();
     }
 
