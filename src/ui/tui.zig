@@ -477,6 +477,9 @@ pub const TUI = struct {
     ts_levels: [7]config.ThinkingLevel = undefined,
     ts_visible: usize = 0,
     ts_sel: usize = 0,
+    /// /scoped-models: snapshot at open (Esc restores it) + dirty flag.
+    scoped_snapshot: ?std.ArrayListUnmanaged([]u8) = null,
+    scoped_dirty: bool = false,
     /// Backed settings fields (see settingsApply).
     skill_commands: bool = true,
     steering_mode_all: bool = true,
@@ -2080,6 +2083,32 @@ pub const TUI = struct {
         self.redraw();
     }
 
+    fn freeScopedList(self: *TUI, list_ptr: *?std.ArrayListUnmanaged([]u8)) void {
+        if (list_ptr.*) |*list| {
+            for (list.items) |id| self.alloc.free(id);
+            list.deinit(self.alloc);
+            list_ptr.* = null;
+        }
+    }
+
+    /// pi enabledModels patterns: "provider/id" exact, "provider/*" prefix.
+    fn patternMatches(pattern: []const u8, full_id: []const u8) bool {
+        if (std.mem.endsWith(u8, pattern, "*")) {
+            return std.mem.startsWith(u8, full_id, pattern[0 .. pattern.len - 1]);
+        }
+        return std.mem.eql(u8, pattern, full_id);
+    }
+
+    fn copyScopedList(self: *TUI, src: ?std.ArrayListUnmanaged([]u8)) ?std.ArrayListUnmanaged([]u8) {
+        const src_list = src orelse return null;
+        var out = std.ArrayListUnmanaged([]u8).empty;
+        for (src_list.items) |id| {
+            const dup = self.alloc.dupe(u8, id) catch continue;
+            out.append(self.alloc, dup) catch self.alloc.free(dup);
+        }
+        return out;
+    }
+
     /// pi ScopedModelsSelector.isEnabled: null = all enabled.
     fn modelScoped(self: *TUI, idx: usize) []const u8 {
         if (self.scoped_models == null) return "\u{2713} enabled";
@@ -2089,13 +2118,23 @@ pub const TUI = struct {
     fn isModelScoped(self: *TUI, idx: usize) bool {
         const cfg = self.cfg orelse return true;
         if (idx >= cfg.models.items.len) return true;
-        const list = &(self.scoped_models orelse return true);
         var fbuf: [256]u8 = undefined;
         const full = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ cfg.models.items[idx].provider, cfg.models.items[idx].id }) catch return true;
-        for (list.items) |id| {
-            if (std.mem.eql(u8, id, full)) return true;
+        // Session list wins (open selector edits it live).
+        if (self.scoped_models) |*list| {
+            for (list.items) |id| {
+                if (std.mem.eql(u8, id, full)) return true;
+            }
+            return false;
         }
-        return false;
+        // Persisted patterns (pi enabledModels): null = all enabled.
+        if (cfg.enabled_models) |pats| {
+            for (pats) |pat| {
+                if (patternMatches(pat, full)) return true;
+            }
+            return false;
+        }
+        return true;
     }
 
     fn toggleScopedModel(self: *TUI, idx: usize) void {
@@ -2377,12 +2416,125 @@ pub const TUI = struct {
         self.note("\x1b[90mSet as default model: {s}/{s}\x1b[0m", .{ m.provider, m.id });
     }
 
+    /// Frame rows for the scoped-models selector chrome: blank + title +
+    /// session-only line + blank ... (items are the editor-adjacent menu
+    /// rows rendered separately) ... blank + footer (+ unsaved warning).
+    fn scopedViewHeight(self: *TUI) usize {
+        var h: usize = 4; // blank + title + session-only + blank
+        const rows = @min(self.menu_len, 10);
+        h += rows;
+        if (self.menu_len > rows) h += 1; // (n/total)
+        h += 2; // blank + Model Name
+        h += 1; // footer
+        return h;
+    }
+
+    fn renderScopedChrome(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        const muted = FG_MUTED;
+        const accent = "\x1b[38;2;167;152;215m";
+        const warn = "\x1b[38;2;222;147;95m";
+        const reset = ansi.RESET;
+        frame.append(self.alloc, "") catch return;
+        const title = std.fmt.allocPrint(self.alloc, "{s}\x1b[1mModel Configuration{s}", .{ accent, reset }) catch return;
+        frame.append(self.alloc, title) catch return;
+        const so = std.fmt.allocPrint(self.alloc, "{s}Session-only. Ctrl+S to save to settings.{s}", .{ muted, reset }) catch return;
+        frame.append(self.alloc, so) catch return;
+        frame.append(self.alloc, "") catch return;
+        // Item rows (pi ScopedModelsSelector.updateList): enabled first
+        // (scoped list order), then disabled; ✓ accent when enabled.
+        var shown: usize = 0;
+        const visible_rows = @min(self.menu_len, 10);
+        const start = self.menu_view_start;
+        var scroll_needed = false;
+        while (shown < visible_rows) : (shown += 1) {
+            const row_i = start + shown;
+            if (row_i >= self.menu_len) break;
+            const e2 = self.menu_items[row_i];
+            const selected = row_i == self.menu_selected;
+            var clean = std.array_list.Managed(u8).init(self.alloc);
+            defer clean.deinit();
+            clean.appendSlice(if (selected) "\u{2192} " else "  ") catch return;
+            if (selected) clean.appendSlice(accent) catch return;
+            clean.appendSlice(if (self.isModelScoped(e2.model_idx orelse 0)) "\u{2713} " else "  ") catch return;
+            clean.appendSlice(e2.name) catch return;
+            clean.appendSlice(reset) catch return;
+            clean.appendSlice(muted) catch return;
+            if (e2.model_idx) |mi| {
+                if (self.cfg) |cc| {
+                    if (mi < cc.models.items.len) {
+                        clean.appendSlice(" [") catch return;
+                        clean.appendSlice(cc.models.items[mi].provider) catch return;
+                        clean.appendSlice("]") catch return;
+                    }
+                }
+            }
+            clean.appendSlice(reset) catch return;
+            frame.append(self.alloc, clean.toOwnedSlice() catch return) catch return;
+        }
+        if (self.menu_len > visible_rows) scroll_needed = true;
+        if (scroll_needed) {
+            const cnt = std.fmt.allocPrint(self.alloc, "  {s}({d}/{d}){s}", .{ muted, self.menu_selected + 1, self.menu_len, reset }) catch return;
+            frame.append(self.alloc, cnt) catch return;
+        }
+        // Model Name detail (selected row).
+        if (self.menu_selected < self.menu_len) {
+            const e3 = self.menu_items[self.menu_selected];
+            frame.append(self.alloc, "") catch return;
+            const nl = std.fmt.allocPrint(self.alloc, "  {s}Model Name: {s}{s}", .{ muted, e3.name, reset }) catch return;
+            frame.append(self.alloc, nl) catch return;
+        }
+        // Footer after the item rows (rendered by the menu loop).
+        var ftext = std.array_list.Managed(u8).init(self.alloc);
+        defer ftext.deinit();
+        ftext.appendSlice("  ") catch return;
+        ftext.appendSlice(muted) catch return;
+        ftext.appendSlice("Enter toggle \u{b7} Ctrl+A all \u{b7} Ctrl+X clear \u{b7} Ctrl+P provider \u{b7} Esc cancel") catch return;
+        ftext.appendSlice(reset) catch return;
+        if (self.scoped_dirty) {
+            ftext.appendSlice(" ") catch return;
+            ftext.appendSlice(warn) catch return;
+            ftext.appendSlice("(unsaved)") catch return;
+            ftext.appendSlice(reset) catch return;
+        }
+        frame.append(self.alloc, ftext.toOwnedSlice() catch return) catch return;
+    }
+
+    fn refreshScopedDescs(self: *TUI) void {
+        for (self.menu_items[0..self.menu_len], 0..) |*e, i| {
+            _ = i;
+            if (e.model_idx) |idx| e.desc = self.modelScoped(idx);
+        }
+    }
+
     fn openScopedModelsMenu(self: *TUI) void {
         const cfg = self.cfg orelse {
             self.note("no config loaded", .{});
             self.redraw();
             return;
         };
+        // Seed the session list from the persisted patterns (null = all).
+        if (self.scoped_models == null) {
+            if (cfg.enabled_models) |pats| {
+                var list = std.ArrayListUnmanaged([]u8).empty;
+                for (cfg.models.items, 0..) |*m, i| {
+                    var fbuf: [256]u8 = undefined;
+                    const full = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ m.provider, m.id }) catch continue;
+                    for (pats) |pat| {
+                        if (patternMatches(pat, full)) {
+                            const dup = self.alloc.dupe(u8, full) catch continue;
+                            list.append(self.alloc, dup) catch {};
+                            break;
+                        }
+                    }
+                    _ = i;
+                }
+                self.scoped_models = list;
+            }
+        }
+        // Esc-restore snapshot.
+        self.freeScopedList(&self.scoped_snapshot);
+        self.scoped_snapshot = self.copyScopedList(self.scoped_models);
+        self.scoped_dirty = false;
         var n: usize = 0;
         for (cfg.models.items, 0..) |*m, i| {
             if (n >= self.menu_items.len) break;
@@ -2397,7 +2549,6 @@ pub const TUI = struct {
         self.menu_selected = 0;
         self.menu_mode = .scoped;
         self.editor.clear() catch {};
-        self.note("Enter toggles; Esc closes (session-only)", .{});
         self.redraw();
     }
 
@@ -2949,6 +3100,7 @@ pub const TUI = struct {
             list.deinit(self.alloc);
         }
         self.ms_filtered.deinit(self.alloc);
+        self.freeScopedList(&self.scoped_snapshot);
         if (self.owned_provider) |p| {
             p.deinit();
         }
@@ -3197,7 +3349,7 @@ pub const TUI = struct {
         // Fixed bottom: menu (menu_h) + top border (1) + editor (editor_h) +
         // bottom border (1) + cwd (1) + status (1). The menu viewport shows
         // at most 16 rows (pi select-list maxVisible).
-        const menu_h: usize = if (self.menu_mode != .hidden) @min(self.menu_len, self.menuMaxVisible()) else 0;
+        const menu_h: usize = if (self.menu_mode != .hidden and self.menu_mode != .scoped) @min(self.menu_len, self.menuMaxVisible()) else 0;
         // The "(sel/total)" scroll-indicator row renders under the menu rows
         // (pi SelectList.render appends it after the items) and must be part
         // of the bottom budget — without it the frame is one row taller than
@@ -3214,7 +3366,8 @@ pub const TUI = struct {
         const settings_h: usize = if (self.menu_mode == .settings) self.settingsViewHeight(editor_h) else 0;
         const ms_h: usize = if (self.menu_mode == .model_selector) self.modelSelectorViewHeight() else 0;
         const ts_h: usize = if (self.menu_mode == .thinking_selector) self.thinkingSelectorViewHeight() else 0;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h;
+        const sc_h: usize = if (self.menu_mode == .scoped) self.scopedViewHeight() else 0;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -3342,6 +3495,10 @@ pub const TUI = struct {
         // 3.7 Thinking selector view (pi ThinkingSelectorComponent).
         if (self.menu_mode == .thinking_selector and ts_h > 0) {
             self.renderThinkingSelectorView(&frame);
+        }
+        // 3.8 Scoped-models view header/footer (pi ScopedModelsSelector).
+        if (self.menu_mode == .scoped and sc_h > 0) {
+            self.renderScopedChrome(&frame);
         }
 
         // 4. Bottom border.
@@ -6873,7 +7030,10 @@ pub const TUI = struct {
             }
             if (self.menu_mode == .scoped) {
                 // Scoped-models selector (pi ScopedModelsSelector): arrows +
-                // Enter toggle; Esc closes. Session-only.
+                // Enter toggle; Ctrl+A all; Ctrl+X clear; Ctrl+P toggle
+                // provider; Alt+↑/↓ reorder enabled; Ctrl+S persists
+                // (settings enabledModels); Esc cancels (restores the
+                // snapshot); printable keys filter.
                 if (self.bindings.matches(key, .menu_up)) {
                     self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
                     self.redraw();
@@ -6883,13 +7043,147 @@ pub const TUI = struct {
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_close)) {
+                    // pi onCancel: drop unsaved changes (restore snapshot).
+                    self.freeScopedList(&self.scoped_models);
+                    self.scoped_models = self.scoped_snapshot;
+                    self.scoped_snapshot = null;
+                    self.scoped_dirty = false;
                     self.menu_mode = .hidden;
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_confirm)) {
                     _ = self.menuActivate();
+                    self.scoped_dirty = true;
                     self.redraw();
                     continue;
+                }
+                switch (key) {
+                    .char => |c| {
+                        if (c.ctrl and (c.c == 'a' or c.c == 'A')) {
+                            // Enable all (null = all enabled).
+                            self.freeScopedList(&self.scoped_models);
+                            self.scoped_dirty = true;
+                            self.refreshScopedDescs();
+                            self.redraw();
+                            continue;
+                        }
+                        if (c.ctrl and (c.c == 'x' or c.c == 'X')) {
+                            // Clear all: every model disabled.
+                            var list = std.ArrayListUnmanaged([]u8).empty;
+                            if (self.cfg) |cfg| {
+                                for (cfg.models.items, 0..) |*m, i| {
+                                    _ = i;
+                                    var fbuf: [256]u8 = undefined;
+                                    const full = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ m.provider, m.id }) catch continue;
+                                    const dup = self.alloc.dupe(u8, full) catch continue;
+                                    list.append(self.alloc, dup) catch {};
+                                }
+                            }
+                            self.freeScopedList(&self.scoped_models);
+                            self.scoped_models = list;
+                            self.scoped_dirty = true;
+                            self.refreshScopedDescs();
+                            self.redraw();
+                            continue;
+                        }
+                        if (c.ctrl and (c.c == 'p' or c.c == 'P')) {
+                            // Toggle all models of the selected row's provider.
+                            if (self.menu_selected < self.menu_len) {
+                                const e2 = self.menu_items[self.menu_selected];
+                                if (e2.model_idx) |idx| {
+                                    if (self.cfg) |cfg| {
+                                        if (idx < cfg.models.items.len) {
+                                            const prov = cfg.models.items[idx].provider;
+                                            var all_on = true;
+                                            for (cfg.models.items, 0..) |*m, mi| {
+                                                if (std.mem.eql(u8, m.provider, prov) and !self.isModelScoped(mi)) all_on = false;
+                                            }
+                                            var list = std.ArrayListUnmanaged([]u8).empty;
+                                            if (self.scoped_models) |*sl| {
+                                                for (sl.items) |id| {
+                                                    const dup = self.alloc.dupe(u8, id) catch continue;
+                                                    list.append(self.alloc, dup) catch {};
+                                                }
+                                            }
+                                            for (cfg.models.items) |*m| {
+                                                if (!std.mem.eql(u8, m.provider, prov)) continue;
+                                                var fbuf: [256]u8 = undefined;
+                                                const full = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ m.provider, m.id }) catch continue;
+                                                var found = false;
+                                                for (list.items) |id| {
+                                                    if (std.mem.eql(u8, id, full)) found = true;
+                                                }
+                                                if (all_on) {
+                                                    // remove provider entries
+                                                    if (found) {
+                                                        var ri: usize = 0;
+                                                        while (ri < list.items.len) {
+                                                            if (std.mem.eql(u8, list.items[ri], full)) {
+                                                                self.alloc.free(list.orderedRemove(ri));
+                                                            } else ri += 1;
+                                                        }
+                                                    }
+                                                } else if (!found) {
+                                                    const dup = self.alloc.dupe(u8, full) catch continue;
+                                                    list.append(self.alloc, dup) catch {};
+                                                }
+                                            }
+                                            self.freeScopedList(&self.scoped_models);
+                                            self.scoped_models = list;
+                                            self.scoped_dirty = true;
+                                            self.refreshScopedDescs();
+                                        }
+                                    }
+                                }
+                            }
+                            self.redraw();
+                            continue;
+                        }
+                        if (c.ctrl and (c.c == 's' or c.c == 'S')) {
+                            // pi app.models.save: persist enabledModels.
+                            if (self.cfg) |cfg| {
+                                if (cfg.enabled_models) |pats| {
+                                    for (pats) |pat| self.alloc.free(pat);
+                                    self.alloc.free(pats);
+                                }
+                                if (self.scoped_models) |*sl| {
+                                    var pats = std.array_list.Managed([]const u8).init(self.alloc);
+                                    for (sl.items) |id| {
+                                        const dup = self.alloc.dupe(u8, id) catch continue;
+                                        pats.append(dup) catch self.alloc.free(dup);
+                                    }
+                                    cfg.enabled_models = pats.toOwnedSlice() catch null;
+                                } else {
+                                    cfg.enabled_models = null;
+                                }
+                                cfg.persistSettings(self.alloc, self.io) catch |err| {
+                                    self.note("settings save failed: {s}", .{@errorName(err)});
+                                };
+                                self.scoped_dirty = false;
+                                self.note("\x1b[90mModel scope saved to settings\x1b[0m", .{});
+                            }
+                            self.redraw();
+                            continue;
+                        }
+                        if (!c.ctrl and !c.alt and c.c >= 0x20 and c.c != 127) {
+                            self.editor.insertChar(c.c) catch {};
+                            self.modelSelectorRefilter();
+                            self.refreshScopedDescs();
+                            self.redraw();
+                            continue;
+                        }
+                    },
+                    .backspace => {
+                        const t = self.editor.getText() catch "";
+                        if (t.len > 0) {
+                            self.editor.replaceRange(t.len - 1, t.len, "") catch {};
+                            self.modelSelectorRefilter();
+                            self.refreshScopedDescs();
+                        }
+                        self.redraw();
+                        continue;
+                    },
+                    else => {},
                 }
                 continue; // swallow everything else while the selector is open
             }

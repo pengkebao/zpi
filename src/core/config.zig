@@ -102,6 +102,10 @@ pub const Config = struct {
     /// settings.json "defaultThinkingLevel": the · default marker in the
     /// thinking selector (pi defaultThinkingLevel).
     default_thinking_level: ?ThinkingLevel = null,
+    /// settings.json "enabledModels": patterns ("provider/id" or
+    /// "provider/*") limiting the Ctrl+P model cycle. null = all enabled
+    /// (pi enabledModels).
+    enabled_models: ?[]const []const u8 = null,
     /// settings.json "commandTools" (Phase I1): shell commands exposed to
     /// the model as tools. Owned; merged across global + project settings.
     command_tools: []command_tools.CommandTool = &.{},
@@ -147,6 +151,10 @@ pub const Config = struct {
     };
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
+        if (self.enabled_models) |pats| {
+            for (pats) |pat| alloc.free(pat);
+            alloc.free(pats);
+        }
         command_tools.freeAll(alloc, self.command_tools);
         for (self.models.items) |m| {
             alloc.free(m.provider);
@@ -417,6 +425,33 @@ pub const Config = struct {
         if (strIn(root, "defaultThinkingLevel")) |dl| {
             self.default_thinking_level = ThinkingLevel.fromStr(dl);
         }
+        // enabledModels: ["provider/id", "provider/*"] patterns.
+        if (root.get("enabledModels")) |ev| {
+            switch (ev) {
+                .array => |arr| {
+                    var pats = std.array_list.Managed([]const u8).init(alloc);
+                    for (arr.items) |item| {
+                        switch (item) {
+                            .string => |str| pats.append(alloc.dupe(u8, str) catch continue) catch {},
+                            else => {},
+                        }
+                    }
+                    if (self.enabled_models) |old_pats| {
+                        for (old_pats) |op| alloc.free(op);
+                        alloc.free(old_pats);
+                    }
+                    self.enabled_models = pats.toOwnedSlice() catch null;
+                },
+                .null => {
+                    if (self.enabled_models) |old_pats| {
+                        for (old_pats) |op| alloc.free(op);
+                        alloc.free(old_pats);
+                    }
+                    self.enabled_models = null;
+                },
+                else => {},
+            }
+        }
         // commandTools (Phase I1): merged — project entries append to the
         // global ones (names later in the list shadow earlier duplicates).
         if (root.get("commandTools")) |_| {
@@ -511,6 +546,11 @@ pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, 
         if (self.default_provider) |dp| try root.object.put(arena, "defaultProvider", .{ .string = dp });
         if (self.default_model) |dm| try root.object.put(arena, "defaultModel", .{ .string = dm });
         if (self.default_thinking_level) |dtl| try root.object.put(arena, "defaultThinkingLevel", .{ .string = dtl.name() });
+        if (self.enabled_models) |pats| {
+            var arr = std.json.Array.init(arena);
+            for (pats) |pat| arr.append(.{ .string = pat }) catch {};
+            try root.object.put(arena, "enabledModels", .{ .array = arr });
+        }
 
         const json_text = try std.json.Stringify.valueAlloc(arena, root, .{});
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json_text });
