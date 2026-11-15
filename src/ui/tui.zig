@@ -6458,6 +6458,7 @@ pub const TUI = struct {
             self.alloc.free(info.path);
             self.alloc.free(info.id);
             if (info.name) |n| self.alloc.free(n);
+            if (info.first_message) |fm| self.alloc.free(fm);
             self.alloc.free(info.timestamp);
         }
         self.alloc.free(list);
