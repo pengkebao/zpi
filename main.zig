@@ -440,8 +440,12 @@ pub fn main(init: std.process.Init) !void {
 
 
     var argv = std.array_list.Managed([]const u8).init(alloc);
+    var prompt_from_argv: ?usize = null; // positional prompt owns this slot
     defer {
-        for (argv.items) |arg| alloc.free(arg);
+        for (argv.items, 0..) |arg, slot| {
+            if (prompt_from_argv == slot) continue; // ownership moved to `prompt`
+            alloc.free(arg);
+        }
         argv.deinit();
     }
     var arg_it = try init.minimal.args.iterateAllocator(alloc);
@@ -468,6 +472,8 @@ pub fn main(init: std.process.Init) !void {
     var cli_provider: ?[]const u8 = null;
     var cli_api_key: ?[]const u8 = null;
     var cli_models_scope: ?[]const u8 = null;
+    var mode_json = false; // --mode json (K1: JSONL event stream on stdout)
+    var mode_rpc = false; // --mode rpc (K2, not yet implemented)
     var cwd: ?[]const u8 = null;
     var no_tui = false;
     var list_models = false;
@@ -523,6 +529,21 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--models")) {
             if (i + 1 < argv.items.len) cli_models_scope = argv.items[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--mode")) {
+            if (i + 1 < argv.items.len) {
+                const m = argv.items[i + 1];
+                if (std.mem.eql(u8, m, "json")) {
+                    mode_json = true;
+                    print_mode = true;
+                } else if (std.mem.eql(u8, m, "rpc")) {
+                    mode_rpc = true;
+                    print_mode = true;
+                } else if (!std.mem.eql(u8, m, "text")) {
+                    std.debug.print("error: unknown --mode '{s}' (text|json|rpc)\n", .{m});
+                    return error.BadUsage;
+                }
+            }
             i += 1;
         } else if (std.mem.eql(u8, arg, "--cwd")) {
             if (i + 1 < argv.items.len) cwd = argv.items[i + 1];
@@ -580,6 +601,7 @@ pub fn main(init: std.process.Init) !void {
                 file_args.append(arg[1..]) catch {};
             } else if (prompt == null) {
                 prompt = arg;
+                prompt_from_argv = argv.items.len - 1;
             }
         }
     }
@@ -1180,11 +1202,16 @@ pub fn main(init: std.process.Init) !void {
             combined.appendSlice(pp) catch {};
         }
         if (combined.items.len > 0) {
-            // expand always returns a fresh allocation (or propagates OOM),
-            // so releasing `combined` afterwards is always safe.
+            // expand always returns a fresh allocation (or propagates OOM);
+            // the original positional prompt is absorbed — free it.
+            if (prompt) |pp| alloc.free(pp);
             prompt = try ptmod.expand(alloc, combined.items, templates);
+        } else if (prompt) |pp| {
+            alloc.free(pp);
+            prompt = null;
         }
     }
+
 
 
     // Build the sectioned system prompt (Phase D) + advertise skills (Phase H1).
@@ -1354,20 +1381,56 @@ pub fn main(init: std.process.Init) !void {
 
     // Run
     if (print_mode) {
+        if (mode_rpc) {
+            std.debug.print("error: --mode rpc is not implemented yet\n", .{});
+            return error.BadUsage;
+        }
+        const stdout = std.Io.File.stdout();
+        // Both modes suppress the streamed echo (print-mode semantics);
+        // json mode's output is the event stream itself.
+        session.quiet = true;
+        if (mode_json) {
+            // K1: JSONL event stream (pi json-event shape). Session header
+            // first (the store file's first line), then live events.
+            if (session.store) |st| {
+                st.emitHeader(stdout, io) catch {};
+            }
+            session.json_out = stdout;
+        }
+        var run_failed = false;
         if (prompt) |p| {
-            // Text streams to stdout; tool activity/thinking go to stderr.
             session.runPromptWithImages(p, image_attachments.items) catch |e| {
-                if (e != error.Aborted) {
-                    std.debug.print("\n[error: {s}]\n", .{@errorName(e)});
+                run_failed = (e != error.Aborted);
+                if (run_failed) {
+                    std.debug.print("[error: {s}]\n", .{@errorName(e)});
                 }
             };
-            const stdout = std.Io.File.stdout();
-            stdout.writeStreamingAll(io, "\n") catch {};
-            if (session.totals.total > 0) {
-                std.debug.print("[usage: {d} in / {d} out / {d} cache-read tokens, ${d:.4} ]\n", .{
-                    session.totals.input, session.totals.output, session.totals.cache_read, session.totals.cost,
-                });
+        }
+        if (mode_json) {
+            session.json_out = null;
+        } else {
+            // Final text from the last assistant message (pi print-mode).
+            var last_text: ?[]u8 = null;
+            for (session.context.messages.items) |m| {
+                if (m.role == .assistant) {
+                    for (m.blocks.items) |b| switch (b) {
+                        .text => |t| last_text = @constCast(t),
+                        else => {},
+                    };
+                }
             }
+            if (last_text) |t| {
+                stdout.writeStreamingAll(io, t) catch {};
+                stdout.writeStreamingAll(io, "\n") catch {};
+            }
+            if (session.last_error_message) |em| {
+                std.debug.print("{s}\n", .{em});
+                run_failed = true;
+            }
+        }
+        if (run_failed) {
+            // pi print-mode: console.error + exit 1 (no error-return trace).
+            std.process.exit(1);
         }
     } else {
         // TUI mode
@@ -1392,10 +1455,16 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
+    if (prompt) |pp| alloc.free(pp);
     // The session may have swapped stores (/clone, /fork, /resume, /import):
     // retire whatever store is current (the initial one moved into
     // session.store at startup and swap paths retire the ones they replace).
     if (session.store) |st| st.deinit();
-    if (cwd_alloc) |c| alloc.free(c);
+    // cwd_alloc freed by the defer at its declaration site (no double free).
     if (sessions_dir_alloc) |d| alloc.free(d);
+    if (stdin_content) |sc| alloc.free(sc);
+    if (file_text) |ft| alloc.free(ft);
+    // TrustReloadCtx path strings (allocated at ctx construction).
+    if (trust_reload.user_mcp.len > 0) alloc.free(trust_reload.user_mcp);
+    if (trust_reload.proj_mcp.len > 0) alloc.free(trust_reload.proj_mcp);
 }

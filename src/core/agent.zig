@@ -102,6 +102,17 @@ pub const Session = struct {
     /// kinds go to the callback; otherwise text goes to stdout and everything
     /// else to stderr (print mode).
     output_cb: ?*OutputContext = null,
+    /// Print mode (pi -p): suppress streamed output entirely (stdout gets
+    /// the final assistant text once the round completes — pi print-mode).
+    quiet: bool = false,
+    /// Monotonic turn index for --mode json turn_start events.
+    turn_counter: u64 = 0,
+    /// Last round failure text (print mode reports it on stderr + exit 1,
+    /// pi print-mode errorMessage semantics).
+    last_error_message: ?[]u8 = null,
+    /// --mode json: when set, structured session events are written here
+    /// as one JSON object per line (pi json-event protocol shape).
+    json_out: ?std.Io.File = null,
     /// Cumulative usage over the whole session (A1).
     totals: msg.Usage = .{},
     /// Session persistence (B); null = --no-session.
@@ -326,15 +337,58 @@ pub const Session = struct {
             oc.fn_ptr(oc.user_data, kind, text);
             return;
         }
+        if (self.quiet) return; // print mode: no streamed output at all
         switch (kind) {
             .text => {
                 const stdout = std.Io.File.stdout();
                 stdout.writeStreamingAll(self.io, text) catch {};
             },
-            else => {
-                std.debug.print("{s}", .{text});
-            },
+            else => {},
         }
+    }
+
+    /// --mode json: write one structured event line to stdout (pi
+    /// AgentSessionEvent / assistantMessageEvent shapes). Best-effort:
+    /// output errors are ignored (broken pipe exits via SIGPIPE/EPIPE).
+    fn jsonEvent(self: *Session, comptime fmt: []const u8, args: anytype) void {
+        if (self.json_out) |out| {
+            const line = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
+            defer self.alloc.free(line);
+            out.writeStreamingAll(self.io, line) catch {};
+            out.writeStreamingAll(self.io, "\n") catch {};
+        }
+    }
+
+    fn jsonEscaped(self: *Session, text: []const u8) ![]u8 {
+        var out = std.array_list.Managed(u8).init(self.alloc);
+        errdefer out.deinit();
+        for (text) |c| {
+            switch (c) {
+                '"' => try out.appendSlice("\\\""),
+                '\\' => try out.appendSlice("\\\\"),
+                '\n' => try out.appendSlice("\\n"),
+                '\r' => try out.appendSlice("\\r"),
+                '\t' => try out.appendSlice("\\t"),
+                else => {
+                    if (c < 0x20) {
+                        var buf: [8]u8 = undefined;
+                        const w = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                        try out.appendSlice(w);
+                    } else {
+                        try out.append(c);
+                    }
+                },
+            }
+        }
+        return out.toOwnedSlice();
+    }
+
+    fn jsonUsage(self: *Session) []const u8 {
+        const u = self.stream_usage orelse return "null";
+        return std.fmt.allocPrint(self.alloc,
+            "{{\"input\":{d},\"output\":{d},\"cacheRead\":{d},\"cacheWrite\":{d},\"total\":{d},\"cost\":{{\"total\":{d:.6}}}}}",
+            .{ u.input, u.output, u.cache_read, u.cache_write, u.total, u.cost },
+        ) catch return "null";
     }
 
     /// Rough context size estimate (chars/4 heuristic, pi-quality is not
@@ -440,6 +494,12 @@ pub const Session = struct {
     /// Run (or force) a compaction. Returns the context size before it, or
     /// null when nothing was compacted. `custom` optionally focuses the summary.
     pub fn runCompaction(self: *Session, custom: ?[]const u8) !?u64 {
+        return self.runCompactionReasoned(custom, "threshold");
+    }
+
+    pub fn runCompactionReasoned(self: *Session, custom: ?[]const u8, reason: []const u8) !?u64 {
+        self.jsonEvent("{{\"type\":\"compaction_start\",\"reason\":\"{s}\"}}", .{reason});
+        defer self.jsonEvent("{{\"type\":\"compaction_end\",\"reason\":\"{s}\"}}", .{reason});
         if (events.getGlobal()) |bus| bus.emit(.compaction);
         const st = self.store orelse return null;
         const msgs = self.context.messages.items;
@@ -506,7 +566,7 @@ pub const Session = struct {
         const s = std.fmt.bufPrint(&buf, "\n[auto-compact: context ~{d} tokens]\n", .{ctx_tokens}) catch "\n[auto-compact]\n";
         self.emit(.tool_info, s);
         // The compaction itself is shown by its own turn event.
-        _ = try self.runCompaction(null);
+        _ = try self.runCompactionReasoned(null, "threshold");
     }
 
     /// Run a user prompt through the agent loop.
@@ -523,6 +583,14 @@ pub const Session = struct {
         clearAbort();
         // Events nobody took belong to an earlier turn.
         self.clearTurnEvents();
+        self.jsonEvent("{{\"type\":\"agent_start\"}}", .{});
+        self.jsonEvent("{{\"type\":\"turn_start\",\"index\":{d}}}", .{self.turn_counter});
+        self.turn_counter += 1;
+        defer {
+            self.jsonEvent("{{\"type\":\"turn_end\"}}", .{});
+            self.jsonEvent("{{\"type\":\"agent_end\"}}", .{});
+            self.jsonEvent("{{\"type\":\"agent_settled\",\"aborted\":{}}}", .{self.isAborted()});
+        }
 
         // pi: after a turn ends, queued follow-up messages run as new turns
         // (the outer loop below). Steering messages are injected BEFORE each
@@ -578,6 +646,8 @@ pub const Session = struct {
             self.stream_tools = &tool_calls;
             self.stream_usage = null;
 
+            self.jsonEvent("{{\"type\":\"message_start\",\"message\":{{\"role\":\"assistant\"}}}}", .{});
+
             // Call LLM (retries + abort-aware, see openai.zig)
             aiprovider.streamDispatch(
                 self.provider,
@@ -606,12 +676,17 @@ pub const Session = struct {
                     thinking_buf.deinit();
                     tool_calls.deinit();
                     self.emit(.tool_info, "\n[auto-compact: context overflow — compacting and retrying]\n");
-                    _ = self.runCompaction(null) catch {};
+                    _ = self.runCompactionReasoned(null, "overflow") catch {};
                     continue; // rebuild wire messages against the compacted context
                 } else {
                     // Keep what streamed before the failure on screen.
                     self.recordText(.thinking, thinking_buf.items);
                     self.recordText(.text, text_buf.items);
+                    const le = self.provider.lastErrorText();
+                    if (le.len > 0) {
+                        if (self.last_error_message) |old| self.alloc.free(old);
+                        self.last_error_message = self.alloc.dupe(u8, le) catch null;
+                    }
                 }
                 text_buf.deinit();
                 thinking_buf.deinit();
@@ -651,6 +726,7 @@ pub const Session = struct {
             const sr: []const u8 = if (n_tool_calls_pending(&assistant_msg) > 0) "toolUse" else "stop";
             assistant_msg.stop_reason = msg.Message.allocStr(self.alloc, sr);
             try self.appendAndRecord(&assistant_msg);
+            self.jsonAssistantEnd(&assistant_msg);
 
             // Count tool calls
             const n_tool_calls: usize = n_tool_calls_pending(&assistant_msg);
@@ -733,7 +809,9 @@ pub const Session = struct {
                                 self.alloc.free(img_data);
                             }
                         }
+                        self.jsonEvent("{{\"type\":\"message_start\",\"message\":{{\"role\":\"toolResult\"}}}}", .{});
                         try self.appendAndRecord(&tr_msg);
+                        self.jsonToolResultEnd(&tr_msg);
                     },
                     else => {},
                 }
@@ -947,19 +1025,116 @@ pub const Session = struct {
         return tool.execute(tool, args_json, &self.exec_ctx);
     }
 
+    /// --mode json: block count before the first tool call slot.
+    fn contentBaseIndex(has_thinking: bool, has_text: bool) usize {
+        return @as(usize, if (has_thinking) 1 else 0) + @as(usize, if (has_text) 1 else 0);
+    }
+
+    /// --mode json: full assistant message object (pi message_end shape).
+    fn jsonAssistantEnd(self: *Session, m: *const msg.Message) void {
+        if (self.json_out == null) return;
+        var content = std.array_list.Managed(u8).init(self.alloc);
+        defer content.deinit();
+        content.append('[') catch return;
+        var first = true;
+        var idx: usize = 0;
+        for (m.blocks.items) |b| {
+            if (!first) content.append(',') catch return;
+            first = false;
+            switch (b) {
+                .thinking => |t| {
+                    const esc = self.jsonEscaped(t) catch return;
+                    defer self.alloc.free(esc);
+                    const seg = std.fmt.allocPrint(self.alloc, "{{\"type\":\"thinking\",\"contentIndex\":{d},\"thinking\":\"{s}\"}}", .{ idx, esc }) catch return;
+                    defer self.alloc.free(seg);
+                    content.appendSlice(seg) catch return;
+                },
+                .text => |t| {
+                    const esc = self.jsonEscaped(t) catch return;
+                    defer self.alloc.free(esc);
+                    const seg = std.fmt.allocPrint(self.alloc, "{{\"type\":\"text\",\"contentIndex\":{d},\"text\":\"{s}\"}}", .{ idx, esc }) catch return;
+                    defer self.alloc.free(seg);
+                    content.appendSlice(seg) catch return;
+                },
+                .tool_call => |tc| {
+                    const id_esc = self.jsonEscaped(tc.id) catch return;
+                    defer self.alloc.free(id_esc);
+                    const name_esc = self.jsonEscaped(tc.name) catch return;
+                    defer self.alloc.free(name_esc);
+                    const args_esc = self.jsonEscaped(tc.arguments) catch return;
+                    defer self.alloc.free(args_esc);
+                    const seg = std.fmt.allocPrint(self.alloc, "{{\"type\":\"toolCall\",\"contentIndex\":{d},\"id\":\"{s}\",\"name\":\"{s}\",\"arguments\":\"{s}\"}}", .{ idx, id_esc, name_esc, args_esc }) catch return;
+                    defer self.alloc.free(seg);
+                    content.appendSlice(seg) catch return;
+                },
+                else => {},
+            }
+            idx += 1;
+        }
+        content.append(']') catch return;
+        const usage = self.jsonUsage();
+        defer if (!std.mem.eql(u8, usage, "null")) self.alloc.free(@constCast(usage));
+        const prov_esc = self.jsonEscaped(m.provider orelse "") catch return;
+        defer self.alloc.free(prov_esc);
+        const model_esc = self.jsonEscaped(m.model_id orelse "") catch return;
+        defer self.alloc.free(model_esc);
+        const sr_esc = self.jsonEscaped(m.stop_reason orelse "") catch return;
+        defer self.alloc.free(sr_esc);
+        self.jsonEvent("{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":{s},\"stopReason\":\"{s}\",\"model\":\"{s}\",\"provider\":\"{s}\",\"usage\":{s}}}}}", .{ content.items, sr_esc, model_esc, prov_esc, usage });
+    }
+
+    /// --mode json: toolResult message object.
+    fn jsonToolResultEnd(self: *Session, m: *const msg.Message) void {
+        if (self.json_out == null) return;
+        for (m.blocks.items) |b| switch (b) {
+            .tool_result => |tr| {
+                const id_esc = self.jsonEscaped(tr.tool_call_id) catch return;
+                defer self.alloc.free(id_esc);
+                const content_esc = self.jsonEscaped(tr.content) catch return;
+                defer self.alloc.free(content_esc);
+                self.jsonEvent("{{\"type\":\"message_end\",\"message\":{{\"role\":\"toolResult\",\"toolCallId\":\"{s}\",\"content\":\"{s}\",\"isError\":{}}}}}", .{ id_esc, content_esc, tr.is_error });
+                return;
+            },
+            else => {},
+        };
+    }
+
     pub fn onStreamEvent(self: *Session, event: ai.StreamEvent) void {
         switch (event) {
             .text_delta => |text| {
                 self.stream_text.appendSlice(text) catch return;
                 self.emit(.text, text);
+                if (self.json_out != null) {
+                    const esc = self.jsonEscaped(text) catch return;
+                    defer self.alloc.free(esc);
+                    // contentIndex: thinking (when present) occupies 0, text follows.
+                    const ci: usize = if (self.stream_thinking.items.len > 0) 1 else 0;
+                    self.jsonEvent("{{\"type\":\"message_update\",\"usage\":null,\"assistantMessageEvent\":{{\"type\":\"text_delta\",\"contentIndex\":{d},\"delta\":\"{s}\"}}}}", .{ ci, esc });
+                }
             },
             .thinking_delta => |text| {
                 self.stream_thinking.appendSlice(text) catch return;
                 self.emit(.thinking, text);
+                if (self.json_out != null) {
+                    const esc = self.jsonEscaped(text) catch return;
+                    defer self.alloc.free(esc);
+                    self.jsonEvent("{{\"type\":\"message_update\",\"usage\":null,\"assistantMessageEvent\":{{\"type\":\"thinking_delta\",\"contentIndex\":0,\"delta\":\"{s}\"}}}}", .{esc});
+                }
             },
             .tool_call_delta => |d| {
+                const is_new = d.index >= self.stream_tools.items.len;
                 while (d.index >= self.stream_tools.items.len) {
                     self.stream_tools.append(.{ .id = "", .name = "", .arguments = "" }) catch return;
+                }
+                if (is_new and self.json_out != null) {
+                    // toolcall_start: id/name arrive with the first event
+                    // (openai) or content_block_start (anthropic).
+                    const id_esc = self.jsonEscaped(d.id orelse "") catch return;
+                    defer self.alloc.free(id_esc);
+                    const name_esc = self.jsonEscaped(d.name orelse "") catch return;
+                    defer self.alloc.free(name_esc);
+                    const base: usize = contentBaseIndex(self.stream_thinking.items.len > 0, self.stream_text.items.len > 0);
+                    self.jsonEvent("{{\"type\":\"message_update\",\"usage\":null,\"assistantMessageEvent\":{{\"type\":\"toolcall_start\",\"contentIndex\":{d},\"id\":\"{s}\",\"toolName\":\"{s}\"}}}}", .{ base + d.index, id_esc, name_esc });
                 }
                 if (d.id) |id| {
                     self.alloc.free(self.stream_tools.items[d.index].id);
@@ -973,6 +1148,12 @@ pub const Session = struct {
                     const merged: []u8 = std.mem.concat(self.alloc, u8, &.{ self.stream_tools.items[d.index].arguments, delta }) catch return;
                     self.alloc.free(self.stream_tools.items[d.index].arguments);
                     self.stream_tools.items[d.index].arguments = merged;
+                    if (self.json_out != null and !is_new and delta.len > 0) {
+                        const esc = self.jsonEscaped(delta) catch return;
+                        defer self.alloc.free(esc);
+                        const base = contentBaseIndex(self.stream_thinking.items.len > 0, self.stream_text.items.len > 0);
+                        self.jsonEvent("{{\"type\":\"message_update\",\"usage\":null,\"assistantMessageEvent\":{{\"type\":\"toolcall_delta\",\"contentIndex\":{d},\"delta\":\"{s}\"}}}}", .{ base + d.index, esc });
+                    }
                 }
             },
             .usage => |u| {

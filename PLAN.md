@@ -164,10 +164,10 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
 | 交互模式 | ✅ | ✅ | |
-| `-p` print（一次运行退出，stdout 只输出正文） | ✅ | ⚠️ | 目前打到 stderr、含 tool 噪音 |
-| `--mode text` | ✅ | ❌ | |
-| `--mode json`（JSONL 事件流） | ✅ | ❌ | 事件全集见 json.md |
-| `--mode rpc`（stdin/stdout JSONL 双向控制） | ✅ | ❌ | IDE/自定义客户端集成点 |
+| `-p` print（一次运行退出，stdout 只输出正文） | ✅ | ✅ | pi print-mode 语义：全程静默（quiet），回合结束从最后一条 assistant 消息一次性输出正文；thinking/tool 完全不落 stderr；错误 → stderr + **exit 1**（process.exit，无 error trace）；leak 清零（prompt/stdin/@file/trust-ctx 路径） |
+| `--mode text` | ✅ | ✅ | `-p` 等价 |
+| `--mode json`（JSONL 事件流） | ✅ | ✅ | **K1**：stdout 逐行 JSONL——session header（store 首行 / 合成）+ agent_start / turn_start / message_start / message_update（text_delta/thinking_delta/toolcall_start{id,toolName}/toolcall_delta，pi assistantMessageEvent 形状）/ message_end（assistant 全 content blocks + stopReason/usage；toolResult 带 toolCallId/content/isError）/ compaction_start|end(reason) / turn_end / agent_end / agent_settled(aborted)；stderr 全静默；工具回合 E2E 双轮验证全部行合法 JSON |
+| `--mode rpc`（stdin/stdout JSONL 双向控制） | ✅ | ❌ | K2（复用 K1 事件流 + 命令解析），CLI 已占位报未实现 |
 | SDK（进程内 TS） | ✅ | ➖ | Zig 侧等价物是库链接；可后置 |
 
 ### 9. 扩展与资源

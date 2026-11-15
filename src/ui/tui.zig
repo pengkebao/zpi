@@ -5500,7 +5500,7 @@ pub const TUI = struct {
             const custom = if (arg.len > 0) arg else null;
             self.addMessage("\x1b[90m[compacting...]\x1b[0m");
             self.redraw();
-            const before = self.session.runCompaction(custom) catch {
+            const before = self.session.runCompactionReasoned(custom, "manual") catch {
                 self.note("\x1b[91m[compact failed]\x1b[0m", .{});
                 self.redraw();
                 return false;

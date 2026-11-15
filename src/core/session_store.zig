@@ -632,6 +632,32 @@ pub const Store = struct {
     entries: std.array_list.Managed(EntryRef),
     file_buf: std.array_list.Managed(u8),
 
+    /// --mode json: write the session header entry (the store file's first
+    /// line) to `out`. pi json mode starts its stream with the header.
+    pub fn emitHeader(self: *Store, out: std.Io.File, io: std.Io) !void {
+        for (self.entries.items) |e| {
+            if (e.kind != .header) continue;
+            try out.writeStreamingAll(io, e.line);
+            try out.writeStreamingAll(io, "\n");
+            return;
+        }
+        // No persisted header (fresh session, --no-session): synthesize one.
+        var cwd_esc = std.array_list.Managed(u8).init(self.alloc);
+        defer cwd_esc.deinit();
+        for (self.cwd) |c| {
+            if (c == '"' or c == '\\') {
+                try cwd_esc.append('\\');
+            }
+            try cwd_esc.append(c);
+        }
+        const line = try std.fmt.allocPrint(self.alloc,
+            "{{\"type\":\"session\",\"id\":\"{s}\",\"cwd\":\"{s}\"}}",
+            .{ self.id, cwd_esc.items });
+        defer self.alloc.free(line);
+        try out.writeStreamingAll(io, line);
+        try out.writeStreamingAll(io, "\n");
+    }
+
     fn deinitEntries(self: *Store) void {
         for (self.entries.items) |e| {
             self.alloc.free(e.id);
