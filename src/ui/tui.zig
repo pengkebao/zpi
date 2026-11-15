@@ -2756,7 +2756,12 @@ pub const TUI = struct {
         _ = self.refreshSize();
 
         // Render the editor (wrapped visual lines) first to know its height.
-        var ed = self.editor.render(self.width) catch return;
+        // In settings mode the editor line is the search input (pi Input
+        // component, default prompt "> "): render inset by 2 and let the
+        // frame prepend the prompt prefix.
+        const settings_search = self.menu_mode == .settings;
+        const ed_width: usize = if (settings_search) (if (self.width > 2) self.width - 2 else 1) else self.width;
+        var ed = self.editor.render(ed_width) catch return;
         var ed_consumed = false;
         errdefer {
             if (!ed_consumed) {
@@ -2766,7 +2771,10 @@ pub const TUI = struct {
         }
         const visual_total = ed.items.len;
         const editor_h = if (visual_total < self.maxEditorHeight()) visual_total else self.maxEditorHeight();
-        const cursor_vis = self.editor.cursorVisualPos(self.width);
+        const cursor_vis_raw = self.editor.cursorVisualPos(ed_width);
+        var cursor_vis = self.editor.cursorVisualPos(self.width);
+        cursor_vis.row = cursor_vis_raw.row;
+        cursor_vis.col = cursor_vis_raw.col + (if (settings_search) @as(u32, 2) else 0);
         var vis_top: usize = 0;
         if (cursor_vis.row >= editor_h) vis_top = cursor_vis.row - editor_h + 1;
         const end = if (visual_total < vis_top + editor_h) visual_total else vis_top + editor_h;
@@ -2873,8 +2881,25 @@ pub const TUI = struct {
         frame.append(self.alloc, top_border) catch return;
 
         // 3. Editor visible visual lines (scrolled to the cursor). Move them
-        // into the frame, free the rest, and consume ed.
-        for (ed.items[vis_top..end]) |line| frame.append(self.alloc, line) catch return;
+        // into the frame, free the rest, and consume ed. Settings mode adds
+        // the Input-component prompt prefix ("> " first line, two spaces on
+        // wrapped continuation lines).
+        for (ed.items[vis_top..end], 0..) |line, vi| {
+            if (!settings_search) {
+                frame.append(self.alloc, line) catch return;
+            } else {
+                const prefixed = std.fmt.allocPrint(self.alloc, "{s}{s}", .{
+                    if (vis_top + vi == 0) "> " else "  ",
+                    line,
+                }) catch {
+                    frame.append(self.alloc, line) catch return;
+                    continue;
+                };
+                frame.append(self.alloc, prefixed) catch return;
+                // Ownership moves into the frame (freed at frame teardown).
+                self.alloc.free(line);
+            }
+        }
         for (ed.items[0..vis_top]) |line| self.alloc.free(line);
         for (ed.items[end..]) |line| self.alloc.free(line);
         ed.deinit(self.alloc);
