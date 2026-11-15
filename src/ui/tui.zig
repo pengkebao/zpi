@@ -1055,11 +1055,16 @@ pub const TUI = struct {
         switch (self.menu_mode) {
             .commands => {
                 if (commandTakesArg(e.name)) {
-                    // pi: a takes-arg command completes to "/name " and the
-                    // menu flips to its argument mode (pi opens the selector).
+                    // pi editor.js tui.select.confirm: a "/" prefix
+                    // completion falls through to SUBMIT — the filled
+                    // "/name " is handed to handleCommand immediately (so
+                    // /model opens the selector in one Enter, /login shows
+                    // its usage, etc). No second Enter needed.
                     self.menuComplete();
                     self.updateMenu();
-                    return false;
+                    const filled = self.editor.getText() catch return false;
+                    defer self.alloc.free(filled);
+                    return self.handleCommand(filled);
                 }
                 self.editor.clear() catch {};
                 // Close the menu BEFORE running the command: the command may
@@ -5794,6 +5799,91 @@ pub const TUI = struct {
             return false;
         }
 
+        // /login <provider> <api-key> — store a credential (pi /login: the
+        // interactive picker + secret prompt needs a text-input UI we don't
+        // have yet; the argument form covers api_key providers).
+        if (std.mem.eql(u8, word, "/login")) {
+            var pid: ?[]const u8 = null;
+            var key: ?[]const u8 = null;
+            var it = std.mem.tokenizeAny(u8, arg, " \t");
+            if (it.next()) |a| pid = a;
+            if (it.next()) |k| key = k;
+            if (pid == null or key == null) {
+                self.note("usage: /login <provider> <api-key>", .{});
+            } else if (self.cfg) |c| {
+                config.saveAuthEntry(self.alloc, self.io, c.base_dir, pid.?, key.?) catch {
+                    self.note("failed to write auth.json", .{});
+                    self.redraw();
+                    return false;
+                };
+                // Apply immediately to models of that provider.
+                var n: usize = 0;
+                for (c.models.items) |*m| {
+                    if (std.ascii.eqlIgnoreCase(m.provider, pid.?)) {
+                        const copy = self.alloc.dupe(u8, key.?) catch continue;
+                        self.alloc.free(m.api_key);
+                        m.api_key = copy;
+                        n += 1;
+                    }
+                }
+                self.note("logged in to {s} ({d} models updated)", .{ pid.?, n });
+            } else {
+                self.note("no config loaded", .{});
+            }
+            self.redraw();
+            return false;
+        }
+
+        // /logout [provider] — drop a stored credential (default: current).
+        if (std.mem.eql(u8, word, "/logout")) {
+            const pid = if (arg.len > 0) arg else self.session.model.provider;
+            if (self.cfg) |c| {
+                config.removeAuthEntry(self.alloc, self.io, c.base_dir, pid) catch {};
+                for (c.models.items) |*m| {
+                    if (std.mem.eql(u8, m.provider, pid)) {
+                        const blank = self.alloc.dupe(u8, "") catch continue;
+                        self.alloc.free(m.api_key);
+                        m.api_key = blank;
+                    }
+                }
+                self.note("logged out from {s}", .{pid});
+            } else {
+                self.note("no config loaded", .{});
+            }
+            self.redraw();
+            return false;
+        }
+
+        // /scoped-models — pi ScopedModelsSelector (Enter toggles, Esc closes).
+        if (std.mem.eql(u8, word, "/scoped-models")) {
+            self.openScopedModelsMenu();
+            return false;
+        }
+
+        // /share — pi shares via Radius artifact or GitHub gist; both need a
+        // remote backend rpi does not have yet (K3).
+        if (std.mem.eql(u8, word, "/share")) {
+            self.addMessage("\x1b[90mshare is not available yet (needs a Radius/gist backend — planned)\x1b[0m");
+            self.redraw();
+            return false;
+        }
+
+        // /bug — report to the rpi repository.
+        if (std.mem.eql(u8, word, "/bug")) {
+            const detail = if (arg.len > 0) arg else "(no description)";
+            self.addMessageFmt("bug tracker: https://git.yumakeji.cn/pengkebao/zpi/issues\nplease include: rpi v0.1.0 ({s}), the command you ran, and this description:\n  {s}", .{ @tagName(builtin.os.tag), detail });
+            self.redraw();
+            return false;
+        }
+
+        // /changelog — rpi keeps no packaged changelog file yet; point at git.
+        if (std.mem.eql(u8, word, "/changelog")) {
+            self.addMessage("rpi v0.1.0\nchangelog: https://git.yumakeji.cn/pengkebao/zpi/-/commits/main");
+            self.redraw();
+            return false;
+        }
+
+        // /thinking (pi) with the legacy /think kept as an alias.
         if (std.mem.eql(u8, word, "/think") or std.mem.eql(u8, word, "/thinking")) {
             if (arg.len == 0) {
                 self.note("Thinking level: {s} (off|low|medium|high|xhigh|max)", .{self.session.thinking_level.name()});
