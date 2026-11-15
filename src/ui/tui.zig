@@ -5816,17 +5816,28 @@ pub const TUI = struct {
 
     /// Remove and re-register one server's tools (after reconnect/exposure/
     /// enable/disable changes).
-    fn mcpReregisterTools(self: *TUI) void {
-        const mgr = mcp.Manager.getGlobal() orelse return;
-        const srv = mgr.findByName(self.mcpServerName()) orelse return;
-        const prefix = std.fmt.allocPrint(self.alloc, "mcp__{s}__", .{srv.name}) catch return;
+    /// Remove one server's tools from the registry. MUST run before the
+    /// server's tool strings are freed (registry Tool name/description
+    /// borrow `full_name`/`description` — freeing first leaves them dangling).
+    fn mcpRemoveToolsFor(self: *TUI, name: []const u8) void {
+        const prefix = std.fmt.allocPrint(self.alloc, "mcp__{s}__", .{name}) catch return;
         defer self.alloc.free(prefix);
         self.session.registry.removeMatchingOn(&.{prefix}, struct {
-            fn pred(patterns: []const []const u8, name: []const u8) bool {
-                return patterns.len > 0 and std.mem.startsWith(u8, name, patterns[0]);
+            fn pred(patterns: []const []const u8, tool_name: []const u8) bool {
+                return patterns.len > 0 and std.mem.startsWith(u8, tool_name, patterns[0]);
             }
         }.pred);
+    }
+
+    fn mcpAddToolsFor(self: *TUI, name: []const u8) void {
+        const mgr = mcp.Manager.getGlobal() orelse return;
+        const srv = mgr.findByName(name) orelse return;
         _ = srv.registerToolsInto(self.session.registry);
+    }
+
+    fn mcpReregisterTools(self: *TUI) void {
+        self.mcpRemoveToolsFor(self.mcpServerName());
+        self.mcpAddToolsFor(self.mcpServerName());
     }
 
     // ---- Project trust prompt (pi TrustSelectorComponent) ----
@@ -5978,10 +5989,12 @@ pub const TUI = struct {
                             self.alloc.free(em);
                             srv.error_msg = null;
                         }
+                        self.mcpRemoveToolsFor(srv.name);
                         if (mgr.reconnectServer(srv.name)) {
-                            self.mcpReregisterTools();
+                            self.mcpAddToolsFor(srv.name);
                             self.note("{s} connected", .{srv.name});
                         } else {
+                            self.mcpAddToolsFor(srv.name);
                             self.note("{s} reconnect failed", .{srv.name});
                         }
                     } else {
@@ -5997,11 +6010,12 @@ pub const TUI = struct {
                         self.note("{s} disabled", .{srv.name});
                     }
                 } else if (std.mem.eql(u8, action, "reconnect")) {
+                    self.mcpRemoveToolsFor(srv.name);
                     if (mgr.reconnectServer(srv.name)) {
-                        self.mcpReregisterTools();
+                        self.mcpAddToolsFor(srv.name);
                         self.note("{s} connected ({d} tools)", .{ srv.name, srv.tools.len });
                     } else {
-                        self.mcpReregisterTools();
+                        self.mcpAddToolsFor(srv.name);
                         self.note("{s} reconnect failed: {s}", .{ srv.name, srv.error_msg orelse "?" });
                     }
                 } else if (std.mem.eql(u8, action, "tools")) {
