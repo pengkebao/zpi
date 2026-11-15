@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("src/core/config.zig");
 const agent = @import("src/core/agent.zig");
 const ai = @import("src/ai/openai.zig");
+const aiprovider = @import("src/ai/provider.zig");
 const tools = @import("src/tools/registry.zig");
 const tui = @import("src/ui/tui.zig");
 
@@ -17,12 +18,13 @@ test "TUI batch2 leak" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
 
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test system prompt");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test system prompt");
     var t = tui.TUI.init(io, alloc, &session, model.name, "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     // Exercise the new editor + footer + multi-line transcript.
@@ -103,6 +105,7 @@ test "TUI batch2 leak" {
     alloc.free(model.name);
     alloc.free(model.base_url);
     alloc.free(model.api_key);
+    alloc.free(model.api);
 
     const leaks = safe.deinit();
     try std.testing.expectEqual(@as(usize, 0), leaks);

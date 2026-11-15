@@ -36,6 +36,7 @@ const scroll_view = @import("scroll_view.zig");
 const search = @import("search.zig");
 const keybindings = @import("keybindings.zig");
 const ai = @import("../ai/openai.zig");
+const aiprovider = @import("../ai/provider.zig");
 const builtin = @import("builtin");
 
 /// Test-only import so the in-file tests can build a session (kept out of
@@ -391,7 +392,7 @@ pub const TUI = struct {
     watch_captured: std.ArrayListUnmanaged(u8) = .empty,
     watch_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Providers created by /model switches; freed in deinit.
-    owned_provider: ?*ai.OpenAiProvider = null,
+    owned_provider: ?aiprovider.AnyProvider = null,
     /// Last emitted cursor park (hidden flag + row<<32|col): a no-change
     /// frame re-parking the same cursor used to emit bytes every tick.
     cursor_park_key: u64 = std.math.maxInt(u64),
@@ -1564,12 +1565,9 @@ pub const TUI = struct {
         const cfg = self.cfg orelse return error.NoConfig;
         if (idx >= cfg.models.items.len) return error.BadIndex;
         const m = &cfg.models.items[idx];
-        const p = try self.alloc.create(ai.OpenAiProvider);
-        errdefer self.alloc.destroy(p);
-        p.* = try ai.OpenAiProvider.init(self.alloc, self.io, m.base_url, m.api_key);
+        const p = try aiprovider.buildFromModel(self.alloc, self.io, m);
         if (self.owned_provider) |old| {
             old.deinit();
-            self.alloc.destroy(old);
         }
         self.owned_provider = p;
         self.session.provider = p;
@@ -2130,7 +2128,6 @@ pub const TUI = struct {
         self.stream_thinking.deinit();
         if (self.owned_provider) |p| {
             p.deinit();
-            self.alloc.destroy(p);
         }
         for (self.scrollback.items) |s| self.alloc.free(s);
         self.scrollback.deinit();
@@ -5085,10 +5082,12 @@ pub const TUI = struct {
 
     /// Split "/cmd arg" into the command word and the (trimmed) argument.
     fn parseCmd(cmd: []const u8) struct { word: []const u8, arg: []const u8 } {
-        var it = std.mem.splitScalar(u8, cmd, ' ');
-        const word = it.next() orelse "";
-        const arg = std.mem.trim(u8, it.next() orelse "", " ");
-        return .{ .word = word, .arg = arg };
+        const trimmed = std.mem.trim(u8, cmd, " \t");
+        if (trimmed.len == 0) return .{ .word = "", .arg = "" };
+        // word = first token; arg = the REST (multi-word args like
+        // "/login <provider> <key>" or "/name my session" stay intact).
+        const split_at = std.mem.indexOfScalar(u8, trimmed, ' ') orelse return .{ .word = trimmed, .arg = "" };
+        return .{ .word = trimmed[0..split_at], .arg = std.mem.trim(u8, trimmed[split_at + 1 ..], " \t") };
     }
 
     fn handleCommand(self: *TUI, cmd: []const u8) bool {
@@ -5257,6 +5256,61 @@ pub const TUI = struct {
                 }
             } else {
                 self.note("No config loaded", .{});
+            }
+            self.redraw();
+            return false;
+        }
+
+        // /login <provider> <api-key> — store a credential (pi /login: the
+        // interactive picker + secret prompt needs a text-input UI we don't
+        // have yet; the argument form covers api_key providers).
+        if (std.mem.eql(u8, word, "/login")) {
+            var pid: ?[]const u8 = null;
+            var key: ?[]const u8 = null;
+            var it = std.mem.tokenizeAny(u8, arg, " \t");
+            if (it.next()) |a| pid = a;
+            if (it.next()) |k| key = k;
+            if (pid == null or key == null) {
+                self.note("usage: /login <provider> <api-key>", .{});
+            } else if (self.cfg) |c| {
+                config.saveAuthEntry(self.alloc, self.io, c.base_dir, pid.?, key.?) catch {
+                    self.note("failed to write auth.json", .{});
+                    self.redraw();
+                    return false;
+                };
+                // Apply immediately to models of that provider.
+                var n: usize = 0;
+                for (c.models.items) |*m| {
+                    if (std.ascii.eqlIgnoreCase(m.provider, pid.?)) {
+                        const copy = self.alloc.dupe(u8, key.?) catch continue;
+                        self.alloc.free(m.api_key);
+                        m.api_key = copy;
+                        n += 1;
+                    }
+                }
+                self.note("logged in to {s} ({d} models updated)", .{ pid.?, n });
+            } else {
+                self.note("no config loaded", .{});
+            }
+            self.redraw();
+            return false;
+        }
+
+        // /logout [provider] — drop a stored credential (default: current).
+        if (std.mem.eql(u8, word, "/logout")) {
+            const pid = if (arg.len > 0) arg else self.session.model.provider;
+            if (self.cfg) |c| {
+                config.removeAuthEntry(self.alloc, self.io, c.base_dir, pid) catch {};
+                for (c.models.items) |*m| {
+                    if (std.mem.eql(u8, m.provider, pid)) {
+                        const blank = self.alloc.dupe(u8, "") catch continue;
+                        self.alloc.free(m.api_key);
+                        m.api_key = blank;
+                    }
+                }
+                self.note("logged out from {s}", .{pid});
+            } else {
+                self.note("no config loaded", .{});
             }
             self.redraw();
             return false;
@@ -6389,11 +6443,12 @@ test "liveBlockLocked: incremental stream render matches a full render" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools_test.Registry.init(alloc);
     try tools_test.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     t.width = 90;
     t.height = 30;

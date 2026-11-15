@@ -3,6 +3,7 @@ const tui = @import("src/ui/tui.zig");
 const config = @import("src/core/config.zig");
 const agent = @import("src/core/agent.zig");
 const ai = @import("src/ai/openai.zig");
+const aiprovider = @import("src/ai/provider.zig");
 const tools = @import("src/tools/registry.zig");
 const tool_search = @import("src/tools/tool_search.zig");
 const component = @import("src/ui/component.zig");
@@ -111,11 +112,12 @@ test "live block renders the full streaming markdown (pushes the viewport)" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
@@ -164,11 +166,12 @@ test "tool call: the pending box is repainted in place by its result" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     const pending_bg = "\x1b[48;2;52;56;58m";
@@ -236,11 +239,12 @@ test "selection: drag selects doc text, highlight reverses the range" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
@@ -289,11 +293,12 @@ test "streaming: the document size does not depend on the viewport" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
@@ -347,11 +352,12 @@ test "thinking: click collapses streaming and finished thinking blocks" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
@@ -414,11 +420,12 @@ test "selection: clicking a tool block toggles its expansion" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
@@ -476,11 +483,12 @@ test "resize: rerenderAtWidth re-wraps blocks and full-width backgrounds" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
     defer t.deinit();
 
@@ -531,11 +539,12 @@ test "scroll: the viewport saturates at both ends instead of wrapping" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     t.addMessage("one\ntwo\nthree\nfour\nfive");
@@ -570,11 +579,12 @@ test "scroll: scrolled-up viewport stays anchored when content grows" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     t.addMessage("head");
@@ -627,11 +637,12 @@ test "scroll: jump hint rect is hit only on the label" {
         .name = try alloc.dupe(u8, "test-model"),
         .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
         .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
     };
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
     var registry = tools.Registry.init(alloc);
     try tools.registerAll(&registry);
-    var session = try agent.Session.init(alloc, io, &model, &registry, &provider, "test");
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
     var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
 
     // Nothing shown: no hit anywhere.

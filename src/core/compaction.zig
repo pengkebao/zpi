@@ -7,6 +7,7 @@
 const std = @import("std");
 const msg = @import("message.zig");
 const ai = @import("../ai/openai.zig");
+const aiprovider = @import("../ai/provider.zig");
 const config = @import("config.zig");
 
 /// pi DEFAULT_COMPACTION_SETTINGS.
@@ -512,7 +513,7 @@ pub const SummaryResult = struct {
 pub fn generateSummary(
     alloc: std.mem.Allocator,
     io: std.Io,
-    provider: *ai.OpenAiProvider,
+    provider: aiprovider.AnyProvider,
     model_id: []const u8,
     messages_to_summarize: []const msg.Message,
     previous_summary: ?[]const u8,
@@ -560,7 +561,7 @@ pub fn generateSummary(
     var sess = SummarySession.init(alloc, abort_check);
     defer sess.deinit();
     // Compaction is a cheap summarization call: no reasoning effort.
-    provider.streamChat(model_id, wire.items, "[]", true, config.ThinkingLevel.off, .{}, &sess) catch |e| {
+    aiprovider.streamDispatch(provider, model_id, wire.items, "[]", true, config.ThinkingLevel.off, .{}, &sess) catch |e| {
         if (e == error.Aborted) return e;
         return e;
     };

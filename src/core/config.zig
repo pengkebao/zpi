@@ -114,6 +114,9 @@ pub const Config = struct {
         name: []u8, // display name
         base_url: []u8,
         api_key: []u8, // resolved key ("" if none)
+        /// Wire protocol: "openai-completions" (default) | "anthropic-messages"
+        /// | "openai-responses" | "google-generative-ai" (pi-ai api field).
+        api: []u8,
         auth_header: bool = false,
         context_window: usize = 128000,
         max_tokens: usize = 16384,
@@ -148,6 +151,7 @@ pub const Config = struct {
             alloc.free(m.name);
             alloc.free(m.base_url);
             alloc.free(m.api_key);
+            alloc.free(m.api);
             for (m.thinking_level_map) |slot| if (slot) |s| alloc.free(s);
         }
         self.models.deinit();
@@ -161,6 +165,135 @@ pub const Config = struct {
     }
 
     /// Find a model by "provider/id" or bare "id".
+    /// Resolution outcome for a CLI / --model pattern (pi resolveModelReference):
+    /// exact provider/id, exact id, provider-filtered fuzzy (substring),
+    /// unfiltered fuzzy with ambiguity reporting, and custom-id fallback.
+    pub const ModelResolution = union(enum) {
+        resolved: *const Model,
+        /// Same id offered by several providers — ask for provider/id.
+        ambiguous_id: void,
+        /// Fuzzy matched several models — picks the best (shortest id,
+        /// alias over dated) but reports the rest.
+        fuzzy: struct { model: *const Model, others: []*const Model },
+        not_found: void,
+    };
+
+    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0) return true;
+        if (needle.len > haystack.len) return false;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+        }
+        return false;
+    }
+
+    /// pi bestFuzzyMatch: alias ids (no -YYYYMMDD date suffix) beat dated
+    /// ones; then the lexicographically greatest id wins (latest).
+    fn fuzzyBetter(a: *const Model, b: *const Model) bool {
+        const a_alias = !hasDateSuffix(a.id);
+        const b_alias = !hasDateSuffix(b.id);
+        if (a_alias != b_alias) return a_alias;
+        return std.mem.order(u8, a.id, b.id) == .gt;
+    }
+
+    fn hasDateSuffix(id: []const u8) bool {
+        if (id.len < 9) return false;
+        const tail = id[id.len - 8 ..];
+        for (tail) |c| {
+            if (!std.ascii.isDigit(c)) return false;
+        }
+        return id[id.len - 9] == '-';
+    }
+
+    /// Resolve a model pattern (pi resolveModelReference, fuzzy=true):
+    /// 1. "provider/id" exact → 2. id exact across providers (ambiguity if
+    /// several) → 3. provider-scoped fuzzy substring → 4. global fuzzy
+    /// substring with best-match pick.
+    pub fn resolveModelPattern(
+        self: *const Config,
+        text: []const u8,
+        provider_filter: ?[]const u8,
+        alloc: std.mem.Allocator,
+    ) ModelResolution {
+        // provider/id exact (+ provider filter must agree)
+        if (std.mem.indexOfScalar(u8, text, '/')) |slash| {
+            const pid = text[0..slash];
+            const mid = text[slash + 1 ..];
+            var hit: ?*const Model = null;
+            for (self.models.items) |*m| {
+                if (std.mem.eql(u8, m.provider, pid) and std.mem.eql(u8, m.id, mid)) {
+                    hit = m;
+                    break;
+                }
+            }
+            if (hit) |m| return .{ .resolved = m };
+            // provider-scoped fuzzy on the id part
+            var best: ?*const Model = null;
+            for (self.models.items) |*m| {
+                if (!std.mem.eql(u8, m.provider, pid)) continue;
+                if (containsIgnoreCase(m.id, mid) or containsIgnoreCase(m.name, mid)) {
+                    if (best == null or fuzzyBetter(m, best.?)) best = m;
+                }
+            }
+            if (best) |m| return .{ .resolved = m };
+            return .not_found;
+        }
+
+        // provider filter (case-insensitive match on provider id)
+        var scoped: ?[]const u8 = null;
+        if (provider_filter) |pf| {
+            for (self.models.items) |*m| {
+                if (std.ascii.eqlIgnoreCase(m.provider, pf)) {
+                    scoped = m.provider;
+                    break;
+                }
+            }
+            if (scoped == null) return .not_found;
+        }
+
+        // exact id (within provider scope if any)
+        var exact: ?*const Model = null;
+        var multiple = false;
+        for (self.models.items) |*m| {
+            if (scoped) |sp| {
+                if (!std.mem.eql(u8, m.provider, sp)) continue;
+            }
+            if (std.mem.eql(u8, m.id, text)) {
+                if (exact == null) {
+                    exact = m;
+                } else {
+                    multiple = true;
+                }
+            }
+        }
+        if (exact) |m| {
+            if (multiple) return .ambiguous_id;
+            return .{ .resolved = m };
+        }
+
+        // fuzzy substring on id/name
+        var best: ?*const Model = null;
+        var others = std.array_list.Managed(*const Model).init(alloc);
+        for (self.models.items) |*m| {
+            if (scoped) |sp| {
+                if (!std.mem.eql(u8, m.provider, sp)) continue;
+            }
+            if (containsIgnoreCase(m.id, text) or containsIgnoreCase(m.name, text)) {
+                if (best == null or fuzzyBetter(m, best.?)) {
+                    if (best) |b| others.append(b) catch {};
+                    best = m;
+                } else {
+                    others.append(m) catch {};
+                }
+            }
+        }
+        if (best) |m| {
+            return .{ .fuzzy = .{ .model = m, .others = others.toOwnedSlice() catch &.{} } };
+        }
+        return .not_found;
+    }
+
     pub fn findModel(self: *const Config, ref: []const u8) ?*const Model {
         for (self.models.items) |*m| {
             const full = std.fmt.allocPrint(self.models.allocator, "{s}/{s}", .{ m.provider, m.id }) catch continue;
@@ -310,7 +443,9 @@ pub const Config = struct {
     /// Load `<cwd>/.pi/settings.json` (project scope) on top of the global
     /// settings. Project-trust gated: the caller only invokes this when the
     /// project is trusted (pi settings-manager project scope).
-    pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, cwd: []const u8) !void {
+    
+
+pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, cwd: []const u8) !void {
         var buf: [1 << 20]u8 = undefined;
         const joined = std.fmt.allocPrint(alloc, "{s}/.pi/settings.json", .{cwd}) catch return error.OutOfMemory;
         defer alloc.free(joined);
@@ -366,49 +501,167 @@ pub const Config = struct {
     }
 };
 
-// ── Built-in providers (subset of pi's catalog, verified values) ────
-
-const BuiltinProvider = struct {
-    id: []const u8,
-    base_url: []const u8,
-    env_var: []const u8,
-};
-
-const builtins = [_]BuiltinProvider{
-    .{ .id = "zai-coding-cn", .base_url = "https://open.bigmodel.cn/api/coding/paas/v4", .env_var = "ZAI_CODING_CN_API_KEY" },
-    .{ .id = "zai", .base_url = "https://api.z.ai/api/coding/paas/v4", .env_var = "ZAI_API_KEY" },
-};
-
-const BuiltinModel = struct {
-    provider: []const u8,
-    id: []const u8,
-    name: []const u8,
-    ctx: usize,
-    max: usize,
-    reasoning: bool,
-    cost_input: f64,
-    cost_output: f64,
-    cost_cache_read: f64,
-};
-
-const builtin_models = [_]BuiltinModel{
-    .{ .provider = "zai-coding-cn", .id = "glm-4.6v", .name = "GLM-4.6V", .ctx = 128000, .max = 32768, .reasoning = true, .cost_input = 0.3, .cost_output = 0.9, .cost_cache_read = 0.05 },
-    .{ .provider = "zai-coding-cn", .id = "glm-5.3", .name = "GLM-5.3", .ctx = 1000000, .max = 131072, .reasoning = true, .cost_input = 1.4, .cost_output = 4.4, .cost_cache_read = 0.26 },
-    .{ .provider = "zai-coding-cn", .id = "glm-5.3-flash", .name = "GLM-5.3-Flash", .ctx = 1000000, .max = 131072, .reasoning = true, .cost_input = 0.15, .cost_output = 0.5, .cost_cache_read = 0.03 },
-};
-
-fn builtinEnv(provider_id: []const u8) ?[]const u8 {
-    for (builtins) |b| {
-        if (std.mem.eql(u8, b.id, provider_id)) return b.env_var;
+/// Store (or update) an api_key credential in <agent-dir>/auth.json,
+/// preserving unrelated fields (pi auth-storage semantics).
+pub fn saveAuthEntry(alloc: std.mem.Allocator, io: std.Io, base_dir: []const u8, provider: []const u8, key: []const u8) !void {
+    const path = try std.fmt.allocPrint(alloc, "{s}/auth.json", .{base_dir});
+    defer alloc.free(path);
+    var root: std.json.ObjectMap = .empty;
+    var buf: [1 << 16]u8 = undefined;
+    if (std.Io.Dir.cwd().readFile(io, path, &buf)) |data| {
+        if (std.json.parseFromSlice(std.json.Value, alloc, data, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) root = parsed.value.object;
+        } else |_| {}
+    } else |_| {}
+    // NOTE: root keys alias the parsed arena; rebuild the object with owned
+    // copies via stringify of a fresh value tree instead of mutating in place
+    // across allocators (the setEntryField lesson).
+    var out = std.array_list.Managed(u8).init(alloc);
+    defer out.deinit();
+    try out.append('{');
+    var wrote = false;
+    if (root.count() > 0) {
+        var it = root.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, provider)) continue; // replaced below
+            if (wrote) try out.append(',');
+            wrote = true;
+            try appendJsonStringField(&out, e.key_ptr.*, e.value_ptr.*);
+        }
     }
-    return null;
+    if (wrote) try out.append(',');
+    wrote = true;
+    try out.append('"');
+    try out.appendSlice(provider);
+    try out.appendSlice("\":{\"type\":\"api_key\",\"key\":");
+    try appendJsonString(&out, key);
+    try out.append('}');
+    try out.append('}');
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
 }
 
-fn builtinBaseUrl(provider_id: []const u8) ?[]const u8 {
-    for (builtins) |b| {
-        if (std.mem.eql(u8, b.id, provider_id)) return b.base_url;
+/// Remove a provider's credential from <agent-dir>/auth.json.
+pub fn removeAuthEntry(alloc: std.mem.Allocator, io: std.Io, base_dir: []const u8, provider: []const u8) !void {
+    const path = try std.fmt.allocPrint(alloc, "{s}/auth.json", .{base_dir});
+    defer alloc.free(path);
+    var buf: [1 << 16]u8 = undefined;
+    const data = std.Io.Dir.cwd().readFile(io, path, &buf) catch return;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const root = parsed.value.object;
+    var out = std.array_list.Managed(u8).init(alloc);
+    defer out.deinit();
+    try out.append('{');
+    var wrote = false;
+    var it = root.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*, provider)) continue;
+        if (wrote) try out.append(',');
+        wrote = true;
+        try appendJsonStringField(&out, e.key_ptr.*, e.value_ptr.*);
     }
-    return null;
+    try out.append('}');
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+}
+
+/// Copy a JSON value (from a parsed arena) into `out` as `"key":value`.
+fn appendJsonStringField(out: *std.array_list.Managed(u8), key: []const u8, value: std.json.Value) !void {
+    try out.append('"');
+    try out.appendSlice(key);
+    try out.appendSlice("\":");
+    const rendered = std.json.Stringify.valueAlloc(out.allocator, value, .{}) catch "null";
+    defer if (rendered.len > 0) out.allocator.free(@constCast(rendered));
+    try out.appendSlice(rendered);
+}
+
+fn appendJsonString(out: *std.array_list.Managed(u8), s: []const u8) !void {
+    try out.append('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice("\\\""),
+            '\\' => try out.appendSlice("\\\\"),
+            '\n' => try out.appendSlice("\\n"),
+            '\r' => try out.appendSlice("\\r"),
+            '\t' => try out.appendSlice("\\t"),
+            else => {
+                if (c < 0x20) {
+                    var buf: [8]u8 = undefined;
+                    const w = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try out.appendSlice(w);
+                } else {
+                    try out.append(c);
+                }
+            },
+        }
+    }
+    try out.append('"');
+}
+
+
+// ── Built-in provider catalog (generated from pi-ai's model catalog) ──
+// tools/gen_catalog.py regenerates src/ai/catalog.json from pi 1.5.0:
+// chat models on the four wire protocols rpi implements, from providers
+// that authenticate with a plain API-key env var (~23 providers, ~700
+// models: openai-completions / anthropic-messages / openai-responses /
+// google-generative-ai).
+
+const catalog_text = @embedFile("../ai/catalog.json");
+
+/// Parsed catalog handle (valid while `parsed` is alive).
+const Catalog = struct {
+    parsed: std.json.Parsed(std.json.Value),
+
+    fn providers(self: *const Catalog) ?std.json.Array {
+        return switch (self.parsed.value) {
+            .object => |o| switch (o.get("providers") orelse return null) {
+                .array => |a| a,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    fn find(self: *const Catalog, provider_id: []const u8) ?std.json.ObjectMap {
+        const arr = self.providers() orelse return null;
+        for (arr.items) |item| {
+            switch (item) {
+                .object => |o| {
+                    const id = o.get("id") orelse continue;
+                    switch (id) {
+                        .string => |sid| if (std.mem.eql(u8, sid, provider_id)) return o,
+                        else => {},
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn str(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+        const v = obj.get(key) orelse return null;
+        return switch (v) {
+            .string => |x| x,
+            else => null,
+        };
+    }
+
+    fn envVar(self: *const Catalog, provider_id: []const u8) ?[]const u8 {
+        const o = self.find(provider_id) orelse return null;
+        return str(o, "env");
+    }
+
+    fn baseUrl(self: *const Catalog, provider_id: []const u8) ?[]const u8 {
+        const o = self.find(provider_id) orelse return null;
+        return str(o, "baseUrl");
+    }
+};
+
+fn parseCatalog(alloc: std.mem.Allocator) ?Catalog {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, catalog_text, .{}) catch return null;
+    return .{ .parsed = parsed };
 }
 
 // ── JSON helpers ────────────────────────────────────────────────────
@@ -591,6 +844,11 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
         cfg.applySettingsValue(alloc, root);
     }
 
+    // Catalog handle for env-var fallbacks in models.json providers.
+    var cat_for_env_holder: ?Catalog = parseCatalog(alloc);
+    defer if (cat_for_env_holder) |*c| c.parsed.deinit();
+    const cat_for_env: *const Catalog = &(cat_for_env_holder.?);
+
     // 4. models.json — custom providers
     var provider_infos = std.array_list.Managed(ProviderInfo).init(alloc);
     defer {
@@ -642,7 +900,7 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                 }
             }
             if (key.len == 0) {
-                if (builtinEnv(pid)) |env_name| {
+                if (cat_for_env.envVar(pid)) |env_name| {
                     if (std.process.Environ.getPosix(environ, env_name)) |v| {
                         key = try alloc.dupe(u8, std.mem.sliceTo(v, 0));
                     }
@@ -682,6 +940,10 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                     .id = try alloc.dupe(u8, mid),
                     .name = try alloc.dupe(u8, strIn(mo, "name") orelse mid),
                     .base_url = try alloc.dupe(u8, m_base),
+                    .api = blk_api: {
+                        const a = strIn(mo, "api") orelse strIn(p, "api") orelse "openai-completions";
+                        break :blk_api try alloc.dupe(u8, a);
+                    },
                     .api_key = try alloc.dupe(u8, key),
                     .auth_header = strIn(mo, "authHeader") != null or p_auth_header,
                     .context_window = numIn(mo, "contextWindow") orelse 128000,
@@ -719,68 +981,121 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
         }
     }
 
-    // 5. Built-in providers (auth.json / env credentials), not overridden in models.json
-    for (builtins) |b| {
-        var defined = false;
-        for (provider_infos.items) |pi| {
-            if (std.mem.eql(u8, pi.id, b.id)) {
-                defined = true;
-                break;
-            }
-        }
-        if (defined) continue;
+    // 5. Built-in catalog providers (auth.json / env credentials), not
+    // overridden in models.json. The full generated catalog (~23 providers,
+    // ~700 models across the four wire protocols) is embedded.
+    if (parseCatalog(alloc)) |*cat| {
+        defer cat.parsed.deinit();
+        if (cat.providers()) |cat_providers| {
+            for (cat_providers.items) |item| {
+                const po = switch (item) {
+                    .object => |o| o,
+                    else => continue,
+                };
+                const pid = Catalog.str(po, "id") orelse continue;
 
-        var key: []u8 = "";
-        for (auth.items) |a| {
-            if (std.mem.eql(u8, a.provider, b.id)) {
-                key = try alloc.dupe(u8, a.key);
-                break;
-            }
-        }
-        if (key.len == 0) {
-            if (std.process.Environ.getPosix(environ, b.env_var)) |v| {
-                key = try alloc.dupe(u8, std.mem.sliceTo(v, 0));
-            }
-        }
-        const is_default = cfg.default_provider != null and
-            std.mem.eql(u8, cfg.default_provider.?, b.id);
-        if (key.len == 0 and !is_default) {
-            if (key.len > 0) alloc.free(key);
-            continue;
-        }
+                var defined = false;
+                for (provider_infos.items) |pi| {
+                    if (std.mem.eql(u8, pi.id, pid)) {
+                        defined = true;
+                        break;
+                    }
+                }
+                if (defined) continue;
 
-        var added = false;
-        for (builtin_models) |bm| {
-            if (!std.mem.eql(u8, bm.provider, b.id)) continue;
-            try cfg.models.append(.{
-                .provider = try alloc.dupe(u8, b.id),
-                .id = try alloc.dupe(u8, bm.id),
-                .name = try alloc.dupe(u8, bm.name),
-                .base_url = try alloc.dupe(u8, b.base_url),
-                .api_key = try alloc.dupe(u8, key),
-                .context_window = bm.ctx,
-                .max_tokens = bm.max,
-                .reasoning = bm.reasoning,
-                .thinking_level = if (bm.reasoning) ThinkingLevel.high else .off,
-                .cost_input = bm.cost_input,
-                .cost_output = bm.cost_output,
-                .cost_cache_read = bm.cost_cache_read,
-                .cost_cache_write = 0,
-            });
-            added = true;
-        }
-        if (!added and is_default) {
-            if (cfg.default_model) |dm| {
-                try cfg.models.append(.{
-                    .provider = try alloc.dupe(u8, b.id),
-                    .id = try alloc.dupe(u8, dm),
-                    .name = try alloc.dupe(u8, dm),
-                    .base_url = try alloc.dupe(u8, b.base_url),
-                    .api_key = try alloc.dupe(u8, key),
-                });
+                var key: []u8 = "";
+                for (auth.items) |a| {
+                    if (std.mem.eql(u8, a.provider, pid)) {
+                        key = try alloc.dupe(u8, a.key);
+                        break;
+                    }
+                }
+                if (key.len == 0) {
+                    if (Catalog.str(po, "env")) |env_name| {
+                        if (std.process.Environ.getPosix(environ, env_name)) |v| {
+                            key = try alloc.dupe(u8, std.mem.sliceTo(v, 0));
+                        }
+                    }
+                }
+                const is_default = cfg.default_provider != null and
+                    std.mem.eql(u8, cfg.default_provider.?, pid);
+                if (key.len == 0 and !is_default) {
+                    if (key.len > 0) alloc.free(key);
+                    continue;
+                }
+
+                const prov_base = Catalog.str(po, "baseUrl") orelse "";
+                var added = false;
+                if (po.get("models")) |mv| {
+                    switch (mv) {
+                        .array => |marr| {
+                            for (marr.items) |mi| {
+                                const mo = switch (mi) {
+                                    .object => |o| o,
+                                    else => continue,
+                                };
+                                const mid = Catalog.str(mo, "id") orelse continue;
+                                const m_api = Catalog.str(mo, "api") orelse "openai-completions";
+                                const m_base = Catalog.str(mo, "baseUrl") orelse prov_base;
+                                if (m_base.len == 0) continue;
+                                try cfg.models.append(.{
+                                    .provider = try alloc.dupe(u8, pid),
+                                    .id = try alloc.dupe(u8, mid),
+                                    .name = try alloc.dupe(u8, Catalog.str(mo, "name") orelse mid),
+                                    .base_url = try alloc.dupe(u8, m_base),
+                                    .api = try alloc.dupe(u8, m_api),
+                                    .api_key = try alloc.dupe(u8, key),
+                                    .context_window = @intCast(numIn(mo, "ctx") orelse 128000),
+                                    .max_tokens = @intCast(numIn(mo, "max") orelse 16384),
+                                    .reasoning = boolIn(mo, "reasoning", false),
+                                    .thinking_level = if (boolIn(mo, "reasoning", false)) ThinkingLevel.high else .off,
+                                    .thinking_format = blk_ctf: {
+                                        const tf = Catalog.str(mo, "tf") orelse break :blk_ctf .default;
+                                        if (std.mem.eql(u8, tf, "zai")) break :blk_ctf .zai;
+                                        if (std.mem.eql(u8, tf, "qwen")) break :blk_ctf .qwen;
+                                        break :blk_ctf .default;
+                                    },
+                                    .supports_images = boolIn(mo, "images", true),
+                                    .thinking_level_map = blk_cmap: {
+                                        var map = [6]?[]u8{null, null, null, null, null, null};
+                                        if (mo.get("map")) |tm| {
+                                            if (tm == .object) {
+                                                for (&map, 0..) |*slot, li| {
+                                                    const lv_name = @as(ThinkingLevel, @enumFromInt(li)).name();
+                                                    if (tm.object.get(lv_name)) |v| {
+                                                        if (v == .string) slot.* = alloc.dupe(u8, v.string) catch null;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        break :blk_cmap map;
+                                    },
+                                    .cost_input = costIn(mo, "ci"),
+                                    .cost_output = costIn(mo, "co"),
+                                    .cost_cache_read = costIn(mo, "cr"),
+                                    .cost_cache_write = costIn(mo, "cw"),
+                                });
+                                added = true;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                if (!added and is_default) {
+                    if (cfg.default_model) |dm| {
+                        try cfg.models.append(.{
+                            .provider = try alloc.dupe(u8, pid),
+                            .id = try alloc.dupe(u8, dm),
+                            .name = try alloc.dupe(u8, dm),
+                            .base_url = try alloc.dupe(u8, prov_base),
+                            .api = try alloc.dupe(u8, "openai-completions"),
+                            .api_key = try alloc.dupe(u8, key),
+                        });
+                    }
+                }
+                if (key.len > 0) alloc.free(key);
             }
         }
-        if (key.len > 0) alloc.free(key);
     }
 
     // 6. Synthesize settings default model if still missing
@@ -799,12 +1114,17 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                     break;
                 }
             }
+            var cat_holder: ?Catalog = null;
+            defer if (cat_holder) |*c| c.parsed.deinit();
+            cat_holder = parseCatalog(alloc);
             if (base.len == 0) {
-                if (builtinBaseUrl(cfg.default_provider.?)) |bb| {
-                    base = bb;
-                    if (builtinEnv(cfg.default_provider.?)) |env_name| {
-                        if (std.process.Environ.getPosix(environ, env_name)) |v| {
-                            key = std.mem.sliceTo(v, 0);
+                if (cat_holder) |*c| {
+                    if (c.baseUrl(cfg.default_provider.?)) |bb| {
+                        base = bb;
+                        if (c.envVar(cfg.default_provider.?)) |env_name| {
+                            if (std.process.Environ.getPosix(environ, env_name)) |v| {
+                                key = std.mem.sliceTo(v, 0);
+                            }
                         }
                     }
                 }
@@ -823,6 +1143,7 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                     .id = try alloc.dupe(u8, cfg.default_model.?),
                     .name = try alloc.dupe(u8, cfg.default_model.?),
                     .base_url = try alloc.dupe(u8, base),
+                    .api = try alloc.dupe(u8, "openai-completions"),
                     .api_key = try alloc.dupe(u8, key),
                     .auth_header = auth_header,
                 });

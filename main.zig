@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const config = @import("src/core/config.zig");
 const agent = @import("src/core/agent.zig");
 const ai = @import("src/ai/openai.zig");
+const aiprovider = @import("src/ai/provider.zig");
 const tools = @import("src/tools/registry.zig");
 const trust = @import("src/core/trust.zig");
 const events = @import("src/core/events.zig");
@@ -464,6 +465,9 @@ pub fn main(init: std.process.Init) !void {
     var model_name: ?[]const u8 = null;
     var cli_thinking: ?config.ThinkingLevel = null;
     var model_id: ?[]const u8 = null;
+    var cli_provider: ?[]const u8 = null;
+    var cli_api_key: ?[]const u8 = null;
+    var cli_models_scope: ?[]const u8 = null;
     var cwd: ?[]const u8 = null;
     var no_tui = false;
     var list_models = false;
@@ -510,6 +514,15 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--model-id")) {
             if (i + 1 < argv.items.len) model_id = argv.items[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--provider")) {
+            if (i + 1 < argv.items.len) cli_provider = argv.items[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--api-key")) {
+            if (i + 1 < argv.items.len) cli_api_key = argv.items[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--models")) {
+            if (i + 1 < argv.items.len) cli_models_scope = argv.items[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, arg, "--cwd")) {
             if (i + 1 < argv.items.len) cwd = argv.items[i + 1];
@@ -658,6 +671,7 @@ pub fn main(init: std.process.Init) !void {
     // Resolve cwd EARLY: the trust decision gates project settings (which
     // feed defaultTools) and project resource loading.
     var cwd_alloc: ?[]u8 = null;
+    defer if (cwd_alloc) |c| alloc.free(c);
     const cwd_abs = blk2: {
         if (cwd) |c| {
             break :blk2 c;
@@ -735,27 +749,116 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Select model: -m/--model-id > settings.json default > first
-    var model: config.Config.Model = blk: {
-        if (model_name) |name| {
-            // pi resolveModelReference: exact reference first, then a
-            // `:level` thinking suffix split (strict — an invalid suffix
-            // keeps the text whole and fails). Explicit --thinking wins
-            // over the suffix (pi main.js).
-            if (cfg.findModel(name)) |m| {
-                var mm = m.*;
-                if (cli_thinking) |tl| mm.thinking_level = tl;
-                break :blk mm;
+    // --models scope: restrict/reorder cfg.models to the matching patterns
+    // (pi resolveModelScope; comma-separated patterns, "provider/*" globs
+    // match by prefix segments, ":level" suffix sets a per-model thinking).
+    if (cli_models_scope) |scope| {
+        var scoped = std.array_list.Managed(config.Config.Model).init(alloc);
+        var it = std.mem.splitScalar(u8, scope, ',');
+        while (it.next()) |raw_pat| {
+            const pat = std.mem.trim(u8, raw_pat, " \t");
+            if (pat.len == 0) continue;
+            var base = pat;
+            var pat_thinking: ?config.ThinkingLevel = null;
+            if (config.splitThinkingSuffix(pat)) |suf| {
+                base = suf.base;
+                pat_thinking = suf.level;
             }
-            if (config.splitThinkingSuffix(name)) |suffix| {
-                if (cfg.findModel(suffix.base)) |m| {
-                    var mm = m.*;
-                    mm.thinking_level = cli_thinking orelse suffix.level;
-                    break :blk mm;
+            var matched_any = false;
+            for (cfg.models.items) |m| {
+                const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ m.provider, m.id }) catch continue;
+                defer alloc.free(full);
+                const hit = if (std.mem.endsWith(u8, base, "*"))
+                    (std.mem.startsWith(u8, full, base[0 .. base.len - 1]) or
+                        std.mem.startsWith(u8, m.id, base[0 .. base.len - 1]))
+                else
+                    (std.mem.eql(u8, full, base) or std.mem.eql(u8, m.id, base) or
+                        std.mem.eql(u8, m.name, base));
+                if (hit) {
+                    var mm = m;
+                    if (pat_thinking) |tl| mm.thinking_level = tl;
+                    scoped.append(mm) catch {};
+                    matched_any = true;
                 }
             }
-            std.debug.print("error: unknown model '{s}' (use --list-models)\n", .{name});
-            return error.UnknownModel;
+            if (!matched_any) {
+                std.debug.print("warning: no models match pattern \"{s}\"\n", .{pat});
+            }
+        }
+        if (scoped.items.len > 0) {
+            cfg.models.deinit();
+            cfg.models = scoped;
+        } else {
+            for (scoped.items) |_| {}
+            scoped.deinit();
+            std.debug.print("warning: --models matched nothing; keeping full catalog\n", .{});
+        }
+    }
+
+    // Select model: -m/--model-id > settings.json default > first
+    // (pi resolveCliModel: provider/id > id (ambiguity-checked) > fuzzy
+    // substring with alias-over-dated tie-break; custom-id fallback for an
+    // unknown id on a known provider.)
+    var model: config.Config.Model = blk: {
+        if (model_name) |name| {
+            var pattern = name;
+            var suffix_level: ?config.ThinkingLevel = null;
+            if (config.splitThinkingSuffix(name)) |suffix| {
+                pattern = suffix.base;
+                suffix_level = suffix.level;
+            }
+            switch (cfg.resolveModelPattern(pattern, cli_provider, alloc)) {
+                .resolved => |m| {
+                    var mm = m.*;
+                    if (cli_api_key) |k| {
+                        alloc.free(mm.api_key);
+                        mm.api_key = try alloc.dupe(u8, k);
+                    }
+                    mm.thinking_level = cli_thinking orelse suffix_level orelse mm.thinking_level;
+                    break :blk mm;
+                },
+                .ambiguous_id => {
+                    std.debug.print("error: model '{s}' is ambiguous across providers. Use provider/id.\n", .{pattern});
+                    return error.UnknownModel;
+                },
+                .fuzzy => |f| {
+                    var mm = f.model.*;
+                    if (cli_api_key) |k| {
+                        alloc.free(mm.api_key);
+                        mm.api_key = try alloc.dupe(u8, k);
+                    }
+                    mm.thinking_level = cli_thinking orelse suffix_level orelse mm.thinking_level;
+                    std.debug.print("note: '{s}' matched {s}/{s}", .{ pattern, mm.provider, mm.id });
+                    if (f.others.len > 0) {
+                        std.debug.print(" ({d} other candidates)", .{f.others.len});
+                    }
+                    std.debug.print("\n", .{});
+                    break :blk mm;
+                },
+                .not_found => {
+                    // pi fallback: custom model id on the requested (or
+                    // scoped) provider, reusing its default model's settings.
+                    if (cli_provider != null or cli_api_key != null) {
+                        for (cfg.models.items) |m| {
+                            if (cli_provider) |pf| {
+                                if (!std.ascii.eqlIgnoreCase(m.provider, pf)) continue;
+                            }
+                            var mm = m;
+                            mm.id = try alloc.dupe(u8, pattern);
+                            mm.name = mm.id;
+                            if (cli_api_key) |k| {
+                                alloc.free(mm.api_key);
+                                mm.api_key = try alloc.dupe(u8, k);
+                            }
+                            mm.thinking_level = cli_thinking orelse suffix_level orelse mm.thinking_level;
+                            std.debug.print("warning: model '{s}' not found for provider '{s}'. Using custom model id.\n", .{ pattern, mm.provider });
+                            break :blk mm;
+                        }
+                    }
+                    std.debug.print("error: unknown model '{s}' (use --list-models)\n", .{pattern});
+                    return error.UnknownModel;
+                },
+            }
         }
         if (model_id) |id| {
             if (cfg.findModel(id)) |m| {
@@ -776,8 +879,8 @@ pub fn main(init: std.process.Init) !void {
         break :blk mm;
     };
 
-    // Init provider
-    var provider = try ai.OpenAiProvider.init(alloc, io, model.base_url, model.api_key);
+    // Init provider (wire protocol selected by the model's api field)
+    var provider = try aiprovider.buildFromModel(alloc, io, &model);
     defer provider.deinit();
 
     // Init tools
@@ -1103,7 +1206,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Create session
     const model_ptr = &model;
-    var session = try agent.Session.init(alloc, io, model_ptr, &registry, &provider, system_prompt);
+    var session = try agent.Session.init(alloc, io, model_ptr, &registry, provider, system_prompt);
     defer session.deinit();
     alloc.free(system_prompt);
     session.compaction = cfg.compaction;

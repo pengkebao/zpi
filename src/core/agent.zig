@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const msg = @import("message.zig");
 const ai = @import("../ai/openai.zig");
+const aiprovider = @import("../ai/provider.zig");
 const events = @import("events.zig");
 const tools = @import("../tools/registry.zig");
 const config = @import("config.zig");
@@ -92,7 +93,7 @@ pub const Session = struct {
     io: std.Io,
     model: *const config.Config.Model,
     registry: *tools.Registry,
-    provider: *ai.OpenAiProvider,
+    provider: aiprovider.AnyProvider,
     context: msg.Context,
     exec_ctx: tools.ExecutionContext,
     max_tool_rounds: usize = 50,
@@ -140,7 +141,7 @@ pub const Session = struct {
         io: std.Io,
         model: *const config.Config.Model,
         registry: *tools.Registry,
-        provider: *ai.OpenAiProvider,
+        provider: aiprovider.AnyProvider,
         system_prompt: []const u8,
     ) !Session {
         const cwd: []const u8 = ".";
@@ -578,7 +579,8 @@ pub const Session = struct {
             self.stream_usage = null;
 
             // Call LLM (retries + abort-aware, see openai.zig)
-            self.provider.streamChat(
+            aiprovider.streamDispatch(
+                self.provider,
                 self.model.id,
                 wire_msgs.items,
                 tools_json,

@@ -107,22 +107,32 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 
 ### 6. 模型与 Provider
 
+> 2026-12 刷新：**四协议全实现 + 全量内置目录**。`src/ai/{openai,anthropic,google,responses,provider,sse}.zig`；
+> 目录 = `tools/gen_catalog.py` 从 pi-ai 1.5.0 生成的 `src/ai/catalog.json`（@embedFile，23 家 provider / ~700 模型，
+> 只收四协议 chat 模型 + 纯 API-key env 认证的 provider）。
+
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
-| openai-completions（SSE+tools） | ✅ | ✅ | |
-| anthropic-messages | ✅ | ❌ | Claude 全系 |
-| openai-responses | ✅ | ❌ | |
-| google-generative-ai | ✅ | ❌ | |
-| 内置 provider 目录（~40 家 + 图片/分类模型） | ✅ | ⚠️ | 仅 zai / zai-coding-cn 两家 |
-| models.json 自定义 provider | ✅ | ✅ | 本次对齐：providers/models/apiKey/authHeader/$ENV/!cmd |
-| auth.json 凭证 | ✅ | ✅ | |
-| OAuth（radius/anthropic/copilot/...） | ✅ | ❌ | |
-| `/login` `/logout`、`pi auth check/print-api-key` | ✅ | ❌ | |
-| 模型模糊匹配（id/name 模式、`--provider` 限定） | ✅ | ⚠️ | 目前仅精确 `provider/id` 或裸 id |
-| `--thinking`/`:level` 后缀/`--api-key`/`--models` 作用域 | ✅ | ❌ | |
-| samplingParams / compat / virtual models | ✅ | ❌ | thinkingFormat(zai/qwen/deepseek...) 已见字段，未消费 |
+| openai-completions（SSE+tools） | ✅ | ✅ | 原 openai.zig（thinkingFormat zai/qwen/deepseek 已消费） |
+| anthropic-messages | ✅ | ✅ | **Phase 6**：x-api-key+anthropic-version 头、顶层 system 数组、tool_use/tool_result blocks、thinking(budget_tokens 按档位)、无签名 thinking 回传转 text（pi allowEmptySignature=false 语义）、SSE message_start/content_block_*/message_delta（input_json_delta → 增量 tool_call 管线复用 openai 格式）|
+| openai-responses | ✅ | ✅ | **Phase 6**：instructions、input items（message/function_call/function_call_output）、reasoning.effort、SSE output_text.delta/output_item.added/function_call_arguments.delta/response.completed |
+| google-generative-ai | ✅ | ✅ | **Phase 6**：x-goog-api-key、systemInstruction、functionCall/functionResponse parts（**call_id→函数名映射**，response 包 `{"result":...}`）、thinkingConfig.includeThoughts、usageMetadata（含 thoughtsTokenCount）|
+| provider 分发 | ✅ | ✅ | `provider.zig`：ApiKind(4) + AnyProvider union + streamDispatch/lastErrorText/buildFromModel；Model 新增 `api` 字段（models.json/catalog 的 "api"）；agent.Session/compaction 走 dispatch；公共 SSE 泵 `sse.zig`（POST+行泵+错误体捕获，retry 留各适配器）|
+| 内置 provider 目录（~40 家） | ✅ | ✅（缩编 23 家） | catalog.json 生成式内置：openai/anthropic/google/xai/deepseek/moonshotai(+cn)/zai(+coding-cn)/kimi-coding/minimax(+cn)/mistral/groq/together/fireworks/openrouter/cerebras/nvidia/baseten/ant-ling/meta/xiaomi/huggingface；模型级 api/baseUrl/reasoning/ctx/max/cost/images/thinkingFormat/thinkingLevelMap 全带 |
+| models.json 自定义 provider | ✅ | ✅ | providers/models/apiKey/authHeader/$ENV/!cmd + **api 字段**（provider 或 model 级，缺省 openai-completions）；env 兜底查 catalog |
+| auth.json 凭证 | ✅ | ✅ | 加载 + **写入**（saveAuthEntry/removeAuthEntry，未知字段保留） |
+| OAuth（radius/anthropic/copilot/...） | ✅ | ❌ | J6（/mcp OAuth 一起） |
+| `/login` `/logout`、`pi auth ...` | ✅ | ✅（api_key 类） | `/login <provider> <api-key>`：写 auth.json + 即时更新同 provider 全部模型；`/logout [provider]`（缺省当前）；OAuth 类待 J6 |
+| 模型模糊匹配（id/name、--provider） | ✅ | ✅ | `resolveModelPattern`（pi resolveModelReference）：provider/id 精确 > 跨家 id 精确（**多家同 id → ambiguous 报错**）> provider 限定 fuzzy 子串 > 全局 fuzzy（**alias 优先于 -YYYYMMDD 日期版，字典序最新**）+ `--provider` 限定 + 未知 id 的 **custom-id fallback**（同 provider 第一个模型的配置换 id，pi buildFallbackModel）|
+| `--thinking`/`:level`/`--api-key`/`--models` | ✅ | ✅ | --thinking level（显式优先）、`--model id:level` 后缀、--api-key 覆盖（不参与 auth 过滤）、--models 逗号 patterns（`provider/*` 前缀 glob + `:level` 后缀，匹配集合即 Ctrl+P 循环范围）、--list-models |
+| samplingParams / compat / virtual models | ✅ | ⚠️ | thinkingFormat(thinkingFormat:zai/qwen/deepseek) + thinkingLevelMap + cost/images 已消费；strict/mid-convo/cache-control 类 compat 待真模型联调；virtual models（自动 fallback 链）⏳ |
 | prompt cache 生命周期 + cache warming | ✅ | ❌ | 可选，靠后 |
-| 模型目录自动刷新（`pi update --models`） | ✅ | ❌ | |
+| 模型目录自动刷新（`pi update --models`) | ✅ | ❌ | 重跑 tools/gen_catalog.py 等价（随 K4/K6） |
+
+**Phase 6 过程修复**：(1) 三适配器 buildBody 首元素逗号 bug（`if (bfirst)` 应为 `if (!bfirst)`，mock 不
+parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；(2) parseCmd 的 arg 只取第二个 token，
+多参命令（/login <provider> <key>）截断——改为完整剩余文本；(3) config 内置目录替换时 helpers 块被
+`pub fn load` 前缀匹配（loadProjectSettings）误切——恢复；(4) main 的 cwd_alloc 泄漏（defer free）。
 
 ### 7. 交互 TUI
 
