@@ -433,6 +433,45 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 - [ ] K5 **跨平台矩阵发布**：darwin/linux/windows × x86_64/aarch64 六个静态二进制；windows 终端 raw mode 用 Win32 Console API（OS API 不算依赖）；HOME→USERPROFILE；CI 矩阵构建
 - [ ] K6 `pi update` 自更新（可裁剪：检查 release 版本号 + 替换自身二进制）
 
+### Phase L — /settings 占位项接线清单（对照 pi settings-selector，逐项待后端）
+> 22 项设置已在 /settings 里可循环切换（会话态，placeholder_idx），
+> 但 rpi 尚无对应子系统——各子系统落地时按本清单补：**持久化键名
+> （与 pi settings.json 完全一致，双向兼容）+ 功能消费点**，然后把该
+> 项从 placeholder_idx 迁到真实字段（参照 skill_commands/autocomplete_max
+> 的接线模式：settingsApplyNext 写字段 + 消费点读字段）。
+
+| 设置项（pi id） | pi settings.json 键 | 待实现的后端 | PLAN 关联 |
+|---|---|---|---|
+| Show images (show-images) | `showImages` | 终端内嵌图片渲染（sixel/kitty/iTerm2 协议） | — |
+| Image width (image-width-cells) | `imageWidthCells` | 同上（内嵌图宽度） | — |
+| Auto-resize images (auto-resize-images) | `autoResizeImages` | 图片 resize（发模型前 2000x2000 上限） | — |
+| Block images (block-images) | `blockImages` | 图片附件发送开关（消息组装过滤 image 块） | — |
+| Show hardware cursor (show-hardware-cursor) | `showHardwareCursor` | 光标绘制策略（终端光标 vs 自绘） | — |
+| Editor padding (editor-padding) | `editorPaddingX` | 编辑器水平内边距（0-3） | — |
+| Output padding (output-padding) | `outputPad` | 消息/工具输出水平内边距 | — |
+| Clear on shrink (clear-on-shrink) | `clearOnShrink` | 差分渲染的收缩清行策略 | G.5 |
+| Terminal progress (terminal-progress) | `showTerminalProgress` | OSC 9;4 进度指示（终端 tab 标题） | — |
+| Transport (transport) | `transport` | stdio/HTTP 多传输 provider 支持 | — |
+| Session share destination (share-destination) | `sessionShareDestination` | /share 的 Radius/Gist 上传后端 | K3 |
+| HTTP idle timeout (http-idle-timeout) | `httpIdleTimeoutMs` | HTTP 客户端空闲超时（本地慢模型） | — |
+| Cache warming (cache-warming-mode) | `cacheWarmingMode` | prompt cache 预热（off/streaming/idle） | 6 节 cache 行 |
+| Mermaid diagrams (mermaid-rendering) | `mermaidRendering` | Mermaid→Unicode 图渲染 | — |
+| Cache miss notices (cache-miss-notices) | `showCacheMissNotices` | cache 成本/恢复诊断的 transcript 通知 | — |
+| Collapse changelog (collapse-changelog) | `collapseChangelog` | 更新后的 changelog 折叠展示 | K6 |
+| Quiet startup (quiet-startup) | `quietStartup` | 启动头精简（只留 header） | 7 节 header 行 |
+| Install telemetry (install-telemetry) | `enableInstallTelemetry` | 匿名版本 ping（rpi 大概率不做） | — |
+| Double-escape action (double-escape-action) | `doubleEscapeAction` | 空编辑器双 Esc 的动作（清除/退出） | — |
+| Tree filter mode (tree-filter-mode) | `treeFilterMode` | /tree 打开时的默认过滤 | — |
+| TUI mode (tui-mode) | `tuiMode` | regular 模式（终端原生 scrollback） | K5 前 |
+| Theme (theme) | `theme`/`lightTheme`/`darkTheme` | H3 主题 JSON + picker（切值后重载配色） | H3 |
+
+接线模板：① config.applySettingsValue 解析对应键 → 真实字段；②
+settingsApplyNext 占位分支迁移到字段写入 + persistSettings；③ 消费点
+读取。已按此模式接线的参考：autocompact / skill_commands /
+autocomplete_max / steering_mode / follow_up_mode / hide_thinking /
+default_project_trust / fs_scrollbar / fs_copy_on_select /
+fs_wheel_lines。
+
 ## 三、实施原则
 
 1. **每步可编译** — 每个 commit `zig build` 通过，`--list-models`/`-p` 可验证
