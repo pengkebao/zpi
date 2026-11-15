@@ -2554,7 +2554,7 @@ pub const TUI = struct {
         frame.append(self.alloc, ftext.toOwnedSlice() catch return) catch return;
     }
 
-    const MCP_MAX_VISIBLE = 6;
+    const MCP_MAX_VISIBLE = 12;
 
     /// MCP manager view rows inside the borders (must match
     /// renderMcpHeader/renderMcpFooter exactly): blank + title +
@@ -3681,10 +3681,10 @@ pub const TUI = struct {
             const mcp_items = mcp_h -| 2; // title(+details) row(s) already added; items+hint below
             _ = mcp_items;
             const visible_items = @min(self.sel_len, MCP_MAX_VISIBLE);
-            const start: usize = if (self.menu_selected >= visible_items)
-                @min(self.menu_selected -| visible_items / 2, self.sel_len -| visible_items)
-            else
-                0;
+            // pi SelectList.getVisibleRange verbatim: centered one-line-at-a
+            // -time follow — max(0, min(sel - floor(vis/2), len - vis)); the
+            // saturating subtractions ARE the max(0,·) clamps.
+            const start: usize = @min(self.menu_selected -| visible_items / 2, self.sel_len -| visible_items);
             // Render item rows directly from sel_rows (single viewport —
             // menuLine's menu_view_start path would double-offset here).
             for (0..visible_items) |v| {
