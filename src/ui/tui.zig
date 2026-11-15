@@ -1452,7 +1452,8 @@ pub const TUI = struct {
         const warn = "\x1b[38;2;222;147;95m";
         const reset = ansi.RESET;
         frame.append(self.alloc, "") catch return;
-        if (self.scoped_models != null) {
+        const has_scope = self.scoped_models != null and self.scoped_models.?.items.len > 0;
+        if (has_scope) {
             const line = std.fmt.allocPrint(self.alloc, "  {s}Scope: {s}{s}all{s}{s} | {s}scoped{s}{s}  {s}tab (all/scoped){s}", .{
                 muted, if (self.ms_scope_all) accent else muted, reset, if (self.ms_scope_all) accent else muted, reset, muted, reset, muted, muted, reset,
             }) catch return;
@@ -2402,7 +2403,30 @@ pub const TUI = struct {
 
     fn openModelSelector(self: *TUI, prefill: ?[]const u8) void {
         self.menu_mode = .model_selector;
-        self.ms_scope_all = true;
+        // Seed the session scope from persisted enabledModels on first use
+        // (pi: session.scopedModels loads from settings at startup).
+        if (self.scoped_models == null) {
+            if (self.cfg) |cfg| {
+                if (cfg.enabled_models) |pats| {
+                    var list = std.ArrayListUnmanaged([]u8).empty;
+                    for (cfg.models.items) |*m| {
+                        var fbuf: [256]u8 = undefined;
+                        const full = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ m.provider, m.id }) catch continue;
+                        for (pats) |pat| {
+                            if (patternMatches(pat, full)) {
+                                const dup = self.alloc.dupe(u8, full) catch continue;
+                                list.append(self.alloc, dup) catch {};
+                                break;
+                            }
+                        }
+                    }
+                    self.scoped_models = list;
+                }
+            }
+        }
+        // pi: scoped models configured → start in the "scoped" view.
+        const has_scope = self.scoped_models != null and self.scoped_models.?.items.len > 0;
+        self.ms_scope_all = !has_scope;
         self.editor.clear() catch {};
         if (prefill) |pf| {
             if (pf.len > 0) self.editor.setText(pf) catch {};
