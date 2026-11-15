@@ -473,9 +473,6 @@ pub const TUI = struct {
     ms_visible: usize = 0,
     ms_sel: usize = 0,
     ms_scope_all: bool = true,
-    /// /mcp manager viewport start (sel_rows are the FULL list; the manager
-    /// does not use the autocomplete projection).
-    mcp_view_start: usize = 0,
     /// /thinking selector state: visible level indices + selection.
     ts_levels: [7]config.ThinkingLevel = undefined,
     ts_visible: usize = 0,
@@ -925,7 +922,7 @@ pub const TUI = struct {
         if (self.menu_mode == .sessions or self.menu_mode == .tree or self.menu_mode == .forksel) return 10;
         return switch (self.menu_mode) {
             .commands, .models, .files => 5,
-            .mcp => @min(self.sel_len, 12),
+            .mcp => MCP_MAX_VISIBLE,
             else => @min(if (self.menu_len > 0) self.menu_len else 1, 16),
         };
     }
@@ -2557,6 +2554,8 @@ pub const TUI = struct {
         frame.append(self.alloc, ftext.toOwnedSlice() catch return) catch return;
     }
 
+    const MCP_MAX_VISIBLE = 6;
+
     /// MCP manager view rows inside the borders (must match
     /// renderMcpHeader/renderMcpFooter exactly): blank + title +
     /// details(server: 3 rows / tools: 1) + items(viewport 10) + count +
@@ -2565,8 +2564,8 @@ pub const TUI = struct {
         var h: usize = 2; // blank + title
         if (self.menu_mode == .mcp_server) h += 3; // command / scope file / State
         if (self.menu_mode == .mcp_tools) h += 1; // Exposure details
-        h += @min(self.sel_len, 12);
-        if (self.sel_len > 12) h += 1;
+        h += @min(self.sel_len, MCP_MAX_VISIBLE);
+        if (self.sel_len > MCP_MAX_VISIBLE) h += 1;
         if (self.menu_mode == .mcp_server or self.menu_mode == .mcp_tools) h += 1; // blank before hint
         h += 1; // hint
         return h;
@@ -2604,13 +2603,14 @@ pub const TUI = struct {
                     frame.append(self.alloc, d2) catch return;
                 }
             }
+            var st_buf: [64]u8 = undefined;
             var st_txt: []const u8 = "disconnected";
             if (mcp.Manager.getGlobal()) |mgr| {
                 if (mgr.findByName(name)) |srv| {
                     if (!srv.enabled) {
                         st_txt = "disabled";
                     } else if (srv.connected) {
-                        st_txt = std.fmt.allocPrint(self.alloc, "connected \u{b7} {d} tools", .{srv.tools.len}) catch "connected";
+                        st_txt = std.fmt.bufPrint(&st_buf, "connected \u{b7} {d} tools", .{srv.tools.len}) catch "connected";
                     }
                 }
             }
@@ -3464,7 +3464,13 @@ pub const TUI = struct {
     pub fn redrawLocked(self: *TUI) void {
         // A resize (or lost SIGWINCH after suspend) repaints everything at
         // the fresh size; the rest of this function just renders normally.
-        if (self.force_full_repaint) {
+        // While an MCP manager view is open, EVERY frame hard-clears: the
+        // view swaps wholesale between layers and list heights, and the
+        // incremental diff left stale rows behind in practice.
+        if (self.force_full_repaint or self.menu_mode == .mcp or
+            self.menu_mode == .mcp_server or self.menu_mode == .mcp_tools or
+            self.menu_mode == .mcp_exposure)
+        {
             self.force_full_repaint = false;
             for (self.prev_lines.items) |l| self.alloc.free(l);
             self.prev_lines.clearRetainingCapacity();
@@ -3674,16 +3680,16 @@ pub const TUI = struct {
             self.renderMcpHeader(&frame, editor_h);
             const mcp_items = mcp_h -| 2; // title(+details) row(s) already added; items+hint below
             _ = mcp_items;
-            const visible_items = @min(self.menu_len, 12);
+            const visible_items = @min(self.sel_len, MCP_MAX_VISIBLE);
             const start: usize = if (self.menu_selected >= visible_items)
-                @min(self.menu_selected -| visible_items / 2, self.menu_len -| visible_items)
+                @min(self.menu_selected -| visible_items / 2, self.sel_len -| visible_items)
             else
                 0;
             // Render item rows directly from sel_rows (single viewport —
             // menuLine's menu_view_start path would double-offset here).
             for (0..visible_items) |v| {
                 const row_i = start + v;
-                if (row_i >= self.menu_len) break;
+                if (row_i >= self.sel_len) break;
                 const r = &self.sel_rows[row_i];
                 const selected = row_i == self.menu_selected;
                 var clean = std.array_list.Managed(u8).init(self.alloc);
@@ -5664,7 +5670,6 @@ pub const TUI = struct {
     /// attention, description = state · exposure · scope.
     fn openMcpManager(self: *TUI) void {
         self.force_full_repaint = true;
-        self.mcp_view_start = 0;
         const mgr = mcp.Manager.getGlobal() orelse return;
         self.menu_mode = .mcp;
         self.menu_selected = 0;
@@ -5750,7 +5755,6 @@ pub const TUI = struct {
         }
         self.sel_len = row;
         self.menu_selected = 0;
-        self.mcp_view_start = 0;
         self.menu_len = self.sel_len;
     }
 
@@ -5776,7 +5780,6 @@ pub const TUI = struct {
             self.sel_len += 1;
         }
         self.menu_selected = 0;
-        self.mcp_view_start = 0;
         self.menu_len = self.sel_len;
     }
 
@@ -7722,25 +7725,10 @@ pub const TUI = struct {
                 // move by one page (clamped to the bounds).
                 if (self.bindings.matches(key, .menu_up)) {
                     self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
-                    // MCP manager renders its viewport from menu_view_start —
-                    // keep the selection visible (pi centers the window) and
-                    // re-project menu_items.
-                    if (is_mcp) {
-                        if (self.menu_selected < self.mcp_view_start) {
-                            self.mcp_view_start = self.menu_selected;
-                        } else if (self.menu_selected >= self.mcp_view_start + 12) {
-                            self.mcp_view_start = self.menu_selected - 11;
-                        }
-                    }
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_down)) {
                     if (self.menu_selected + 1 < self.menu_len) self.menu_selected += 1;
-                    if (is_mcp) {
-                        if (self.menu_selected >= self.mcp_view_start + 12) {
-                            self.mcp_view_start = self.menu_selected - 11;
-                        }
-                    }
                     self.redraw();
                     continue;
                 } else if (key == .page_up or key == .page_down) {
