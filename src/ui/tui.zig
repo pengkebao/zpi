@@ -56,6 +56,7 @@ const BORDER_HIGH = "\x1b[38;2;151;118;229m"; // thinkingHigh (purple)
 const BORDER_XHIGH = "\x1b[38;2;222;84;193m"; // thinkingXhigh (magenta)
 const BORDER_MAX = "\x1b[38;2;254;84;98m"; // thinkingMax (red)
 const BORDER_BASH = "\x1b[38;2;94;178;134m"; // bashMode (green)
+const BORDER_INFO = "\x1b[38;2;114;130;216m"; // theme.border okhsl(231 57% 65%) — modal selectors
 const ACCENT = "\x1b[38;2;167;152;215m";
 // Message block colors (pi dark theme).
 const USER_BG = "\x1b[48;2;33;59;73m"; // userMessageBg blueBg
@@ -2985,6 +2986,13 @@ pub const TUI = struct {
     /// The border color for the current state (thinking level or bash mode).
     fn borderColor(self: *const TUI) []const u8 {
         if (self.bash_mode) return BORDER_BASH;
+        // Modal selectors render their own theme.border (blue) in pi; the
+        // plain autocomplete menus (commands/models/files) keep the editor
+        // in its normal editing state.
+        switch (self.menu_mode) {
+            .settings, .scoped, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => return BORDER_INFO,
+            else => {},
+        }
         return levelColor(self.session.thinking_level);
     }
 
