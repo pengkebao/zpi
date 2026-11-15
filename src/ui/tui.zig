@@ -477,8 +477,7 @@ pub const TUI = struct {
     ts_levels: [7]config.ThinkingLevel = undefined,
     ts_visible: usize = 0,
     ts_sel: usize = 0,
-    /// /scoped-models: snapshot at open (Esc restores it) + dirty flag.
-    scoped_snapshot: ?std.ArrayListUnmanaged([]u8) = null,
+    /// /scoped-models: dirty flag (changes applied live; Ctrl+S persists).
     scoped_dirty: bool = false,
     /// Backed settings fields (see settingsApply).
     skill_commands: bool = true,
@@ -2108,16 +2107,6 @@ pub const TUI = struct {
         return std.mem.eql(u8, pattern, full_id);
     }
 
-    fn copyScopedList(self: *TUI, src: ?std.ArrayListUnmanaged([]u8)) ?std.ArrayListUnmanaged([]u8) {
-        const src_list = src orelse return null;
-        var out = std.ArrayListUnmanaged([]u8).empty;
-        for (src_list.items) |id| {
-            const dup = self.alloc.dupe(u8, id) catch continue;
-            out.append(self.alloc, dup) catch self.alloc.free(dup);
-        }
-        return out;
-    }
-
     /// pi ScopedModelsSelector.isEnabled: null = all enabled.
     fn modelScoped(self: *TUI, idx: usize) []const u8 {
         if (self.scoped_models == null) return "\u{2713} enabled";
@@ -2567,9 +2556,6 @@ pub const TUI = struct {
                 self.scoped_models = list;
             }
         }
-        // Esc-restore snapshot.
-        self.freeScopedList(&self.scoped_snapshot);
-        self.scoped_snapshot = self.copyScopedList(self.scoped_models);
         self.scoped_dirty = false;
         var n: usize = 0;
         for (cfg.models.items, 0..) |*m, i| {
@@ -3137,7 +3123,6 @@ pub const TUI = struct {
             list.deinit(self.alloc);
         }
         self.ms_filtered.deinit(self.alloc);
-        self.freeScopedList(&self.scoped_snapshot);
         if (self.owned_provider) |p| {
             p.deinit();
         }
@@ -7080,10 +7065,9 @@ pub const TUI = struct {
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_close)) {
-                    // pi onCancel: drop unsaved changes (restore snapshot).
-                    self.freeScopedList(&self.scoped_models);
-                    self.scoped_models = self.scoped_snapshot;
-                    self.scoped_snapshot = null;
+                    // pi onCancel: just close — toggles already applied to
+                    // the session scope live (onChange → updateSessionModels);
+                    // only Ctrl+S writes them to settings.
                     self.scoped_dirty = false;
                     self.menu_mode = .hidden;
                     self.redraw();
