@@ -2452,7 +2452,11 @@ pub const TUI = struct {
         // (scoped list order), then disabled; ✓ accent when enabled.
         var shown: usize = 0;
         const visible_rows = @min(self.menu_len, 10);
-        const start = self.menu_view_start;
+        // pi: viewport centers on the selected row (never past the end).
+        const start: usize = if (self.menu_selected >= visible_rows)
+            @min(self.menu_selected -| visible_rows / 2, self.menu_len -| visible_rows)
+        else
+            0;
         var scroll_needed = false;
         while (shown < visible_rows) : (shown += 1) {
             const row_i = start + shown;
@@ -2555,6 +2559,7 @@ pub const TUI = struct {
         }
         self.menu_len = n;
         self.menu_selected = 0;
+        self.menu_view_start = 0;
         self.menu_mode = .scoped;
         self.editor.clear() catch {};
         self.redraw();
