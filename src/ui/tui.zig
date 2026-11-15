@@ -1489,7 +1489,8 @@ pub const TUI = struct {
                 break :blk_wl "auto";
             },
             // Placeholder settings cycle in-session (pi backs all of them;
-            // rpi persists them once their subsystems exist).
+            // persist to the pi key in PLAN "Phase L" when the subsystem
+            // lands).
             else => blk_ph: {
                 for (SETTING_DEFS, 0..) |d, i| {
                     if (d.kind == def.kind) break :blk_ph def.values[self.placeholder_idx[i]];
@@ -1517,7 +1518,8 @@ pub const TUI = struct {
         const cfg = self.cfg;
         switch (def.kind) {
             // Placeholder settings cycle their in-session value (pi backs
-            // all of these; rpi persists them once the subsystems exist).
+            // all of these; persist per PLAN "Phase L" when each subsystem
+            // lands).
             .show_images, .image_width, .auto_resize_images, .block_images,
             .show_hardware_cursor, .editor_padding, .output_padding,
             .clear_on_shrink, .terminal_progress, .transport,
