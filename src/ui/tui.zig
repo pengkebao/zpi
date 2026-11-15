@@ -132,7 +132,7 @@ pub const TUI = struct {
     /// leading slash (pi item.value: label may differ, e.g. models show the
     /// id but complete to "provider/id"); empty = use `name`.
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null, value: []const u8 = "" };
-    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped };
+    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped, model_selector };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
 
     /// pi settings-selector items (pi-tui SettingsList + settings-selector.js),
@@ -467,53 +467,12 @@ pub const TUI = struct {
     settings_filtered: [SETTING_DEFS.len]usize = undefined,
     settings_visible: usize = 0,
     settings_sel: usize = 0,
-    /// Placeholder settings: current index into their values array (backed
-    /// settings use real fields; these cycle in-session until their
-    /// subsystems exist, then persist like pi).
-    placeholder_idx: [SETTING_DEFS.len]u8 = blk: {
-        var idx: [SETTING_DEFS.len]u8 = undefined;
-        for (SETTING_DEFS, 0..) |def, i| {
-            // Default = the pi default for that setting (first value whose
-            // text matches the documented default; compute lazily below by
-            // scanning for the known defaults).
-            idx[i] = 0;
-            for (def.values, 0..) |v, vi| {
-                const is_default = switch (def.kind) {
-                    .show_images => std.mem.eql(u8, v, "true"),
-                    .image_width => std.mem.eql(u8, v, "60"),
-                    .auto_resize_images => std.mem.eql(u8, v, "true"),
-                    .block_images => std.mem.eql(u8, v, "false"),
-                    .show_hardware_cursor => std.mem.eql(u8, v, "false"),
-                    .editor_padding => std.mem.eql(u8, v, "0"),
-                    .output_padding => std.mem.eql(u8, v, "1"),
-                    .clear_on_shrink => std.mem.eql(u8, v, "false"),
-                    .terminal_progress => std.mem.eql(u8, v, "false"),
-                    .transport => std.mem.eql(u8, v, "auto"),
-                    .share_destination => std.mem.eql(u8, v, "auto"),
-                    .http_idle_timeout => std.mem.eql(u8, v, "default"),
-                    .cache_warming => std.mem.eql(u8, v, "off"),
-                    .mermaid => std.mem.eql(u8, v, "off"),
-                    .cache_miss_notices => std.mem.eql(u8, v, "false"),
-                    .collapse_changelog => std.mem.eql(u8, v, "true"),
-                    .quiet_startup => std.mem.eql(u8, v, "false"),
-                    .install_telemetry => std.mem.eql(u8, v, "false"),
-                    .double_escape => std.mem.eql(u8, v, "none"),
-                    .tree_filter => std.mem.eql(u8, v, "all"),
-                    .warnings => std.mem.eql(u8, v, "true"),
-                    .model_thinking => std.mem.eql(u8, v, "none"),
-                    .tui_mode => std.mem.eql(u8, v, "fullscreen"),
-                    .fs_exit_output => std.mem.eql(u8, v, "transcript"),
-                    .theme => std.mem.eql(u8, v, "dark"),
-                    else => false,
-                };
-                if (is_default) {
-                    idx[i] = @intCast(vi);
-                    break;
-                }
-            }
-        }
-        break :blk idx;
-    },
+    /// /model selector state (pi ModelSelectorComponent): filtered model
+    /// indices into cfg.models + selection + scope (all/scoped cycling).
+    ms_filtered: std.ArrayListUnmanaged(usize) = .empty,
+    ms_visible: usize = 0,
+    ms_sel: usize = 0,
+    ms_scope_all: bool = true,
     /// Backed settings fields (see settingsApply).
     skill_commands: bool = true,
     steering_mode_all: bool = true,
@@ -624,9 +583,6 @@ pub const TUI = struct {
                 self.alloc.free(desc);
             };
         }
-        // pi: the skill-commands setting gates /skill: autocomplete entries
-        // (skills themselves stay loadable via the model's skill listing).
-        if (!self.skill_commands) return;
         const skills_list = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir, self.project_trusted) catch return;
         defer skills.freeAll(self.alloc, skills_list);
         for (skills_list) |sk| {
@@ -680,7 +636,7 @@ pub const TUI = struct {
         // Modal dialogs (settings, session/tree/fork pickers, the /mcp
         // manager, scoped-models) are not driven by editor text.
         switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped => return,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector => return,
             else => {},
         }
         const text = self.editor.getText() catch {
@@ -787,82 +743,6 @@ pub const TUI = struct {
         // token match over id/provider/"provider/id"/name; label = id,
         // completion value = "provider/id", description = provider; initial
         // selection = first exact/prefix value match).
-        if (single_line and std.mem.startsWith(u8, text, "/model ")) {
-            const query = std.mem.trim(u8, text["/model ".len..], " ");
-            const cfg = self.cfg orelse {
-                self.menu_mode = .hidden;
-                return;
-            };
-            const total = @min(cfg.models.items.len, self.menu_items.len);
-            if (total == 0) {
-                self.menu_mode = .hidden;
-                return;
-            }
-            var values: [64][]const u8 = undefined;
-            var search_texts: [64][]const u8 = undefined;
-            var model_map: [64]usize = undefined;
-            var n: usize = 0;
-            var oom = false;
-            for (cfg.models.items, 0..) |m, idx| {
-                if (n >= total) break;
-                values[n] = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ m.provider, m.id }) catch {
-                    oom = true;
-                    break;
-                };
-                // pi getModelSearchText: id, provider, provider/id and the
-                // display name all participate in the token match.
-                search_texts[n] = std.fmt.allocPrint(self.alloc, "{s} {s} {s} {s}", .{ m.id, m.provider, values[n], m.name }) catch values[n];
-                model_map[n] = idx;
-                n += 1;
-            }
-            var cap: usize = 0;
-            defer {
-                // Null out refs into the temp strings freed below, then free them.
-                for (0..cap) |k| self.menu_items[k].value = "";
-                for (0..n) |i| {
-                    if (search_texts[i].ptr != values[i].ptr) self.alloc.free(search_texts[i]);
-                    self.alloc.free(values[i]);
-                }
-            }
-            if (!oom) {
-                const MCtx = struct {
-                    texts: []const []const u8,
-                    fn get(c: @This(), i: usize) []const u8 {
-                        return c.texts[i];
-                    }
-                };
-                const mctx = MCtx{ .texts = search_texts[0..n] };
-                if (fuzzy.fuzzyFilter(self.alloc, n, query, mctx, MCtx.get) catch null) |order| {
-                    defer self.alloc.free(order);
-                    var ordered: [64]MenuEntry = undefined;
-                    var ordered_map: [64]usize = undefined;
-                    for (order) |i| {
-                        if (cap >= ordered.len) break;
-                        const m = cfg.models.items[model_map[i]];
-                        ordered[cap] = .{ .name = m.id, .desc = m.provider, .model_idx = model_map[i], .value = values[i] };
-                        ordered_map[cap] = model_map[i];
-                        cap += 1;
-                    }
-                    for (0..cap) |k| {
-                        self.menu_items[k] = ordered[k];
-                        model_map[k] = ordered_map[k];
-                    }
-                }
-            }
-            self.menu_len = cap;
-            // pi editor rule: exact value match first, then first prefix hit.
-            const VCtx = struct {
-                vals: []const []const u8,
-                fn get(c: @This(), i: usize) []const u8 {
-                    return c.vals[i];
-                }
-            };
-            var vs: [64][]const u8 = undefined;
-            for (0..cap) |k| vs[k] = self.menu_items[k].value;
-            self.menu_selected = fuzzy.bestMatchIndex(cap, query, VCtx{ .vals = vs[0..cap] }, VCtx.get) orelse 0;
-            self.menu_mode = if (cap > 0) .models else .hidden;
-            return;
-        }
 
         // "@path" completion: the cursor sits right after an "@token" on the
         // current line ('@' at line start or after whitespace, no spaces in
@@ -1022,10 +902,9 @@ pub const TUI = struct {
     /// autocomplete shows AUTOCOMPLETE_MAX_VISIBLE (default 5) rows centered
     /// on the selection; modal pickers show up to 16.
     fn menuMaxVisible(self: *const TUI) usize {
-        if (self.menu_mode == .settings) return 10;
+        if (self.menu_mode == .settings or self.menu_mode == .model_selector) return 10;
         return switch (self.menu_mode) {
-            // pi: autocompleteMaxVisible setting (3-20, default 5).
-            .commands, .models, .files => @max(3, @min(20, self.autocomplete_max)),
+            .commands, .models, .files => 5,
             .mcp => @min(self.sel_len, 12),
             else => @min(if (self.menu_len > 0) self.menu_len else 1, 16),
         };
@@ -1078,7 +957,7 @@ pub const TUI = struct {
         // projected window directly and menu_view_start only decides the
         // selection marker.
         const projected = switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped => true,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector => true,
             else => false,
         };
         const item_idx = if (projected) v else self.menu_view_start + v;
@@ -1204,29 +1083,15 @@ pub const TUI = struct {
                 }
                 return false;
             },
-            .models => {
-                // pi /model selector: Enter switches to the selected model
-                // right away (the menu is a picker, not an input completion —
-                // filling "/model provider/id " left it looking hung).
-                self.editor.clear() catch {};
-                // Close the menu first: switchModel redraws from inside
-                // handleCommand-style paths and must not render the picker.
-                self.menu_mode = .hidden;
-                self.menu_len = 0;
-                if (self.menu_text_cache) |c| {
-                    self.alloc.free(c);
-                    self.menu_text_cache = null;
-                }
-                if (e.model_idx) |idx| {
+            .models => unreachable, // legacy autocomplete menu; /model now opens the selector
+            .model_selector => {
+                // pi ModelSelector: Enter selects (switchModel) and closes.
+                if (self.ms_visible > 0) {
+                    const idx = self.ms_filtered.items[self.ms_sel];
+                    self.closeModelSelector();
                     self.switchModel(idx) catch |err| {
                         self.note("model switch failed: {s}", .{@errorName(err)});
                     };
-                } else {
-                    // No model mapping (synthetic entry): fall back to the
-                    // command path so at least the fuzzy command runs.
-                    const cmd = std.fmt.allocPrint(self.alloc, "/model {s}", .{e.name}) catch return false;
-                    defer self.alloc.free(cmd);
-                    return self.handleCommand(cmd);
                 }
                 return false;
             },
@@ -1238,7 +1103,10 @@ pub const TUI = struct {
                 // pi SettingsList: Enter/Space cycles the selected value
                 // silently (the row already shows the new value).
                 if (self.settings_visible > 0) {
-                    _ = self.settingsApplyNext(SETTING_DEFS[self.settings_filtered[self.settings_sel]]);
+                    const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
+                    if (!self.settingsApplyNext(def)) {
+                        self.note("{s}: not implemented yet", .{def.label});
+                    }
                 }
                 return false;
             },
@@ -1420,6 +1288,92 @@ pub const TUI = struct {
         _ = editor_h;
     }
 
+    /// Frame rows the model selector occupies below the editor line:
+    /// blank + notice-or-scope rows (+scope hint when scoped) + items +
+    /// count + blank + Model Name + hint. Keep in sync with
+    /// renderModelSelectorView.
+    fn modelSelectorViewHeight(self: *TUI) usize {
+        const scoped = self.scoped_models != null;
+        var h: usize = 1; // blank after search line
+        if (scoped) {
+            h += 2; // "Scope: all | scoped" + tab hint
+        } else {
+            h += 1; // "Only showing models from configured providers..."
+        }
+        h += @min(self.ms_visible, 10);
+        if (self.ms_visible > 10) h += 1; // (n/total)
+        h += 1; // blank
+        if (self.ms_visible > 0) h += 1; // Model Name: ...
+        h += 1; // hint
+        return h;
+    }
+
+    fn renderModelSelectorView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        const muted = FG_MUTED;
+        const accent = "\x1b[38;2;167;152;215m";
+        const warn = "\x1b[38;2;222;147;95m";
+        const reset = ansi.RESET;
+        frame.append(self.alloc, "") catch return;
+        if (self.scoped_models != null) {
+            const line = std.fmt.allocPrint(self.alloc, "  {s}Scope: {s}{s}all{s}{s} | {s}scoped{s}{s}  {s}tab (all/scoped){s}", .{
+                muted, if (self.ms_scope_all) accent else muted, reset, if (self.ms_scope_all) accent else muted, reset, muted, reset, muted, muted, reset,
+            }) catch return;
+            frame.append(self.alloc, line) catch return;
+            const hint = std.fmt.allocPrint(self.alloc, "  {s}tab (all/scoped){s}", .{muted, reset}) catch return;
+            frame.append(self.alloc, hint) catch return;
+        } else {
+            const line = std.fmt.allocPrint(self.alloc, "{s}Only showing models from configured providers. Use /login to add providers.{s}", .{ warn, reset }) catch return;
+            frame.append(self.alloc, line) catch return;
+        }
+        const visible_rows = @min(self.ms_visible, 10);
+        if (self.ms_visible == 0) {
+            const line = std.fmt.allocPrint(self.alloc, "  {s}No matching models{s}", .{ muted, reset }) catch return;
+            frame.append(self.alloc, line) catch return;
+        } else {
+            const total = self.ms_visible;
+            const start: usize = if (self.ms_sel >= visible_rows)
+                @min(self.ms_sel - visible_rows / 2, total -| visible_rows)
+            else
+                0;
+            for (0..visible_rows) |v| {
+                const idx = self.ms_filtered.items[start + v];
+                const cfg = self.cfg orelse return;
+                if (idx >= cfg.models.items.len) continue;
+                const m = &cfg.models.items[idx];
+                const selected = (start + v) == self.ms_sel;
+                var clean = std.array_list.Managed(u8).init(self.alloc);
+                defer clean.deinit();
+                clean.appendSlice(if (selected) "\u{2192} " else "  ") catch return;
+                if (selected) clean.appendSlice(accent) catch return;
+                clean.appendSlice(if (self.isCurrentModel(idx)) "\u{2713} " else "  ") catch return;
+                clean.appendSlice(m.id) catch return;
+                clean.appendSlice(reset) catch return;
+                clean.appendSlice(" ") catch return;
+                clean.appendSlice(muted) catch return;
+                clean.appendSlice("[") catch return;
+                clean.appendSlice(m.provider) catch return;
+                clean.appendSlice("]") catch return;
+                if (self.isDefaultModel(idx)) clean.appendSlice(" \u{b7} default") catch return;
+                clean.appendSlice(reset) catch return;
+                frame.append(self.alloc, clean.toOwnedSlice() catch return) catch return;
+            }
+            if (total > visible_rows) {
+                const cnt = std.fmt.allocPrint(self.alloc, "  {s}({d}/{d}){s}", .{ muted, self.ms_sel + 1, total, reset }) catch return;
+                frame.append(self.alloc, cnt) catch return;
+            }
+            frame.append(self.alloc, "") catch return;
+            const sel_idx = self.ms_filtered.items[self.ms_sel];
+            const sel_name = if (self.cfg) |c|
+                (if (sel_idx < c.models.items.len) c.models.items[sel_idx].name else "")
+            else
+                "";
+            const name_line = std.fmt.allocPrint(self.alloc, "  {s}Model Name: {s}{s}", .{ muted, sel_name, reset }) catch return;
+            frame.append(self.alloc, name_line) catch return;
+        }
+        const hint = std.fmt.allocPrint(self.alloc, "  {s}Enter to select \u{b7} Ctrl+S to set as default \u{b7} Escape/Ctrl+C to cancel{s}", .{ muted, reset }) catch return;
+        frame.append(self.alloc, hint) catch return;
+    }
+
     fn openSettingsMenu(self: *TUI) void {
         if (self.cfg != null) {
             // Reflect persisted values (compaction etc.) in the selector.
@@ -1464,16 +1418,40 @@ pub const TUI = struct {
         const cfg = self.cfg;
         return switch (def.kind) {
             .autocompact => if (cfg) |c| (if (c.compaction.enabled) "true" else "false") else "true",
+            .show_images => "true",
+            .image_width => "60",
+            .auto_resize_images => "true",
+            .block_images => "false",
             .skill_commands => if (self.skill_commands) "true" else "false",
+            .show_hardware_cursor => "false",
+            .editor_padding => "0",
+            .output_padding => "1",
             .autocomplete_max => std.fmt.bufPrint(buf, "{d}", .{self.autocomplete_max}) catch "5",
+            .clear_on_shrink => "false",
+            .terminal_progress => "false",
             .steering_mode => if (self.steering_mode_all) "all" else "one-at-a-time",
             .follow_up_mode => if (self.follow_up_mode_all) "all" else "one-at-a-time",
+            .transport => "auto",
+            .share_destination => "auto",
+            .http_idle_timeout => "default",
+            .cache_warming => "off",
             .hide_thinking => if (self.thinking_hidden) "true" else "false",
+            .mermaid => "off",
+            .cache_miss_notices => "false",
+            .collapse_changelog => "true",
+            .quiet_startup => "false",
+            .install_telemetry => "false",
             .default_project_trust => if (cfg) |c| switch (c.default_project_trust) {
                 .ask => "Ask",
                 .always => "Always trust",
                 .never => "Never trust",
             } else "Ask",
+            .double_escape => "none",
+            .tree_filter => "all",
+            .warnings => "true",
+            .model_thinking => "none",
+            .tui_mode => "fullscreen",
+            .fs_exit_output => "transcript",
             .fs_scrollbar => if (cfg) |c| switch (c.fullscreen_scrollbar) {
                 .auto => "auto",
                 .always => "always",
@@ -1488,15 +1466,7 @@ pub const TUI = struct {
                 }
                 break :blk_wl "auto";
             },
-            // Placeholder settings cycle in-session (pi backs all of them;
-            // persist to the pi key in PLAN "Phase L" when the subsystem
-            // lands).
-            else => blk_ph: {
-                for (SETTING_DEFS, 0..) |d, i| {
-                    if (d.kind == def.kind) break :blk_ph def.values[self.placeholder_idx[i]];
-                }
-                break :blk_ph def.values[0];
-            },
+            .theme => "dark",
         };
     }
 
@@ -1517,29 +1487,6 @@ pub const TUI = struct {
         const next = def.values[if (found) (pos + 1) % def.values.len else 0];
         const cfg = self.cfg;
         switch (def.kind) {
-            // Placeholder settings cycle their in-session value (pi backs
-            // all of these; persist per PLAN "Phase L" when each subsystem
-            // lands).
-            .show_images, .image_width, .auto_resize_images, .block_images,
-            .show_hardware_cursor, .editor_padding, .output_padding,
-            .clear_on_shrink, .terminal_progress, .transport,
-            .share_destination, .http_idle_timeout, .cache_warming, .mermaid,
-            .cache_miss_notices, .collapse_changelog, .quiet_startup,
-            .install_telemetry, .double_escape, .tree_filter, .warnings,
-            .model_thinking, .tui_mode, .fs_exit_output, .theme => {
-                for (SETTING_DEFS, 0..) |d, i| {
-                    if (d.kind == def.kind) {
-                        for (def.values, 0..) |v, vi| {
-                            if (std.mem.eql(u8, v, next)) {
-                                self.placeholder_idx[i] = @intCast(vi);
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                }
-                return true;
-            },
             .autocompact => {
                 const on = std.mem.eql(u8, next, "true");
                 if (cfg) |c| c.compaction.enabled = on;
@@ -1547,19 +1494,10 @@ pub const TUI = struct {
                 // footer "(auto)" marker — keep them in sync immediately.
                 self.session.compaction.enabled = on;
             },
-            .skill_commands => {
-                self.skill_commands = std.mem.eql(u8, next, "true");
-                self.refreshSlashExtras();
-            },
-            .steering_mode => {
-                self.steering_mode_all = std.mem.eql(u8, next, "all");
-                self.session.steering_mode_all = self.steering_mode_all;
-            },
-            .follow_up_mode => {
-                self.follow_up_mode_all = std.mem.eql(u8, next, "all");
-                self.session.follow_up_mode_all = self.follow_up_mode_all;
-            },
+            .skill_commands => self.skill_commands = std.mem.eql(u8, next, "true"),
             .autocomplete_max => self.autocomplete_max = std.fmt.parseInt(usize, next, 10) catch 5,
+            .steering_mode => self.steering_mode_all = std.mem.eql(u8, next, "all"),
+            .follow_up_mode => self.follow_up_mode_all = std.mem.eql(u8, next, "all"),
             .hide_thinking => self.thinking_hidden = std.mem.eql(u8, next, "true"),
             .default_project_trust => {
                 if (cfg) |c| {
@@ -1587,6 +1525,8 @@ pub const TUI = struct {
                     c.fullscreen_wheel_lines = if (std.mem.eql(u8, next, "auto")) null else std.fmt.parseInt(u16, next, 10) catch null;
                 }
             },
+            // tui_mode/theme/etc: rpi cannot back these yet.
+            else => return false,
         }
         if (cfg) |c| c.persistSettings(self.alloc, self.io) catch {};
         return true;
@@ -2025,6 +1965,124 @@ pub const TUI = struct {
 
     /// /scoped-models — pi ScopedModelsSelector: list all models with their
     /// enabled state; Enter toggles, Esc closes. Session-only.
+    fn closeModelSelector(self: *TUI) void {
+        self.menu_mode = .hidden;
+        self.editor.clear() catch {};
+        self.ms_visible = 0;
+        self.ms_sel = 0;
+    }
+
+    fn modelSearchText(self: *TUI, idx: usize, buf: *[256]u8) []const u8 {
+        const cfg = self.cfg orelse return "";
+        if (idx >= cfg.models.items.len) return "";
+        const m = &cfg.models.items[idx];
+        const is_default = self.isDefaultModel(idx);
+        return std.fmt.bufPrint(buf, "{s} {s}/{s} {s} {s}{s}", .{
+            m.provider, m.provider, m.id, m.provider, m.id,
+            if (is_default) " default" else "",
+        }) catch "";
+    }
+
+    fn isCurrentModel(self: *TUI, idx: usize) bool {
+        const m = self.session.model;
+        const cfg = self.cfg orelse return false;
+        if (idx >= cfg.models.items.len) return false;
+        return std.mem.eql(u8, cfg.models.items[idx].provider, m.provider) and
+            std.mem.eql(u8, cfg.models.items[idx].id, m.id);
+    }
+
+    fn isDefaultModel(self: *TUI, idx: usize) bool {
+        const cfg = self.cfg orelse return false;
+        if (idx >= cfg.models.items.len) return false;
+        const m = &cfg.models.items[idx];
+        return cfg.default_provider != null and cfg.default_model != null and
+            std.mem.eql(u8, cfg.default_provider.?, m.provider) and
+            std.mem.eql(u8, cfg.default_model.?, m.id);
+    }
+
+    /// pi sortModels: current first, default second, rest by provider.
+    fn modelSelectorSort(self: *TUI, list: *std.ArrayListUnmanaged(usize)) void {
+        const Ctx = struct { tui: *TUI };
+        const ctx = Ctx{ .tui = self };
+        std.mem.sort(usize, list.items, ctx, struct {
+            fn f(c: Ctx, a: usize, b: usize) bool {
+                const a_cur = c.tui.isCurrentModel(a);
+                const b_cur = c.tui.isCurrentModel(b);
+                if (a_cur != b_cur) return a_cur;
+                const a_def = c.tui.isDefaultModel(a);
+                const b_def = c.tui.isDefaultModel(b);
+                if (a_def != b_def) return a_def;
+                const cfg = c.tui.cfg orelse return false;
+                const am = &cfg.models.items[a];
+                const bm = &cfg.models.items[b];
+                return std.mem.order(u8, am.provider, bm.provider) == .lt;
+            }
+        }.f);
+    }
+
+    /// pi ModelSelector.filterModels: substring over the pi search text;
+    /// a query starting with "default" pins default models first.
+    fn modelSelectorRefilter(self: *TUI) void {
+        const query_raw = self.editor.getText() catch "";
+        defer self.alloc.free(query_raw);
+        const query = std.mem.trim(u8, query_raw, " ");
+        self.ms_filtered.clearRetainingCapacity();
+        const cfg = self.cfg orelse return;
+        const scope_all = self.ms_scope_all or self.scoped_models == null;
+        var vbuf: [256]u8 = undefined;
+        for (cfg.models.items, 0..) |_, i| {
+            if (!scope_all and !self.isModelScoped(i)) continue;
+            if (query.len > 0) {
+                const text = self.modelSearchText(i, &vbuf);
+                if (!containsIgnoreCase2(text, query)) continue;
+            }
+            self.ms_filtered.append(self.alloc, i) catch {};
+        }
+        if (query.len > 0 and std.ascii.startsWithIgnoreCase(query, "default")) {
+            var defaults = std.ArrayListUnmanaged(usize).empty;
+            var rest = std.ArrayListUnmanaged(usize).empty;
+            for (self.ms_filtered.items) |i| {
+                if (self.isDefaultModel(i)) {
+                    defaults.append(self.alloc, i) catch {};
+                } else {
+                    rest.append(self.alloc, i) catch {};
+                }
+            }
+            self.ms_filtered.clearRetainingCapacity();
+            self.ms_filtered.appendSlice(self.alloc, defaults.items) catch {};
+            self.ms_filtered.appendSlice(self.alloc, rest.items) catch {};
+            defaults.deinit(self.alloc);
+            rest.deinit(self.alloc);
+        }
+        if (query.len == 0) self.modelSelectorSort(&self.ms_filtered);
+        self.ms_visible = self.ms_filtered.items.len;
+        if (self.ms_sel >= self.ms_visible) self.ms_sel = if (self.ms_visible > 0) self.ms_visible - 1 else 0;
+    }
+
+    fn openModelSelector(self: *TUI, prefill: ?[]const u8) void {
+        self.menu_mode = .model_selector;
+        self.ms_scope_all = true;
+        self.editor.clear() catch {};
+        if (prefill) |pf| {
+            if (pf.len > 0) self.editor.setText(pf) catch {};
+        }
+        self.modelSelectorRefilter();
+        self.ms_sel = 0;
+        self.menu_text_cache = null;
+        self.redraw();
+    }
+
+    fn setDefaultModel(self: *TUI, idx: usize) void {
+        const cfg = self.cfg orelse return;
+        if (idx >= cfg.models.items.len) return;
+        const m = &cfg.models.items[idx];
+        cfg.setDefaultProviderModel(self.alloc, m.provider, m.id) catch {};
+        cfg.persistSettings(self.alloc, self.io) catch |err| {
+            self.note("settings save failed: {s}", .{@errorName(err)});
+        };
+        self.note("default model: {s}/{s}", .{ m.provider, m.id });
+    }
+
     fn openScopedModelsMenu(self: *TUI) void {
         const cfg = self.cfg orelse {
             self.note("no config loaded", .{});
@@ -2596,6 +2654,7 @@ pub const TUI = struct {
             for (list.items) |id| self.alloc.free(id);
             list.deinit(self.alloc);
         }
+        self.ms_filtered.deinit(self.alloc);
         if (self.owned_provider) |p| {
             p.deinit();
         }
@@ -2822,7 +2881,8 @@ pub const TUI = struct {
         // component, default prompt "> "): render inset by 2 and let the
         // frame prepend the prompt prefix.
         const settings_search = self.menu_mode == .settings;
-        const ed_width: usize = if (settings_search) (if (self.width > 2) self.width - 2 else 1) else self.width;
+        const modal_search = settings_search or self.menu_mode == .model_selector;
+        const ed_width: usize = if (modal_search) (if (self.width > 2) self.width - 2 else 1) else self.width;
         var ed = self.editor.render(ed_width) catch return;
         var ed_consumed = false;
         errdefer {
@@ -2858,7 +2918,8 @@ pub const TUI = struct {
         // the editor borders — search line (the editor), blank, up to 10
         // item rows, scroll count, blank, wrapped description, hint.
         const settings_h: usize = if (self.menu_mode == .settings) self.settingsViewHeight(editor_h) else 0;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h;
+        const ms_h: usize = if (self.menu_mode == .model_selector) self.modelSelectorViewHeight() else 0;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -2947,7 +3008,7 @@ pub const TUI = struct {
         // the Input-component prompt prefix ("> " first line, two spaces on
         // wrapped continuation lines).
         for (ed.items[vis_top..end], 0..) |line, vi| {
-            if (!settings_search) {
+            if (!modal_search) {
                 frame.append(self.alloc, line) catch return;
             } else {
                 const prefixed = std.fmt.allocPrint(self.alloc, "{s}{s}", .{
@@ -2976,6 +3037,12 @@ pub const TUI = struct {
         // value), scroll count, blank, wrapped description, hint line.
         if (self.menu_mode == .settings and settings_h > 0) {
             self.renderSettingsView(&frame, editor_h, settings_h);
+        }
+        // 3.6 Model selector view (pi ModelSelectorComponent.updateList):
+        // provider notice / scope rows, item rows with ✓/· default badges,
+        // scroll count, blank, Model Name detail, key hint line.
+        if (self.menu_mode == .model_selector and ms_h > 0) {
+            self.renderModelSelectorView(&frame);
         }
 
         // 4. Bottom border.
@@ -3077,7 +3144,7 @@ pub const TUI = struct {
         // plain autocomplete menus (commands/models/files) keep the editor
         // in its normal editing state.
         switch (self.menu_mode) {
-            .settings, .scoped, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => return BORDER_INFO,
+            .settings, .scoped, .model_selector, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => return BORDER_INFO,
             else => {},
         }
         return levelColor(self.session.thinking_level);
@@ -3414,16 +3481,13 @@ pub const TUI = struct {
             self.render_mutex.unlock(self.io);
             return true;
         }
-        // Dragged: copy the selected text (pi: copyOnSelect defaults true;
-        // the settings toggle disables the auto-copy).
-        if (self.fullscreen_copy_on_select) {
-            if (self.selectionText()) |text| {
+        // Dragged: copy the selected text (pi: copyOnSelect defaults true).
+        if (self.selectionText()) |text| {
             defer self.alloc.free(text);
             self.render_mutex.unlock(self.io);
-                self.copyToClipboard(text);
-                self.flash("Copied!");
-                return true;
-            }
+            self.copyToClipboard(text);
+            self.flash("Copied!");
+            return true;
         }
         self.render_mutex.unlock(self.io);
         return true;
@@ -5722,154 +5786,14 @@ pub const TUI = struct {
             return false;
         }
 
+        // pi: /model (with or without a search term) opens the selector
+        // (ModelSelectorComponent); Enter selects, Ctrl+S sets default.
         if (std.mem.eql(u8, word, "/model")) {
-            const cfg = self.cfg;
-            if (arg.len == 0) {
-                if (cfg != null and cfg.?.models.items.len > 0) {
-                    // pi /model (no argument): open the model selector. Our
-                    // selector is the editor completion menu with an empty
-                    // query (every model listed, fuzzy-filterable by typing).
-                    self.editor.setText("/model ") catch {};
-                    self.updateMenu();
-                } else if (cfg) |c| {
-                    var aw: std.Io.Writer.Allocating = .init(self.alloc);
-                    defer aw.deinit();
-                    const lw = &aw.writer;
-                    lw.print("Model: {s} (provider: {s})\nModels:", .{ self.model_name, self.session.model.provider }) catch {};
-                    for (c.models.items) |m| {
-                        lw.print(" {s}", .{m.name}) catch {};
-                    }
-                    const line = self.alloc.dupe(u8, aw.written()) catch "model list failed";
-                    self.noteOwned(line);
-                } else {
-                    self.note("Model: {s} (no config loaded — selector unavailable)", .{self.model_name});
-                }
-                self.redraw();
-                return false;
-            }
-            // /model <name>: fuzzy-find (pi fuzzy scoring, best match wins)
-            // and switch directly. "provider/id" is also matched exactly.
-            if (cfg) |c| {
-                var best: ?usize = null;
-                var best_score: i64 = std.math.maxInt(i64);
-                for (c.models.items, 0..) |m, idx| {
-                    var hit: ?i64 = null;
-                    if (std.mem.eql(u8, m.id, arg)) {
-                        hit = -10000;
-                    } else blk: {
-                        const pid = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ m.provider, m.id }) catch break :blk;
-                        defer self.alloc.free(pid);
-                        if (std.mem.eql(u8, pid, arg)) hit = -9999;
-                    }
-                    if (hit == null) {
-                        hit = fuzzy.fuzzyMatch(self.alloc, arg, m.id) orelse fuzzy.fuzzyMatch(self.alloc, arg, m.name);
-                    }
-                    if (hit) |sc| {
-                        if (sc < best_score) {
-                            best_score = sc;
-                            best = idx;
-                        }
-                    }
-                }
-                if (best) |idx| {
-                    self.switchModel(idx) catch |err| {
-                        self.note("model switch failed: {s}", .{@errorName(err)});
-                    };
-                } else {
-                    self.note("Unknown model: {s}", .{arg});
-                }
-            } else {
-                self.note("No config loaded", .{});
-            }
+            self.openModelSelector(arg);
             self.redraw();
             return false;
         }
 
-        // /login <provider> <api-key> — store a credential (pi /login: the
-        // interactive picker + secret prompt needs a text-input UI we don't
-        // have yet; the argument form covers api_key providers).
-        if (std.mem.eql(u8, word, "/login")) {
-            var pid: ?[]const u8 = null;
-            var key: ?[]const u8 = null;
-            var it = std.mem.tokenizeAny(u8, arg, " \t");
-            if (it.next()) |a| pid = a;
-            if (it.next()) |k| key = k;
-            if (pid == null or key == null) {
-                self.note("usage: /login <provider> <api-key>", .{});
-            } else if (self.cfg) |c| {
-                config.saveAuthEntry(self.alloc, self.io, c.base_dir, pid.?, key.?) catch {
-                    self.note("failed to write auth.json", .{});
-                    self.redraw();
-                    return false;
-                };
-                // Apply immediately to models of that provider.
-                var n: usize = 0;
-                for (c.models.items) |*m| {
-                    if (std.ascii.eqlIgnoreCase(m.provider, pid.?)) {
-                        const copy = self.alloc.dupe(u8, key.?) catch continue;
-                        self.alloc.free(m.api_key);
-                        m.api_key = copy;
-                        n += 1;
-                    }
-                }
-                self.note("logged in to {s} ({d} models updated)", .{ pid.?, n });
-            } else {
-                self.note("no config loaded", .{});
-            }
-            self.redraw();
-            return false;
-        }
-
-        // /logout [provider] — drop a stored credential (default: current).
-        if (std.mem.eql(u8, word, "/logout")) {
-            const pid = if (arg.len > 0) arg else self.session.model.provider;
-            if (self.cfg) |c| {
-                config.removeAuthEntry(self.alloc, self.io, c.base_dir, pid) catch {};
-                for (c.models.items) |*m| {
-                    if (std.mem.eql(u8, m.provider, pid)) {
-                        const blank = self.alloc.dupe(u8, "") catch continue;
-                        self.alloc.free(m.api_key);
-                        m.api_key = blank;
-                    }
-                }
-                self.note("logged out from {s}", .{pid});
-            } else {
-                self.note("no config loaded", .{});
-            }
-            self.redraw();
-            return false;
-        }
-
-        // /scoped-models — pi ScopedModelsSelector (Enter toggles, Esc closes).
-        if (std.mem.eql(u8, word, "/scoped-models")) {
-            self.openScopedModelsMenu();
-            return false;
-        }
-
-        // /share — pi shares via Radius artifact or GitHub gist; both need a
-        // remote backend rpi does not have yet (K3).
-        if (std.mem.eql(u8, word, "/share")) {
-            self.addMessage("\x1b[90mshare is not available yet (needs a Radius/gist backend — planned)\x1b[0m");
-            self.redraw();
-            return false;
-        }
-
-        // /bug — report to the rpi repository.
-        if (std.mem.eql(u8, word, "/bug")) {
-            const detail = if (arg.len > 0) arg else "(no description)";
-            self.addMessageFmt("bug tracker: https://git.yumakeji.cn/pengkebao/zpi/issues\nplease include: rpi v0.1.0 ({s}), the command you ran, and this description:\n  {s}", .{ @tagName(builtin.os.tag), detail });
-            self.redraw();
-            return false;
-        }
-
-        // /changelog — rpi keeps no packaged changelog file yet; point at git.
-        if (std.mem.eql(u8, word, "/changelog")) {
-            self.addMessage("rpi v0.1.0\nchangelog: https://git.yumakeji.cn/pengkebao/zpi/-/commits/main");
-            self.redraw();
-            return false;
-        }
-
-        // /thinking (pi) with the legacy /think kept as an alias.
         if (std.mem.eql(u8, word, "/think") or std.mem.eql(u8, word, "/thinking")) {
             if (arg.len == 0) {
                 self.note("Thinking level: {s} (off|low|medium|high|xhigh|max)", .{self.session.thinking_level.name()});
@@ -6581,6 +6505,75 @@ pub const TUI = struct {
                 }
                 continue; // swallow everything else while the selector is open
             }
+            if (self.menu_mode == .model_selector) {
+                // Model selector (pi ModelSelectorComponent): arrows navigate;
+                // Enter selects; Ctrl+S sets the default model; Esc cancels;
+                // printable keys edit the search. Tab toggles all/scoped when
+                // a scope exists.
+                if (self.bindings.matches(key, .menu_up)) {
+                    if (self.ms_sel > 0) self.ms_sel -= 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_down)) {
+                    if (self.ms_sel + 1 < self.ms_visible) self.ms_sel += 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_close)) {
+                    self.closeModelSelector();
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    if (self.ms_visible > 0) {
+                        const idx = self.ms_filtered.items[self.ms_sel];
+                        self.closeModelSelector();
+                        self.switchModel(idx) catch |err| {
+                            self.note("model switch failed: {s}", .{@errorName(err)});
+                        };
+                    }
+                    self.redraw();
+                    continue;
+                }
+                switch (key) {
+                    .char => |c| {
+                        if (c.ctrl and (c.c == 's' or c.c == 'S')) {
+                            // pi app.models.save: set as default model.
+                            if (self.ms_visible > 0) {
+                                self.setDefaultModel(self.ms_filtered.items[self.ms_sel]);
+                            }
+                            self.redraw();
+                            continue;
+                        }
+                        if (!c.ctrl and !c.alt and c.c >= 0x20 and c.c != 127) {
+                            self.editor.insertChar(c.c) catch {};
+                            self.ms_sel = 0;
+                            self.modelSelectorRefilter();
+                            self.redraw();
+                            continue;
+                        }
+                    },
+                    .backspace => {
+                        const t = self.editor.getText() catch "";
+                        if (t.len > 0) {
+                            self.editor.replaceRange(t.len - 1, t.len, "") catch {};
+                            self.ms_sel = 0;
+                            self.modelSelectorRefilter();
+                        }
+                        self.redraw();
+                        continue;
+                    },
+                    .tab => {
+                        if (self.scoped_models != null) {
+                            self.ms_scope_all = !self.ms_scope_all;
+                            self.ms_sel = 0;
+                            self.modelSelectorRefilter();
+                        }
+                        self.redraw();
+                        continue;
+                    },
+                    else => {},
+                }
+                continue; // swallow everything else while the selector is open
+            }
             if (self.menu_mode == .settings) {
                 // Settings selector (pi SettingsSelectorComponent): the
                 // editor line is the search input; arrows navigate; Enter/
@@ -6602,7 +6595,10 @@ pub const TUI = struct {
                 } else if (self.bindings.matches(key, .menu_confirm)) {
                     // pi applies silently — the row's value already shows it.
                     if (self.settings_visible > 0) {
-                        _ = self.settingsApplyNext(SETTING_DEFS[self.settings_filtered[self.settings_sel]]);
+                        const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
+                        if (!self.settingsApplyNext(def)) {
+                            self.note("{s}: not implemented yet", .{def.label});
+                        }
                     }
                     self.redraw();
                     continue;
@@ -6610,7 +6606,10 @@ pub const TUI = struct {
                 // Space also cycles (pi Enter/Space to change).
                 if (key == .space) {
                     if (self.settings_visible > 0) {
-                        _ = self.settingsApplyNext(SETTING_DEFS[self.settings_filtered[self.settings_sel]]);
+                        const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
+                        if (!self.settingsApplyNext(def)) {
+                            self.note("{s}: not implemented yet", .{def.label});
+                        }
                     }
                     self.redraw();
                     continue;
