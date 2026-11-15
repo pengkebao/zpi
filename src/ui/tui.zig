@@ -1183,13 +1183,11 @@ pub const TUI = struct {
                 return false;
             },
             .settings => {
-                // pi SettingsList: Enter/Space cycles the selected value.
+                // pi SettingsList: Enter/Space cycles the selected value
+                // silently (the row already shows the new value).
                 if (self.settings_visible > 0) {
-                    var vbuf: [64]u8 = undefined;
                     const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
-                    if (self.settingsApplyNext(def)) {
-                        self.note("{s} set to {s}", .{ def.label, self.settingsCurrentValue(def, &vbuf) });
-                    } else {
+                    if (!self.settingsApplyNext(def)) {
                         self.note("{s}: not implemented yet", .{def.label});
                     }
                 }
@@ -1487,7 +1485,11 @@ pub const TUI = struct {
         const cfg = self.cfg;
         switch (def.kind) {
             .autocompact => {
-                if (cfg) |c| c.compaction.enabled = std.mem.eql(u8, next, "true");
+                const on = std.mem.eql(u8, next, "true");
+                if (cfg) |c| c.compaction.enabled = on;
+                // Session holds a copy consumed by maybeAutoCompact and the
+                // footer "(auto)" marker — keep them in sync immediately.
+                self.session.compaction.enabled = on;
             },
             .skill_commands => self.skill_commands = std.mem.eql(u8, next, "true"),
             .autocomplete_max => self.autocomplete_max = std.fmt.parseInt(usize, next, 10) catch 5,
@@ -6481,7 +6483,6 @@ pub const TUI = struct {
                 }
                 continue; // swallow everything else while the selector is open
             }
-            var settings_vbuf: [64]u8 = undefined;
             if (self.menu_mode == .settings) {
                 // Settings selector (pi SettingsSelectorComponent): the
                 // editor line is the search input; arrows navigate; Enter/
@@ -6501,11 +6502,10 @@ pub const TUI = struct {
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_confirm)) {
+                    // pi applies silently — the row's value already shows it.
                     if (self.settings_visible > 0) {
                         const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
-                        if (self.settingsApplyNext(def)) {
-                            self.note("{s} set to {s}", .{ def.label, self.settingsCurrentValue(def, &settings_vbuf) });
-                        } else {
+                        if (!self.settingsApplyNext(def)) {
                             self.note("{s}: not implemented yet", .{def.label});
                         }
                     }
@@ -6516,9 +6516,7 @@ pub const TUI = struct {
                 if (key == .space) {
                     if (self.settings_visible > 0) {
                         const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
-                        if (self.settingsApplyNext(def)) {
-                            self.note("{s} set to {s}", .{ def.label, self.settingsCurrentValue(def, &settings_vbuf) });
-                        } else {
+                        if (!self.settingsApplyNext(def)) {
                             self.note("{s}: not implemented yet", .{def.label});
                         }
                     }
