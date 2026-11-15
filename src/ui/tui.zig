@@ -1248,9 +1248,15 @@ pub const TUI = struct {
                     self.note("resume failed: cannot open {s}", .{path});
                     return false;
                 };
-                const id_copy = self.alloc.dupe(u8, new_st.id) catch "?";
-                self.switchToStore(new_st);
-                self.note("\x1b[90mresumed session {s}\x1b[0m", .{id_copy});
+                const id_copy: []const u8 = self.alloc.dupe(u8, new_st.id) catch "";
+                if (id_copy.len > 0) {
+                    defer self.alloc.free(id_copy);
+                    self.switchToStore(new_st);
+                    self.note("\x1b[90mresumed session {s}\x1b[0m", .{id_copy});
+                } else {
+                    self.switchToStore(new_st);
+                    self.note("\x1b[90mresumed session\x1b[0m", .{});
+                }
                 return false;
             },
             .tree => {
