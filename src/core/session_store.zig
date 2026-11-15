@@ -624,6 +624,34 @@ pub const SessionInfo = struct {
     modified_ms: i64 = 0,
 };
 
+/// Aggregated /session info (pi session stats shape).
+pub const SessionStats = struct {
+    messages_total: usize = 0,
+    messages_user: usize = 0,
+    messages_assistant: usize = 0,
+    tool_calls: usize = 0,
+    tool_results: usize = 0,
+    tokens_input: u64 = 0,
+    tokens_cached: u64 = 0,
+    tokens_output: u64 = 0,
+    tokens_total: u64 = 0,
+    cost_total: f64 = 0,
+    /// Per-model accumulation: "provider/model", tokens, cost.
+    models: []ModelUsage = &.{},
+
+    pub const ModelUsage = struct {
+        key: []const u8,
+        tokens: u64,
+        cost: f64,
+    };
+
+    pub fn deinit(self: *SessionStats, alloc: std.mem.Allocator) void {
+        for (self.models) |*m| alloc.free(m.key);
+        if (self.models.len > 0) alloc.free(self.models);
+        self.models = &.{};
+    }
+};
+
 pub const Store = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1363,6 +1391,119 @@ pub const Store = struct {
     }
 
     /// One-line human summary for /session.
+    /// Aggregate session-wide stats by re-parsing entry lines (pi /session
+    /// stats: message counts, token totals, per-model cost).
+    pub fn collectStats(self: *const Store, alloc: std.mem.Allocator) SessionStats {
+        var stats = SessionStats{};
+        var models = std.array_list.Managed(SessionStats.ModelUsage).init(alloc);
+        defer models.deinit();
+        for (self.entries.items) |e| {
+            if (e.kind != .message) continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, e.line, .{}) catch continue;
+            defer parsed.deinit();
+            const mo = switch (parsed.value) {
+                .object => |o| blk: {
+                    const mv = o.get("message") orelse continue;
+                    break :blk switch (mv) {
+                        .object => |x| x,
+                        else => continue,
+                    };
+                },
+                else => continue,
+            };
+            stats.messages_total += 1;
+            const role = jsonStringField(alloc, e.line, "role") orelse "";
+            defer if (role.len > 0) alloc.free(@constCast(role));
+            if (std.mem.eql(u8, role, "user")) stats.messages_user += 1;
+            if (std.mem.eql(u8, role, "assistant")) stats.messages_assistant += 1;
+            // tool calls (assistant blocks) and results (tool role).
+            if (std.mem.eql(u8, role, "assistant")) {
+                if (mo.get("content")) |cv| {
+                    switch (cv) {
+                        .array => |arr| {
+                            for (arr.items) |blk| {
+                                switch (blk) {
+                                    .object => |bo| {
+                                        const bt = bo.get("type") orelse continue;
+                                        const bts = switch (bt) {
+                                            .string => |x| x,
+                                            else => continue,
+                                        };
+                                        if (std.mem.eql(u8, bts, "toolCall")) stats.tool_calls += 1;
+                                    },
+                                    else => {},
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+            if (std.mem.eql(u8, role, "tool")) stats.tool_results += 1;
+            // usage accumulation + per-model bucket (assistant only).
+            const uv = mo.get("usage") orelse continue;
+            const uo = switch (uv) {
+                .object => |x| x,
+                else => continue,
+            };
+            var u_input: u64 = 0;
+            var u_output: u64 = 0;
+            var u_cached: u64 = 0;
+            var u_total: u64 = 0;
+            var u_cost: f64 = 0;
+            if (uo.get("input")) |v| u_input = intFromJson(v);
+            if (uo.get("output")) |v| u_output = intFromJson(v);
+            if (uo.get("cacheRead")) |v| u_cached = intFromJson(v);
+            if (uo.get("totalTokens")) |v| u_total = intFromJson(v);
+            if (uo.get("cost")) |cv2| {
+                switch (cv2) {
+                    .object => |co| {
+                        if (co.get("total")) |v| u_cost = floatFromJson(v);
+                    },
+                    else => {},
+                }
+            }
+            stats.tokens_input += u_input;
+            stats.tokens_cached += u_cached;
+            stats.tokens_output += u_output;
+            stats.tokens_total += u_total;
+            stats.cost_total += u_cost;
+            if (std.mem.eql(u8, role, "assistant")) {
+                var key_buf = std.array_list.Managed(u8).init(alloc);
+                defer key_buf.deinit();
+                const prov = jsonStringField(alloc, e.line, "provider") orelse "";
+                defer if (prov.len > 0) alloc.free(@constCast(prov));
+                const mid = jsonStringField(alloc, e.line, "model") orelse "";
+                defer if (mid.len > 0) alloc.free(@constCast(mid));
+                if (prov.len > 0 and mid.len > 0) {
+                    key_buf.appendSlice(prov) catch continue;
+                    key_buf.append('/') catch continue;
+                    key_buf.appendSlice(mid) catch continue;
+                } else {
+                    key_buf.appendSlice("(unknown)") catch continue;
+                }
+                var found = false;
+                for (models.items) |*mu| {
+                    if (std.mem.eql(u8, mu.key, key_buf.items)) {
+                        mu.tokens += u_total;
+                        mu.cost += u_cost;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    models.append(.{
+                        .key = alloc.dupe(u8, key_buf.items) catch continue,
+                        .tokens = u_total,
+                        .cost = u_cost,
+                    }) catch {};
+                }
+            }
+        }
+        stats.models = models.toOwnedSlice() catch &.{};
+        return stats;
+    }
+
     pub fn infoLine(self: *const Store, alloc: std.mem.Allocator) ![]u8 {
         const name = self.name orelse "(unnamed)";
         const parent = self.parent_session orelse "-";
@@ -1706,6 +1847,22 @@ fn sanitizePreview(alloc: std.mem.Allocator, text: []const u8) ?[]u8 {
     };
     tmp.deinit();
     return out;
+}
+
+fn intFromJson(v: std.json.Value) u64 {
+    return switch (v) {
+        .integer => |n| @intCast(@max(0, n)),
+        .float => |f| @intFromFloat(@max(0, f)),
+        else => 0,
+    };
+}
+
+fn floatFromJson(v: std.json.Value) f64 {
+    return switch (v) {
+        .integer => |n| @floatFromInt(n),
+        .float => |f| f,
+        else => 0,
+    };
 }
 
 /// File mtime in ms epoch (0 when unavailable).

@@ -6518,12 +6518,50 @@ pub const TUI = struct {
         };
 
         if (std.mem.eql(u8, word, "/session")) {
-            const line = st.infoLine(self.alloc) catch {
-                self.addMessage("(info failed)");
-                self.redraw();
-                return false;
+            // pi /session: full stats block (Session Info shape).
+            var stats = st.collectStats(self.alloc);
+            defer stats.deinit(self.alloc);
+            var out = std.array_list.Managed(u8).init(self.alloc);
+            defer out.deinit();
+            const muted = "\x1b[90m";
+            const reset = "\x1b[0m";
+            const bold = "\x1b[1m";
+            const P = struct {
+                fn add(o: *std.array_list.Managed(u8), comptime f: []const u8, args: anytype) void {
+                    const seg = std.fmt.allocPrint(o.allocator, f, args) catch return;
+                    defer o.allocator.free(seg);
+                    o.appendSlice(seg) catch {};
+                }
             };
-            self.noteOwned(line);
+            P.add(&out, "{s}Session Info{s}\n", .{ bold, reset });
+            P.add(&out, "{s}File: {s}{s}\n", .{ muted, st.path, reset });
+            P.add(&out, "{s}ID: {s}{s}\n\n", .{ muted, st.id, reset });
+            P.add(&out, "{s}Messages{s}\n", .{ bold, reset });
+            P.add(&out, "Total: {d}\nUser: {d}\nAssistant: {d}\nTools: {d} calls, {d} results\n\n", .{
+                stats.messages_total, stats.messages_user, stats.messages_assistant, stats.tool_calls, stats.tool_results,
+            });
+            P.add(&out, "{s}Tokens{s}\n", .{ bold, reset });
+            P.add(&out, "Input: {d}\n", .{stats.tokens_input});
+            const uncached = stats.tokens_input -| stats.tokens_cached;
+            const cached_pct: f64 = if (stats.tokens_input > 0)
+                @as(f64, @floatFromInt(stats.tokens_cached)) * 100.0 / @as(f64, @floatFromInt(stats.tokens_input))
+            else
+                0;
+            P.add(&out, "{s}  Cached: {s}{d} ({d:.1}%)\n{s}  Uncached: {s}{d}\n", .{
+                muted, reset, stats.tokens_cached, cached_pct, muted, reset, uncached,
+            });
+            P.add(&out, "Output: {d}\nTotal: {d}\n\n", .{ stats.tokens_output, stats.tokens_total });
+            P.add(&out, "{s}Cost{s}\n", .{ bold, reset });
+            P.add(&out, "Total: ${d:.3}\n", .{stats.cost_total});
+            for (stats.models) |mu| {
+                P.add(&out, "{s}  {s}: ${d:.3} ({s} tokens){s}\n", .{
+                    muted, mu.key, mu.cost, formatCompactTokens(mu.tokens), reset,
+                });
+            }
+            // Owned copy for addMessage.
+            const text = self.alloc.dupe(u8, out.items) catch return false;
+            defer self.alloc.free(text);
+            self.addMessage(text);
             self.redraw();
             return false;
         }
@@ -6755,6 +6793,20 @@ pub const TUI = struct {
             return;
         };
         self.noteOwned(s);
+    }
+
+    /// pi compact token display: 965k / 3.3M.
+    fn formatCompactTokens(tokens: u64) []const u8 {
+        const S = struct {
+            var buf: [16]u8 = undefined;
+        };
+        if (tokens >= 1_000_000) {
+            return std.fmt.bufPrint(&S.buf, "{d:.1}M", .{@as(f64, @floatFromInt(tokens)) / 1_000_000.0}) catch "?";
+        }
+        if (tokens >= 1000) {
+            return std.fmt.bufPrint(&S.buf, "{d}k", .{tokens / 1000}) catch "?";
+        }
+        return std.fmt.bufPrint(&S.buf, "{d}", .{tokens}) catch "?";
     }
 
     fn freeSessionList(self: *TUI, list: []const ss.SessionInfo) void {
