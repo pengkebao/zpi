@@ -1192,10 +1192,12 @@ pub const TUI = struct {
             },
             .scoped => {
                 // pi ScopedModelsSelector: Enter toggles the model's enabled
-                // state; the menu stays open for more toggles (Esc closes).
+                // state silently — the row's ✓ marker already shows it (no
+                // transcript output).
                 if (e.model_idx) |idx| {
                     self.toggleScopedModel(idx);
-                    self.note("{s} {s}", .{ e.name, self.modelScoped(e.model_idx.?) });
+                    self.scoped_dirty = true;
+                    self.refreshScopedDescs();
                 }
                 return false;
             },
