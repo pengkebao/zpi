@@ -624,6 +624,9 @@ pub const TUI = struct {
                 self.alloc.free(desc);
             };
         }
+        // pi: the skill-commands setting gates /skill: autocomplete entries
+        // (skills themselves stay loadable via the model's skill listing).
+        if (!self.skill_commands) return;
         const skills_list = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir, self.project_trusted) catch return;
         defer skills.freeAll(self.alloc, skills_list);
         for (skills_list) |sk| {
@@ -1021,7 +1024,8 @@ pub const TUI = struct {
     fn menuMaxVisible(self: *const TUI) usize {
         if (self.menu_mode == .settings) return 10;
         return switch (self.menu_mode) {
-            .commands, .models, .files => 5,
+            // pi: autocompleteMaxVisible setting (3-20, default 5).
+            .commands, .models, .files => @max(3, @min(20, self.autocomplete_max)),
             .mcp => @min(self.sel_len, 12),
             else => @min(if (self.menu_len > 0) self.menu_len else 1, 16),
         };
@@ -1541,10 +1545,19 @@ pub const TUI = struct {
                 // footer "(auto)" marker — keep them in sync immediately.
                 self.session.compaction.enabled = on;
             },
-            .skill_commands => self.skill_commands = std.mem.eql(u8, next, "true"),
+            .skill_commands => {
+                self.skill_commands = std.mem.eql(u8, next, "true");
+                self.refreshSlashExtras();
+            },
+            .steering_mode => {
+                self.steering_mode_all = std.mem.eql(u8, next, "all");
+                self.session.steering_mode_all = self.steering_mode_all;
+            },
+            .follow_up_mode => {
+                self.follow_up_mode_all = std.mem.eql(u8, next, "all");
+                self.session.follow_up_mode_all = self.follow_up_mode_all;
+            },
             .autocomplete_max => self.autocomplete_max = std.fmt.parseInt(usize, next, 10) catch 5,
-            .steering_mode => self.steering_mode_all = std.mem.eql(u8, next, "all"),
-            .follow_up_mode => self.follow_up_mode_all = std.mem.eql(u8, next, "all"),
             .hide_thinking => self.thinking_hidden = std.mem.eql(u8, next, "true"),
             .default_project_trust => {
                 if (cfg) |c| {
@@ -3399,13 +3412,16 @@ pub const TUI = struct {
             self.render_mutex.unlock(self.io);
             return true;
         }
-        // Dragged: copy the selected text (pi: copyOnSelect defaults true).
-        if (self.selectionText()) |text| {
+        // Dragged: copy the selected text (pi: copyOnSelect defaults true;
+        // the settings toggle disables the auto-copy).
+        if (self.fullscreen_copy_on_select) {
+            if (self.selectionText()) |text| {
             defer self.alloc.free(text);
             self.render_mutex.unlock(self.io);
-            self.copyToClipboard(text);
-            self.flash("Copied!");
-            return true;
+                self.copyToClipboard(text);
+                self.flash("Copied!");
+                return true;
+            }
         }
         self.render_mutex.unlock(self.io);
         return true;

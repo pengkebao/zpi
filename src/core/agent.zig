@@ -142,6 +142,13 @@ pub const Session = struct {
     /// CLI @file image attachments for the next user message (not owned).
     pending_images: ?[]const msg.ImageBlock = null,
     steering_queue: std.ArrayListUnmanaged([]u8) = .empty,
+    /// pi steeringMode: "all" (default) delivers every queued steering
+    /// message before the next LLM request; "one-at-a-time" delivers one
+    /// and waits for the response.
+    steering_mode_all: bool = true,
+    /// pi followUpMode: "all" drains follow-ups as consecutive new turns;
+    /// "one-at-a-time" starts one follow-up turn per settled round.
+    follow_up_mode_all: bool = true,
     queue_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Messages queued to start a NEW turn after the current one ends
     /// (pi: followUpQueue, alt+enter).
@@ -250,7 +257,19 @@ pub const Session = struct {
             for (texts) |t| self.alloc.free(t);
             self.alloc.free(texts);
         }
-        for (texts) |t| {
+        // pi steeringMode "one-at-a-time": deliver the first message now and
+        // put the rest back (they go out after the next response).
+        var usable = texts;
+        if (!self.steering_mode_all and texts.len > 1) {
+            self.queue_mutex.lock(self.io) catch {};
+            defer self.queue_mutex.unlock(self.io);
+            var i = texts.len;
+            while (i > 1) : (i -= 1) {
+                self.steering_queue.insert(self.alloc, 0, texts[i - 1]) catch {};
+            }
+            usable = texts[0..1];
+        }
+        for (usable) |t| {
             var user_msg = msg.Message.init(self.alloc);
             defer user_msg.deinit();
             user_msg.role = .user;
