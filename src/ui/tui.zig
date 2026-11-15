@@ -1910,7 +1910,13 @@ pub const TUI = struct {
         self.session.model = m;
         self.session.thinking_level = m.thinking_level;
         self.model_name = m.name;
-        self.note("Model: {s} ({s})", .{ m.name, m.provider });
+        // pi showStatus: "Switched to <name>[ (thinking: <level>)]" in dim
+        // gray. Reasoning models follow the model's default thinking level.
+        if (m.reasoning and m.thinking_level != .off) {
+            self.note("\x1b[90mSwitched to {s} (thinking: {s})\x1b[0m", .{ m.name, m.thinking_level.name() });
+        } else {
+            self.note("\x1b[90mSwitched to {s}\x1b[0m", .{m.name});
+        }
         self.redraw();
     }
 
@@ -2092,7 +2098,7 @@ pub const TUI = struct {
         cfg.persistSettings(self.alloc, self.io) catch |err| {
             self.note("settings save failed: {s}", .{@errorName(err)});
         };
-        self.note("default model: {s}/{s}", .{ m.provider, m.id });
+        self.note("\x1b[90mSet as default model: {s}/{s}\x1b[0m", .{ m.provider, m.id });
     }
 
     fn openScopedModelsMenu(self: *TUI) void {
