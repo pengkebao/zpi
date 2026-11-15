@@ -132,7 +132,7 @@ pub const TUI = struct {
     /// leading slash (pi item.value: label may differ, e.g. models show the
     /// id but complete to "provider/id"); empty = use `name`.
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null, value: []const u8 = "" };
-    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped, model_selector };
+    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped, model_selector, thinking_selector };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
 
     /// pi settings-selector items (pi-tui SettingsList + settings-selector.js),
@@ -473,6 +473,10 @@ pub const TUI = struct {
     ms_visible: usize = 0,
     ms_sel: usize = 0,
     ms_scope_all: bool = true,
+    /// /thinking selector state: visible level indices + selection.
+    ts_levels: [7]config.ThinkingLevel = undefined,
+    ts_visible: usize = 0,
+    ts_sel: usize = 0,
     /// Backed settings fields (see settingsApply).
     skill_commands: bool = true,
     steering_mode_all: bool = true,
@@ -643,7 +647,7 @@ pub const TUI = struct {
         // Modal dialogs (settings, session/tree/fork pickers, the /mcp
         // manager, scoped-models) are not driven by editor text.
         switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector => return,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector => return,
             else => {},
         }
         const text = self.editor.getText() catch {
@@ -909,7 +913,7 @@ pub const TUI = struct {
     /// autocomplete shows AUTOCOMPLETE_MAX_VISIBLE (default 5) rows centered
     /// on the selection; modal pickers show up to 16.
     fn menuMaxVisible(self: *const TUI) usize {
-        if (self.menu_mode == .settings or self.menu_mode == .model_selector) return 10;
+        if (self.menu_mode == .settings or self.menu_mode == .model_selector or self.menu_mode == .thinking_selector) return 10;
         return switch (self.menu_mode) {
             .commands, .models, .files => 5,
             .mcp => @min(self.sel_len, 12),
@@ -1061,7 +1065,7 @@ pub const TUI = struct {
         // projected window directly and menu_view_start only decides the
         // selection marker.
         const projected = switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector => true,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector => true,
             else => false,
         };
         const item_idx = if (projected) v else self.menu_view_start + v;
@@ -1202,6 +1206,20 @@ pub const TUI = struct {
                         self.note("model switch failed: {s}", .{@errorName(err)});
                     };
                 }
+                return false;
+            },
+            .thinking_selector => {
+                // pi ThinkingSelector: Enter applies the level and closes
+                // (recorded like the /thinking command path).
+                if (self.ts_visible > 0) {
+                    const lvl = self.ts_levels[self.ts_sel];
+                    self.session.thinking_level = lvl;
+                    if (self.session.store) |st_t| st_t.recordThinkingLevel(lvl.name());
+                    self.note("\x1b[90mThinking level set to {s}\x1b[0m", .{lvl.name()});
+                }
+                self.menu_mode = .hidden;
+                self.editor.clear() catch {};
+                self.redraw();
                 return false;
             },
             .files => {
@@ -2112,6 +2130,135 @@ pub const TUI = struct {
 
     /// /scoped-models — pi ScopedModelsSelector: list all models with their
     /// enabled state; Enter toggles, Esc closes. Session-only.
+    /// pi getSupportedThinkingLevels: non-reasoning models offer only
+    /// "off"; xhigh/max appear only when the model maps them.
+    fn supportedThinkingLevels(self: *TUI) []const config.ThinkingLevel {
+        const S = struct {
+            var buf: [7]config.ThinkingLevel = undefined;
+        };
+        const m = self.session.model;
+        if (!m.reasoning) {
+            S.buf[0] = .off;
+            return S.buf[0..1];
+        }
+        var n: usize = 0;
+        const all = [_]config.ThinkingLevel{ .off, .low, .medium, .high, .xhigh, .max };
+        for (all) |lvl| {
+            const i = @intFromEnum(lvl);
+            if (i >= 4) { // xhigh/max: only when the model maps them
+                if (m.thinking_level_map[i]) |_| {
+                    S.buf[n] = lvl;
+                    n += 1;
+                }
+            } else {
+                S.buf[n] = lvl;
+                n += 1;
+            }
+        }
+        return S.buf[0..n];
+    }
+
+    fn openThinkingSelector(self: *TUI) void {
+        self.menu_mode = .thinking_selector;
+        self.editor.clear() catch {};
+        const levels = self.supportedThinkingLevels();
+        for (levels, 0..) |lvl, i| self.ts_levels[i] = lvl;
+        self.ts_visible = levels.len;
+        // Preselect the current level.
+        self.ts_sel = 0;
+        for (levels, 0..) |lvl, i| {
+            if (lvl == self.session.thinking_level) self.ts_sel = i;
+        }
+        self.freeMenuTextCache();
+        self.redraw();
+    }
+
+    fn thinkingSelectorRefilter(self: *TUI) void {
+        const query_raw = self.editor.getText() catch "";
+        defer self.alloc.free(query_raw);
+        const query = std.mem.trim(u8, query_raw, " ");
+        const levels = self.supportedThinkingLevels();
+        var kept = std.ArrayListUnmanaged(config.ThinkingLevel).empty;
+        defer kept.deinit(self.alloc);
+        for (levels) |lvl| {
+            if (query.len == 0 or containsIgnoreCase2(lvl.name(), query)) {
+                kept.append(self.alloc, lvl) catch {};
+            }
+        }
+        for (kept.items, 0..) |lvl, i| self.ts_levels[i] = lvl;
+        self.ts_visible = kept.items.len;
+        if (self.ts_sel >= self.ts_visible) self.ts_sel = if (self.ts_visible > 0) self.ts_visible - 1 else 0;
+    }
+
+    /// pi LEVEL_DESCRIPTIONS.
+    fn thinkingLevelDesc(lvl: config.ThinkingLevel) []const u8 {
+        return switch (lvl) {
+            .off => "No reasoning",
+            .low => "Light reasoning (~2k tokens)",
+            .medium => "Moderate reasoning (~8k tokens)",
+            .high => "Deep reasoning (~16k tokens)",
+            .xhigh => "Extra-high reasoning (~32k tokens)",
+            .max => "Maximum reasoning",
+        };
+    }
+
+    /// Frame rows: blank + title + cycle hint + blank + search + blank +
+    /// items (each item is 2 rows: level + description) + blank + hint.
+    /// (pi ThinkingSelectorComponent order.)
+    fn thinkingSelectorViewHeight(self: *TUI) usize {
+        const rows = @min(self.ts_visible, @as(usize, 10));
+        var h: usize = 6; // blank + title + blank + cycle hint + blank + search
+        h += rows * 2; // item + description per visible level
+        h += 2; // blank + hint
+        return h;
+    }
+
+    fn renderThinkingSelectorView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        const muted = FG_MUTED;
+        const accent = "\x1b[38;2;167;152;215m";
+        const reset = ansi.RESET;
+        frame.append(self.alloc, "") catch return;
+        const title = std.fmt.allocPrint(self.alloc, "{s}Thinking Level{s}", .{ accent, reset }) catch return;
+        frame.append(self.alloc, title) catch return;
+        frame.append(self.alloc, "") catch return;
+        const cyc = std.fmt.allocPrint(self.alloc, "{s}shift+tab cycles thinking levels in-session{s}", .{ muted, reset }) catch return;
+        frame.append(self.alloc, cyc) catch return;
+        frame.append(self.alloc, "") catch return;
+        // (The "> " search line is the editor row appended by the caller.)
+        const visible_rows = @min(self.ts_visible, 10);
+        const start: usize = if (self.ts_sel >= visible_rows)
+            @min(self.ts_sel -| visible_rows / 2, self.ts_visible -| visible_rows)
+        else
+            0;
+        for (0..visible_rows) |v| {
+            const lvl = self.ts_levels[start + v];
+            const selected = (start + v) == self.ts_sel;
+            var clean = std.array_list.Managed(u8).init(self.alloc);
+            defer clean.deinit();
+            clean.appendSlice(if (selected) "\u{2192} " else "  ") catch return;
+            if (selected) clean.appendSlice(accent) catch return;
+            clean.appendSlice(if (lvl == self.session.thinking_level) "\u{2713} " else "  ") catch return;
+            clean.appendSlice(lvl.name()) catch return;
+            clean.appendSlice(reset) catch return;
+            frame.append(self.alloc, clean.toOwnedSlice() catch return) catch return;
+            // Description line (pi SelectList item description).
+            var desc = std.array_list.Managed(u8).init(self.alloc);
+            defer desc.deinit();
+            desc.appendSlice("    ") catch return;
+            desc.appendSlice(muted) catch return;
+            desc.appendSlice(thinkingLevelDesc(lvl)) catch return;
+            const cfg = self.cfg;
+            if (cfg != null and cfg.?.default_thinking_level != null and cfg.?.default_thinking_level.? == lvl) {
+                desc.appendSlice(" \u{b7} default") catch return;
+            }
+            desc.appendSlice(reset) catch return;
+            frame.append(self.alloc, desc.toOwnedSlice() catch return) catch return;
+        }
+        frame.append(self.alloc, "") catch return;
+        const hint = std.fmt.allocPrint(self.alloc, "  {s}Enter to select \u{b7} Ctrl+S to set as default \u{b7} Escape/Ctrl+C to cancel{s}", .{ muted, reset }) catch return;
+        frame.append(self.alloc, hint) catch return;
+    }
+
     fn closeModelSelector(self: *TUI) void {
         self.menu_mode = .hidden;
         self.editor.clear() catch {};
@@ -3028,7 +3175,7 @@ pub const TUI = struct {
         // component, default prompt "> "): render inset by 2 and let the
         // frame prepend the prompt prefix.
         const settings_search = self.menu_mode == .settings;
-        const modal_search = settings_search or self.menu_mode == .model_selector;
+        const modal_search = settings_search or self.menu_mode == .model_selector or self.menu_mode == .thinking_selector;
         const ed_width: usize = if (modal_search) (if (self.width > 2) self.width - 2 else 1) else self.width;
         var ed = self.editor.render(ed_width) catch return;
         var ed_consumed = false;
@@ -3066,7 +3213,8 @@ pub const TUI = struct {
         // item rows, scroll count, blank, wrapped description, hint.
         const settings_h: usize = if (self.menu_mode == .settings) self.settingsViewHeight(editor_h) else 0;
         const ms_h: usize = if (self.menu_mode == .model_selector) self.modelSelectorViewHeight() else 0;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h;
+        const ts_h: usize = if (self.menu_mode == .thinking_selector) self.thinkingSelectorViewHeight() else 0;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -3191,6 +3339,10 @@ pub const TUI = struct {
         if (self.menu_mode == .model_selector and ms_h > 0) {
             self.renderModelSelectorView(&frame);
         }
+        // 3.7 Thinking selector view (pi ThinkingSelectorComponent).
+        if (self.menu_mode == .thinking_selector and ts_h > 0) {
+            self.renderThinkingSelectorView(&frame);
+        }
 
         // 4. Bottom border.
         const bottom_border = self.borderLine() catch return;
@@ -3291,7 +3443,7 @@ pub const TUI = struct {
         // plain autocomplete menus (commands/models/files) keep the editor
         // in its normal editing state.
         switch (self.menu_mode) {
-            .settings, .scoped, .model_selector, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => return BORDER_INFO,
+            .settings, .scoped, .model_selector, .thinking_selector, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => return BORDER_INFO,
             else => {},
         }
         return levelColor(self.session.thinking_level);
@@ -6028,7 +6180,10 @@ pub const TUI = struct {
         // /thinking (pi) with the legacy /think kept as an alias.
         if (std.mem.eql(u8, word, "/think") or std.mem.eql(u8, word, "/thinking")) {
             if (arg.len == 0) {
-                self.note("Thinking level: {s} (off|low|medium|high|xhigh|max)", .{self.session.thinking_level.name()});
+                // pi handleThinkingCommand(undefined): open the selector.
+                self.openThinkingSelector();
+                self.redraw();
+                return false;
             } else if (config.ThinkingLevel.fromStr(arg)) |lvl| {
                 self.session.thinking_level = lvl;
                 if (self.session.store) |st_think| st_think.recordThinkingLevel(lvl.name());
@@ -6798,6 +6953,71 @@ pub const TUI = struct {
                             self.ms_scope_all = !self.ms_scope_all;
                             self.ms_sel = 0;
                             self.modelSelectorRefilter();
+                        }
+                        self.redraw();
+                        continue;
+                    },
+                    else => {},
+                }
+                continue; // swallow everything else while the selector is open
+            }
+            if (self.menu_mode == .thinking_selector) {
+                // Thinking selector (pi ThinkingSelectorComponent): arrows +
+                // Enter apply; Ctrl+S persists as settings default; Esc
+                // cancels; printable keys filter the levels.
+                if (self.bindings.matches(key, .menu_up)) {
+                    if (self.ts_sel > 0) self.ts_sel -= 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_down)) {
+                    if (self.ts_sel + 1 < self.ts_visible) self.ts_sel += 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_close)) {
+                    self.menu_mode = .hidden;
+                    self.editor.clear() catch {};
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    if (self.ts_visible > 0) {
+                        const lvl = self.ts_levels[self.ts_sel];
+                        self.session.thinking_level = lvl;
+                        if (self.session.store) |st_t| st_t.recordThinkingLevel(lvl.name());
+                        self.note("\x1b[90mThinking level set to {s}\x1b[0m", .{lvl.name()});
+                    }
+                    self.menu_mode = .hidden;
+                    self.editor.clear() catch {};
+                    self.redraw();
+                    continue;
+                }
+                switch (key) {
+                    .char => |c| {
+                        if (c.ctrl and (c.c == 's' or c.c == 'S')) {
+                            if (self.ts_visible > 0) {
+                                const lvl = self.ts_levels[self.ts_sel];
+                                if (self.cfg) |c2| {
+                                    c2.default_thinking_level = lvl;
+                                    c2.persistSettings(self.alloc, self.io) catch {};
+                                }
+                                self.note("\x1b[90mDefault thinking level: {s}\x1b[0m", .{lvl.name()});
+                            }
+                            self.redraw();
+                            continue;
+                        }
+                        if (!c.ctrl and !c.alt and c.c >= 0x20 and c.c != 127) {
+                            self.editor.insertChar(c.c) catch {};
+                            self.ts_sel = 0;
+                            self.thinkingSelectorRefilter();
+                            self.redraw();
+                            continue;
+                        }
+                    },
+                    .backspace => {
+                        const t = self.editor.getText() catch "";
+                        if (t.len > 0) {
+                            self.editor.replaceRange(t.len - 1, t.len, "") catch {};
+                            self.ts_sel = 0;
+                            self.thinkingSelectorRefilter();
                         }
                         self.redraw();
                         continue;

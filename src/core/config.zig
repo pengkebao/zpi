@@ -99,6 +99,9 @@ pub const Config = struct {
     /// "never" — what to do when a project has trust-gated resources and no
     /// saved decision.
     default_project_trust: DefaultProjectTrust = .ask,
+    /// settings.json "defaultThinkingLevel": the · default marker in the
+    /// thinking selector (pi defaultThinkingLevel).
+    default_thinking_level: ?ThinkingLevel = null,
     /// settings.json "commandTools" (Phase I1): shell commands exposed to
     /// the model as tools. Owned; merged across global + project settings.
     command_tools: []command_tools.CommandTool = &.{},
@@ -410,6 +413,10 @@ pub const Config = struct {
             if (numIn(obj, "keepRecentTokens")) |n| self.compaction.keep_recent_tokens = @intCast(n);
             self.compaction.enabled = boolIn(obj, "enabled", self.compaction.enabled);
         }
+        // defaultThinkingLevel: "off".."max" (pi defaultThinkingLevel).
+        if (strIn(root, "defaultThinkingLevel")) |dl| {
+            self.default_thinking_level = ThinkingLevel.fromStr(dl);
+        }
         // commandTools (Phase I1): merged — project entries append to the
         // global ones (names later in the list shadow earlier duplicates).
         if (root.get("commandTools")) |_| {
@@ -503,6 +510,7 @@ pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, 
         try root.object.put(arena, "compaction", .{ .object = comp });
         if (self.default_provider) |dp| try root.object.put(arena, "defaultProvider", .{ .string = dp });
         if (self.default_model) |dm| try root.object.put(arena, "defaultModel", .{ .string = dm });
+        if (self.default_thinking_level) |dtl| try root.object.put(arena, "defaultThinkingLevel", .{ .string = dtl.name() });
 
         const json_text = try std.json.Stringify.valueAlloc(arena, root, .{});
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json_text });
