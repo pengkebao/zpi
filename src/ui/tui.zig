@@ -916,6 +916,7 @@ pub const TUI = struct {
     /// on the selection; modal pickers show up to 16.
     fn menuMaxVisible(self: *const TUI) usize {
         if (self.menu_mode == .settings or self.menu_mode == .model_selector or self.menu_mode == .thinking_selector) return 10;
+        if (self.menu_mode == .sessions or self.menu_mode == .tree or self.menu_mode == .forksel) return 10;
         return switch (self.menu_mode) {
             .commands, .models, .files => 5,
             .mcp => @min(self.sel_len, 12),
@@ -1059,6 +1060,25 @@ pub const TUI = struct {
         // named sessions render orange, the current session accent.
         if (self.menu_mode == .sessions) {
             return self.sessionPickerLine(v, width);
+        }
+        // Tree picker rows (pi TreeSelector): "› " + rich entry text (the
+        // row buffer already carries colors); hint row after the entries.
+        if (self.menu_mode == .tree) {
+            const muted = FG_MUTED;
+            const reset = ansi.RESET;
+            const item_idx = self.menu_view_start + v;
+            const selected = item_idx == self.menu_selected;
+            if (item_idx >= self.sel_len) {
+                return std.fmt.allocPrint(self.alloc, "  {s}Enter switch \u{b7} Esc cancel{s}", .{ muted, reset }) catch return error.OutOfMemory;
+            }
+            const r = &self.sel_rows[item_idx];
+            var out = std.array_list.Managed(u8).init(self.alloc);
+            defer out.deinit();
+            if (selected) out.appendSlice(selected_bg) catch return error.OutOfMemory;
+            out.appendSlice(if (selected) "\u{203a} " else "  ") catch return error.OutOfMemory;
+            out.appendSlice(r.name[0..r.name_len]) catch return error.OutOfMemory;
+            if (selected) out.appendSlice(reset) catch return error.OutOfMemory;
+            return out.toOwnedSlice() catch return error.OutOfMemory;
         }
         // Editor menus keep the FULL filtered list in menu_items: v is the
         // window-relative row and the window starts at menu_view_start.
@@ -1790,27 +1810,34 @@ pub const TUI = struct {
         const st = self.session.store orelse return;
         var chain: [SEL_MAX]ss.Store.ChainItem = undefined;
         const cnt = st.leafChain(&chain);
+        const muted = FG_MUTED;
+        const accent = "\x1b[38;2;167;152;215m";
+        const ok_green = "\x1b[38;2;126;188;135m";
+        const warn = "\x1b[38;2;222;147;95m";
+        const reset = ansi.RESET;
         for (chain[0..cnt]) |ci| {
             if (self.sel_len >= SEL_MAX) break;
             const row = self.sel_len;
-            const depth: usize = @min(self.sel_len, 12);
+            const preview = ci.preview[0..ci.preview_len];
+            // pi getEntryDisplayText: role prefixes and dim meta rows.
             var name_buf: [168]u8 = undefined;
-            const icon: []const u8 = switch (ci.kind) {
-                .message => if (ci.is_user_message) "❯" else "✱",
-                .compaction => "⛁",
-                .branch_summary => "⑂",
-                .session_info => "✎",
-                .model_change => "◆",
-                .thinking_level_change => "◍",
-                else => "·",
+            const name_txt: []const u8 = switch (ci.kind) {
+                .message => blk: {
+                    // pi: active-path marker "• " (accent) + role prefix.
+                    if (ci.is_user_message) {
+                        break :blk std.fmt.bufPrint(&name_buf, "{s}\u{2022} {s}user: {s}{s}{s}", .{ accent, reset, accent, preview, reset }) catch continue;
+                    }
+                    break :blk std.fmt.bufPrint(&name_buf, "{s}\u{2022} {s}assistant: {s}{s}{s}", .{ ok_green, reset, ok_green, preview, reset }) catch continue;
+                },
+                .compaction => std.fmt.bufPrint(&name_buf, "{s}\u{2022} [compaction: {s}]{s}", .{ accent, preview, reset }) catch continue,
+                .branch_summary => std.fmt.bufPrint(&name_buf, "{s}\u{2022} [branch summary]: {s}{s}", .{ warn, preview, reset }) catch continue,
+                .model_change => std.fmt.bufPrint(&name_buf, "{s}\u{2022} [model: {s}]{s}", .{ muted, preview, reset }) catch continue,
+                .thinking_level_change => std.fmt.bufPrint(&name_buf, "{s}\u{2022} [thinking: {s}]{s}", .{ muted, preview, reset }) catch continue,
+                .session_info => std.fmt.bufPrint(&name_buf, "{s}\u{2022} [title: {s}]{s}", .{ muted, preview, reset }) catch continue,
+                else => std.fmt.bufPrint(&name_buf, "{s}\u{2022} {s}{s}", .{ muted, preview, reset }) catch continue,
             };
-            const indent_src = "                                ";
-            const id_txt = ci.id[0..ci.id_len];
-            const name_txt = std.fmt.bufPrint(&name_buf, "{s}{s} {s}", .{
-                indent_src[0 .. depth * 2], icon, id_txt,
-            }) catch continue;
             self.selSetName(row, name_txt);
-            self.selSetDesc(row, ci.preview[0..ci.preview_len]);
+            self.selSetDesc(row, "");
             self.selSetId(row, ci.id[0..ci.id_len]);
             self.sel_len += 1;
         }
@@ -2522,6 +2549,79 @@ pub const TUI = struct {
             ftext.appendSlice(reset) catch return;
         }
         frame.append(self.alloc, ftext.toOwnedSlice() catch return) catch return;
+    }
+
+    /// MCP manager view height: header rows + items + count + footer.
+    fn mcpViewHeight(self: *TUI) usize {
+        var h: usize = 1; // title
+        if (self.menu_mode == .mcp_server) h += 1; // details line
+        if (self.menu_mode == .mcp_tools) h += 1; // details line
+        h += @min(self.menu_len, 10);
+        if (self.menu_len > 10) h += 1;
+        h += 1; // hint
+        return h;
+    }
+
+    /// MCP manager header: title + (server/tools) details line.
+    fn renderMcpHeader(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), editor_h: usize) void {
+        _ = editor_h;
+        const muted = FG_MUTED;
+        const accent = "\x1b[38;2;167;152;215m";
+        const reset = ansi.RESET;
+        frame.append(self.alloc, "") catch return;
+        const title: []const u8 = switch (self.menu_mode) {
+            .mcp => "MCP servers",
+            .mcp_server => blk: {
+                break :blk std.fmt.allocPrint(self.alloc, "MCP server {s}", .{self.mcpServerName()}) catch "MCP server";
+            },
+            .mcp_tools => blk: {
+                break :blk std.fmt.allocPrint(self.alloc, "Tools of {s}", .{self.mcpServerName()}) catch "Tools";
+            },
+            else => "Exposure",
+        };
+        const t = std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ accent, title, reset }) catch return;
+        frame.append(self.alloc, t) catch return;
+        if (self.menu_mode == .mcp_server) {
+            // pi details: `State: <describeState>` from the selected server.
+            const name = self.mcpServerName();
+            var st_txt: []const u8 = "disconnected";
+            if (mcp.Manager.getGlobal()) |mgr| {
+                if (mgr.findByName(name)) |srv| {
+                    if (!srv.enabled) {
+                        st_txt = "disabled";
+                    } else if (srv.connected) {
+                        st_txt = std.fmt.allocPrint(self.alloc, "connected \u{b7} {d} tool{s}", .{ srv.tools.len, if (srv.tools.len == 1) "" else "s" }) catch "connected";
+                    } else {
+                        st_txt = "disconnected";
+                    }
+                }
+            }
+            const d = std.fmt.allocPrint(self.alloc, "  {s}State: {s}{s}", .{ muted, st_txt, reset }) catch return;
+            frame.append(self.alloc, d) catch return;
+        }
+    }
+
+    /// MCP manager footer hint per layer.
+    fn renderMcpFooter(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        const muted = FG_MUTED;
+        const reset = ansi.RESET;
+        const hint: []const u8 = switch (self.menu_mode) {
+            .mcp => "Enter manage \u{b7} Esc close",
+            .mcp_server => "Enter select \u{b7} Esc back",
+            else => "Enter select \u{b7} Esc back",
+        };
+        const line = std.fmt.allocPrint(self.alloc, "  {s}{s}{s}", .{ muted, hint, reset }) catch return;
+        frame.append(self.alloc, line) catch return;
+    }
+
+    fn selRowName(self: *TUI, row: usize) []const u8 {
+        if (row >= self.sel_len) return "";
+        return self.sel_rows[row].name[0..self.sel_rows[row].name_len];
+    }
+
+    fn selRowDesc(self: *TUI, row: usize) []const u8 {
+        if (row >= self.sel_len) return "";
+        return self.sel_rows[row].desc[0..self.sel_rows[row].desc_len];
     }
 
     fn refreshScopedDescs(self: *TUI) void {
@@ -3371,7 +3471,14 @@ pub const TUI = struct {
         // Fixed bottom: menu (menu_h) + top border (1) + editor (editor_h) +
         // bottom border (1) + cwd (1) + status (1). The menu viewport shows
         // at most 16 rows (pi select-list maxVisible).
-        const menu_h: usize = if (self.menu_mode != .hidden and self.menu_mode != .scoped) @min(self.menu_len, self.menuMaxVisible()) else 0;
+        var menu_h: usize = if (self.menu_mode != .hidden and self.menu_mode != .scoped and
+            self.menu_mode != .mcp and self.menu_mode != .mcp_server and
+            self.menu_mode != .mcp_tools and self.menu_mode != .mcp_exposure) @min(self.menu_len, self.menuMaxVisible()) else 0;
+        // Session/tree pickers append a hint row after the entries.
+        if (self.menu_mode == .sessions or self.menu_mode == .tree) menu_h += 1;
+        // MCP manager chrome: title(+details) + items + hint inside borders.
+        const mcp_h: usize = if (self.menu_mode == .mcp or self.menu_mode == .mcp_server or
+            self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure) self.mcpViewHeight() else 0;
         // The "(sel/total)" scroll-indicator row renders under the menu rows
         // (pi SelectList.render appends it after the items) and must be part
         // of the bottom budget — without it the frame is one row taller than
@@ -3389,7 +3496,7 @@ pub const TUI = struct {
         const ms_h: usize = if (self.menu_mode == .model_selector) self.modelSelectorViewHeight() else 0;
         const ts_h: usize = if (self.menu_mode == .thinking_selector) self.thinkingSelectorViewHeight() else 0;
         const sc_h: usize = if (self.menu_mode == .scoped) self.scopedViewHeight() else 0;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -3521,6 +3628,24 @@ pub const TUI = struct {
         // 3.8 Scoped-models view header/footer (pi ScopedModelsSelector).
         if (self.menu_mode == .scoped and sc_h > 0) {
             self.renderScopedChrome(&frame);
+        }
+        // 3.75 MCP manager view (pi ui.menu): title/details header, item
+        // rows, hint footer — all inside the editor borders.
+        if (mcp_h > 0) {
+            self.renderMcpHeader(&frame, editor_h);
+            const mcp_items = mcp_h -| 2; // title(+details) row(s) already added; items+hint below
+            _ = mcp_items;
+            for (0..@min(self.menu_len, 10)) |v| {
+                const ml_raw = self.menuLine(v, self.width, 12, 32) catch return;
+                const ml = truncateToWidth(self.alloc, ml_raw, self.width) catch return;
+                self.alloc.free(ml_raw);
+                frame.append(self.alloc, ml) catch return;
+            }
+            if (self.menu_len > 10) {
+                const cnt = std.fmt.allocPrint(self.alloc, "  {s}({d}/{d}){s}", .{ FG_MUTED, self.menu_selected + 1, self.menu_len, ansi.RESET }) catch return;
+                frame.append(self.alloc, cnt) catch return;
+            }
+            self.renderMcpFooter(&frame);
         }
 
         // 4. Bottom border.
