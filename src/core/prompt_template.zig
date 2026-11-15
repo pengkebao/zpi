@@ -26,12 +26,21 @@ pub const Template = struct {
 
 /// Discover templates: agent_dir/prompts + cwd/.pi/prompts. Later entries
 /// (project) win on name clash (they are found first during lookup).
-pub fn discover(alloc: std.mem.Allocator, io: std.Io, agent_dir: []const u8, cwd: []const u8) []Template {
+pub fn discover(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    agent_dir: []const u8,
+    cwd: []const u8,
+    /// Project-trust gate (pi): when false, cwd/.pi/prompts is skipped.
+    include_project: bool,
+) []Template {
     var list = std.array_list.Managed(Template).init(alloc);
     // Project first so user-level entries cannot shadow project ones.
-    const proj = std.fmt.allocPrint(alloc, "{s}/.pi/prompts", .{cwd}) catch return list.toOwnedSlice() catch return &.{};
-    defer alloc.free(proj);
-    addDir(&list, alloc, io, proj, "p");
+    if (include_project) {
+        const proj = std.fmt.allocPrint(alloc, "{s}/.pi/prompts", .{cwd}) catch return list.toOwnedSlice() catch return &.{};
+        defer alloc.free(proj);
+        addDir(&list, alloc, io, proj, "p");
+    }
     const glob = std.fmt.allocPrint(alloc, "{s}/prompts", .{agent_dir}) catch return list.toOwnedSlice() catch return &.{};
     defer alloc.free(glob);
     addDir(&list, alloc, io, glob, "u");

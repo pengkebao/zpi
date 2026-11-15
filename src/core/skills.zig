@@ -39,6 +39,10 @@ pub fn discover(
     agent_dir: []const u8,
     cwd: []const u8,
     home_dir: ?[]const u8,
+    /// Project-trust gate (pi): when false, project locations (cwd/.pi/skills,
+    /// cwd/.agents/skills and cwd ancestors) are skipped — only user-level
+    /// skills load.
+    include_project: bool,
 ) ![]Skill {
     // Discovered skills, deduped by name (first wins — pi keeps the first
     // discovered on a collision). A plain list + linear scan keeps ownership
@@ -56,8 +60,10 @@ pub fn discover(
     }
     try addLoc(alloc, &locs, agent_dir, "skills");
     if (home_dir) |h| try addLoc(alloc, &locs, h, ".agents/skills");
-    try addLoc(alloc, &locs, cwd, ".pi/skills");
-    try addLoc(alloc, &locs, cwd, ".agents/skills");
+    if (include_project) {
+        try addLoc(alloc, &locs, cwd, ".pi/skills");
+        try addLoc(alloc, &locs, cwd, ".agents/skills");
+    }
 
     for (locs.items) |loc| {
         scanDir(alloc, io, loc, true, &collected, &diags) catch continue;
@@ -503,7 +509,7 @@ test "discover scans agent + project dirs recursively" {
     const cwd = try std.fs.path.join(alloc, &.{ root, "proj" });
     defer alloc.free(cwd);
 
-    const found = try discover(alloc, io, agent_dir, cwd, null);
+    const found = try discover(alloc, io, agent_dir, cwd, null, true);
     defer freeAll(alloc, found);
 
     // Expect exactly: pdf-tools, deep-skill, hidden-skill, proj-skill (nodesc skipped).

@@ -76,6 +76,8 @@ pub fn splitThinkingSuffix(text: []const u8) ?struct { base: []const u8, level: 
 }
 
 /// Fullscreen scrollbar visibility (settings.json "fullscreenScrollbar").
+pub const DefaultProjectTrust = enum { ask, always, never };
+
 pub const ScrollbarMode = enum { auto, always, hidden };
 
 pub const Config = struct {
@@ -92,6 +94,10 @@ pub const Config = struct {
     /// settings.json "fullscreenWheelScrollLines": a fixed line count per
     /// wheel event; null = "auto" (velocity-based, pi's default).
     fullscreen_wheel_lines: ?u32 = null,
+    /// settings.json "defaultProjectTrust" (pi): "ask" (default) | "always" |
+    /// "never" — what to do when a project has trust-gated resources and no
+    /// saved decision.
+    default_project_trust: DefaultProjectTrust = .ask,
 
     pub const Model = struct {
         provider: []u8,
@@ -189,6 +195,97 @@ pub const Config = struct {
 
     /// Persist current settings (compaction, default model) to
     /// <agent-dir>/settings.json, preserving unrelated fields.
+    /// Apply one settings.json JSON object (shared by the global agent-dir
+    /// settings and the project `.pi/settings.json`, which overrides — pi
+    /// settings-manager project scope). Fields already set are freed/re-set.
+    fn applySettingsValue(self: *Config, alloc: std.mem.Allocator, root: std.json.ObjectMap) void {
+        if (strIn(root, "defaultProvider")) |dp| {
+            if (self.default_provider) |old| alloc.free(old);
+            self.default_provider = alloc.dupe(u8, dp) catch null;
+        }
+        if (strIn(root, "defaultModel")) |dm| {
+            if (self.default_model) |old| alloc.free(old);
+            self.default_model = alloc.dupe(u8, dm) catch null;
+        }
+        // Fullscreen scrollbar: "auto" (pi default) | "always" | "hidden".
+        if (strIn(root, "fullscreenScrollbar")) |sb| {
+            if (std.mem.eql(u8, sb, "always")) self.fullscreen_scrollbar = .always;
+            if (std.mem.eql(u8, sb, "hidden")) self.fullscreen_scrollbar = .hidden;
+        }
+        // Lines per wheel event; "auto" (or anything else) is velocity-based.
+        if (root.get("fullscreenWheelScrollLines")) |wv| {
+            if (numIn(root, "fullscreenWheelScrollLines")) |n| {
+                if (n >= 1) self.fullscreen_wheel_lines = @intCast(n);
+            } else if (wv == .string and std.mem.eql(u8, wv.string, "auto")) {
+                self.fullscreen_wheel_lines = null;
+            }
+        }
+        // defaultProjectTrust: "ask" (default) | "always" | "never".
+        if (strIn(root, "defaultProjectTrust")) |t| {
+            if (std.mem.eql(u8, t, "always")) self.default_project_trust = .always;
+            if (std.mem.eql(u8, t, "never")) self.default_project_trust = .never;
+            if (std.mem.eql(u8, t, "ask")) self.default_project_trust = .ask;
+        }
+        // defaultTools: ["read", "+bash", ...] (may contain +name/-name modifiers)
+        if (root.get("defaultTools")) |tv| {
+            const arr = switch (tv) {
+                .array => |a| a,
+                else => return,
+            };
+            if (self.default_tools) |old| freeDefaultTools(alloc, old);
+            const names = alloc.alloc([]const u8, arr.items.len) catch return;
+            var filled: usize = 0;
+            var ok = true;
+            for (arr.items, 0..) |item, idx| {
+                const str = switch (item) {
+                    .string => |str| str,
+                    else => {
+                        ok = false;
+                        break;
+                    },
+                };
+                names[idx] = alloc.dupe(u8, str) catch {
+                    ok = false;
+                    break;
+                };
+                filled = idx + 1;
+            }
+            if (ok) {
+                self.default_tools = names;
+            } else {
+                for (0..filled) |idx| alloc.free(names[idx]);
+                alloc.free(names);
+            }
+        }
+        // compaction: { enabled, reserveTokens, keepRecentTokens }
+        if (root.get("compaction")) |cv| {
+            const obj = switch (cv) {
+                .object => |o| o,
+                else => return,
+            };
+            if (numIn(obj, "reserveTokens")) |n| self.compaction.reserve_tokens = @intCast(n);
+            if (numIn(obj, "keepRecentTokens")) |n| self.compaction.keep_recent_tokens = @intCast(n);
+            self.compaction.enabled = boolIn(obj, "enabled", self.compaction.enabled);
+        }
+    }
+
+    /// Load `<cwd>/.pi/settings.json` (project scope) on top of the global
+    /// settings. Project-trust gated: the caller only invokes this when the
+    /// project is trusted (pi settings-manager project scope).
+    pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, cwd: []const u8) !void {
+        var buf: [1 << 20]u8 = undefined;
+        const joined = std.fmt.allocPrint(alloc, "{s}/.pi/settings.json", .{cwd}) catch return error.OutOfMemory;
+        defer alloc.free(joined);
+        const data = std.Io.Dir.cwd().readFile(io, joined, &buf) catch return error.NotFound;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch return error.InvalidJson;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |o| o,
+            else => return error.InvalidJson,
+        };
+        self.applySettingsValue(alloc, root);
+    }
+
     pub fn persistSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io) !void {
         const path = try std.fmt.allocPrint(alloc, "{s}/settings.json", .{self.base_dir});
         defer alloc.free(path);
@@ -453,62 +550,7 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
             .object => |o| o,
             else => break :blk,
         };
-        if (strIn(root, "defaultProvider")) |dp| {
-            cfg.default_provider = try alloc.dupe(u8, dp);
-        }
-        if (strIn(root, "defaultModel")) |dm| {
-            cfg.default_model = try alloc.dupe(u8, dm);
-        }
-        // Fullscreen scrollbar: "auto" (pi default) | "always" | "hidden".
-        if (strIn(root, "fullscreenScrollbar")) |sb| {
-            if (std.mem.eql(u8, sb, "always")) cfg.fullscreen_scrollbar = .always;
-            if (std.mem.eql(u8, sb, "hidden")) cfg.fullscreen_scrollbar = .hidden;
-        }
-        // Lines per wheel event; "auto" (or anything else) is velocity-based.
-        if (root.get("fullscreenWheelScrollLines")) |wv| {
-            if (numIn(root, "fullscreenWheelScrollLines")) |n| {
-                if (n >= 1) cfg.fullscreen_wheel_lines = @intCast(n);
-            } else if (wv == .string and std.mem.eql(u8, wv.string, "auto")) {
-                cfg.fullscreen_wheel_lines = null;
-            }
-        }
-        // defaultTools: ["read", "+bash", ...] (may contain +name/-name modifiers)
-        if (root.get("defaultTools")) |tv| {
-            const arr = switch (tv) {
-                .array => |a| a,
-                else => break :blk,
-            };
-            const names = try alloc.alloc([]const u8, arr.items.len);
-            var filled: usize = 0;
-            var ok = true;
-            for (arr.items, 0..) |item, idx| {
-                const s = switch (item) {
-                    .string => |str| str,
-                    else => {
-                        ok = false;
-                        break;
-                    },
-                };
-                names[idx] = try alloc.dupe(u8, s);
-                filled = idx + 1;
-            }
-            if (ok) {
-                cfg.default_tools = names;
-            } else {
-                for (0..filled) |idx| alloc.free(names[idx]);
-                alloc.free(names);
-            }
-        }
-        // compaction: { enabled, reserveTokens, keepRecentTokens }
-        if (root.get("compaction")) |cv| {
-            const obj = switch (cv) {
-                .object => |o| o,
-                else => break :blk,
-            };
-            if (numIn(obj, "reserveTokens")) |n| cfg.compaction.reserve_tokens = @intCast(n);
-            if (numIn(obj, "keepRecentTokens")) |n| cfg.compaction.keep_recent_tokens = @intCast(n);
-            cfg.compaction.enabled = boolIn(obj, "enabled", cfg.compaction.enabled);
-        }
+        cfg.applySettingsValue(alloc, root);
     }
 
     // 4. models.json — custom providers
@@ -756,4 +798,9 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
     }
 
     return cfg;
+}
+
+fn freeDefaultTools(alloc: std.mem.Allocator, tools_list: []const []const u8) void {
+    for (tools_list) |t| alloc.free(t);
+    alloc.free(tools_list);
 }

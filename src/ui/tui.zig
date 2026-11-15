@@ -16,6 +16,7 @@ const ss = @import("../core/session_store.zig");
 const shell = @import("../tools/shell.zig");
 const clipboard = @import("../core/clipboard.zig");
 const ptmod = @import("../core/prompt_template.zig");
+const trust = @import("../core/trust.zig");
 const fuzzy = @import("fuzzy.zig");
 const compact = @import("../core/compaction.zig");
 const skills = @import("../core/skills.zig");
@@ -128,7 +129,7 @@ pub const TUI = struct {
     /// leading slash (pi item.value: label may differ, e.g. models show the
     /// id but complete to "provider/id"); empty = use `name`.
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null, value: []const u8 = "" };
-    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure };
+    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
     /// Selector row capacity (sessions/tree/fork pickers).
     const SEL_MAX = 64;
@@ -222,6 +223,7 @@ pub const TUI = struct {
         .{ .name = "/copy", .desc = "Copy last reply to clipboard" },
         .{ .name = "/settings", .desc = "Open settings (Enter cycles values)" },
         .{ .name = "/debug", .desc = "Write debug log" },
+        .{ .name = "/trust", .desc = "Save project trust decision for future sessions" },
         .{ .name = "/exit", .desc = "Quit" },
         .{ .name = "/quit", .desc = "Quit" },
     };
@@ -443,6 +445,23 @@ pub const TUI = struct {
     /// reset menu_selected on navigation keys — the menu would snap back to
     /// the first row on every up/down).
     menu_text_cache: ?[]u8 = null,
+    /// Project-trust decision (pi resolveProjectTrusted). Set by main after
+    /// the trust flow; gates project skills/prompts/templates discovery.
+    project_trusted: bool = false,
+    /// Pending trust prompt: when set, the main loop shows the trust modal
+    /// (pi TrustSelectorComponent) before processing any other key.
+    trust_prompt: ?TrustPrompt = null,
+    /// main-provided reload hook: re-runs project-resource loading after a
+    /// trust decision (project mcp connect + tool registration).
+    trust_reload_ctx: ?*anyopaque = null,
+    trust_reload_fn: ?*const fn (ctx: *anyopaque, t: *TUI, trusted: bool) void = null,
+
+    const TrustPrompt = struct {
+        cwd: []u8,
+        saved: ?bool,
+        /// /trust flow (re-decide + save) vs startup ask (esc = distrust).
+        from_command: bool,
+    };
 
     const SlashExtra = struct { name: []u8, desc: []u8 };
 
@@ -463,7 +482,7 @@ pub const TUI = struct {
         }
         self.slash_extras.clearRetainingCapacity();
         const agent_dir = self.agent_dir_for_templates();
-        const templates = ptmod.discover(self.alloc, self.io, agent_dir, self.cwd_abs);
+        const templates = ptmod.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.project_trusted);
         defer ptmod.freeAll(self.alloc, templates);
         for (templates) |t| {
             const name = std.fmt.allocPrint(self.alloc, "/{s}", .{t.name}) catch continue;
@@ -476,7 +495,7 @@ pub const TUI = struct {
                 self.alloc.free(desc);
             };
         }
-        const skills_list = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir) catch return;
+        const skills_list = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir, self.project_trusted) catch return;
         defer skills.freeAll(self.alloc, skills_list);
         for (skills_list) |sk| {
             // pi: skills come from user or project dirs; tag by which root
@@ -529,7 +548,7 @@ pub const TUI = struct {
         // Modal dialogs (settings, session/tree/fork pickers, the /mcp
         // manager) are not driven by editor text.
         switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure => return,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => return,
             else => {},
         }
         const text = self.editor.getText() catch {
@@ -925,7 +944,7 @@ pub const TUI = struct {
         // projected window directly and menu_view_start only decides the
         // selection marker.
         const projected = switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure => true,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => true,
             else => false,
         };
         const item_idx = if (projected) v else self.menu_view_start + v;
@@ -1091,6 +1110,10 @@ pub const TUI = struct {
             },
             .mcp, .mcp_server, .mcp_tools, .mcp_exposure => {
                 return self.mcpMenuActivate();
+            },
+            .trust => {
+                self.applyTrustChoice();
+                return false;
             },
             .hidden => return false,
         }
@@ -2351,7 +2374,11 @@ pub const TUI = struct {
         // the terminal, which scrolls the screen by one line on every menu
         // frame and leaves stale rows behind.
         const count_line: usize = if (menu_h > 0 and self.menu_len > menu_h) 1 else 0;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line;
+        // Trust prompt panel: title + cwd + saved/current lines above the
+        // list and a key-hint footer below (pi TrustSelectorComponent frame).
+        const trust_head: usize = if (self.menu_mode == .trust) 4 else 0;
+        const trust_foot: usize = if (self.menu_mode == .trust) 1 else 0;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -2458,6 +2485,31 @@ pub const TUI = struct {
         if (menu_h > 0) {
             const col_min: usize = if (self.menu_mode == .commands or self.menu_mode == .models) 12 else 32;
             const col_max: usize = if (self.menu_mode == .commands or self.menu_mode == .models) 32 else 32;
+            if (self.menu_mode == .trust) {
+                if (self.trust_prompt) |tp| {
+                    const accent = "\x1b[38;2;167;152;215m";
+                    const saved_txt = if (tp.saved) |sv|
+                        (if (sv) "trusted" else "untrusted")
+                    else
+                        "none";
+                    const lines = [_][]const u8{
+                        "Project trust",
+                        tp.cwd,
+                        "Saved decision: none",
+                        "Current session: none",
+                    };
+                    _ = lines;
+                    const l1 = std.fmt.allocPrint(self.alloc, "{s}Project trust{s}", .{ accent, ansi.RESET }) catch return;
+                    frame.append(self.alloc, l1) catch return;
+                    const l2 = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}" ++ ansi.RESET, .{tp.cwd}) catch return;
+                    frame.append(self.alloc, l2) catch return;
+                    const l3 = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "Saved decision: {s}" ++ ansi.RESET, .{saved_txt}) catch return;
+                    frame.append(self.alloc, l3) catch return;
+                    const cur: []const u8 = if (self.project_trusted) "trusted" else "untrusted";
+                    const l4 = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "Current session: {s}" ++ ansi.RESET, .{cur}) catch return;
+                    frame.append(self.alloc, l4) catch return;
+                }
+            }
             self.updateMenuViewport(menu_h);
             for (0..menu_h) |v| {
                 // menu_items is the projected window (modal pickers project
@@ -2471,6 +2523,10 @@ pub const TUI = struct {
             if (self.menu_len > menu_h) {
                 const indicator = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "  ({d}/{d})" ++ ansi.RESET, .{ self.menu_selected + 1, self.menu_len }) catch return;
                 frame.append(self.alloc, indicator) catch return;
+            }
+            if (self.menu_mode == .trust) {
+                const foot = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "\u{2191}\u{2193} navigate \u{2022} enter save \u{2022} esc cancel" ++ ansi.RESET, .{}) catch return;
+                frame.append(self.alloc, foot) catch return;
             }
         }
 
@@ -4209,7 +4265,7 @@ pub const TUI = struct {
         if (!std.mem.startsWith(u8, word, "/")) return false;
         const name = word[1..];
         if (name.len == 0) return false;
-        const templates = ptmod.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs);
+        const templates = ptmod.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs, self.project_trusted);
         defer ptmod.freeAll(self.alloc, templates);
         for (templates) |t| {
             if (std.mem.eql(u8, t.name, name)) return true;
@@ -4221,7 +4277,7 @@ pub const TUI = struct {
     /// (pi expandPromptTemplate). Returns the input unchanged when no
     /// template matches; the caller frees the returned slice.
     fn expandTemplate(self: *TUI, text: []const u8) ![]u8 {
-        const templates = ptmod.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs);
+        const templates = ptmod.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs, self.project_trusted);
         defer ptmod.freeAll(self.alloc, templates);
         return ptmod.expand(self.alloc, text, templates);
     }
@@ -4240,7 +4296,7 @@ pub const TUI = struct {
         const space = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
         const skill_name = rest[0..space];
         const args = if (space < rest.len) std.mem.trim(u8, rest[space + 1 ..], " ") else "";
-        const list = skills.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs, self.home_dir) catch return null;
+        const list = skills.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs, self.home_dir, self.project_trusted) catch return null;
         defer skills.freeAll(self.alloc, list);
         for (list) |s| {
             if (!std.mem.eql(u8, s.name, skill_name)) continue;
@@ -4261,7 +4317,7 @@ pub const TUI = struct {
     /// the number of visible skills. Returns an error string on failure.
     fn reloadResources(self: *TUI) !void {
         const cfg = self.cfg orelse return;
-        const list = try skills.discover(self.alloc, self.io, cfg.base_dir, self.cwd_abs, self.home_dir);
+        const list = try skills.discover(self.alloc, self.io, cfg.base_dir, self.cwd_abs, self.home_dir, self.project_trusted);
         defer skills.freeAll(self.alloc, list);
         const block = try skills.formatForPrompt(self.alloc, list);
         defer {
@@ -4512,6 +4568,130 @@ pub const TUI = struct {
             }
         }.pred);
         _ = srv.registerToolsInto(self.session.registry);
+    }
+
+    // ---- Project trust prompt (pi TrustSelectorComponent) ----
+
+    /// Open the trust selector (pi getProjectTrustOptions order). Called by
+    /// main when a startup ask is pending, and by the /trust command.
+    pub fn beginTrustPrompt(self: *TUI, cwd: []const u8, saved: ?bool, from_command: bool) void {
+        self.freeTrustPrompt();
+        const cwd_copy = self.alloc.dupe(u8, cwd) catch return;
+        // Five options in pi's order; labels are copied into the static
+        // sel_rows (kind ids ride along for applyTrustChoice).
+        const parent = std.fs.path.dirname(cwd);
+        const labels = [_][]const u8{
+            "Trust",
+            "Trust parent folder",
+            "Trust (this session only)",
+            "Do not trust",
+            "Do not trust (this session only)",
+        };
+        const kinds = [_][]const u8{ "trust", "trust_parent", "trust_session", "distrust", "distrust_session" };
+        self.sel_len = 0;
+        self.menu_selected = 0;
+        self.menu_view_start = 0;
+        for (labels, 0..) |base_label, i| {
+            if (self.sel_len >= SEL_MAX) break;
+            if (i == 1 and parent == null) continue; // no parent (root cwd)
+            const row = self.sel_len;
+            var name_buf: [200]u8 = undefined;
+            const name = if (i == 1)
+                std.fmt.bufPrint(&name_buf, "{s} ({s})", .{ base_label, parent.? }) catch continue
+            else
+                base_label;
+            self.selSetName(row, name);
+            self.selSetDesc(row, "");
+            self.selSetId(row, kinds[i]);
+            self.sel_len += 1;
+        }
+        // Start on the saved-decision option (pi isSavedOption: first match).
+        self.menu_selected = 0;
+        if (saved) |sv| {
+            const want: []const u8 = if (sv) "trust" else "distrust";
+            for (0..self.sel_len) |i| {
+                if (std.mem.eql(u8, self.sel_rows[i].id[0..self.sel_rows[i].id_len], want)) {
+                    self.menu_selected = i;
+                    break;
+                }
+            }
+        }
+        self.trust_prompt = .{ .cwd = cwd_copy, .saved = saved, .from_command = from_command };
+        self.menu_mode = .trust;
+        self.editor.clear() catch {};
+        self.refreshSelMenu();
+        self.redraw();
+    }
+
+    fn freeTrustPrompt(self: *TUI) void {
+        if (self.trust_prompt) |*tp| {
+            self.alloc.free(tp.cwd);
+            self.trust_prompt = null;
+        }
+    }
+
+    /// Enter in the trust selector: persist per kind (session-only choices
+    /// skip the store), flip project_trusted, run the main-provided reload
+    /// hook, then close (pi saveProjectTrustPromptResult + resource reload).
+    fn applyTrustChoice(self: *TUI) void {
+        const tp = self.trust_prompt orelse return;
+        const kind = self.selRowId();
+        var store = trust.Store.init(self.alloc, self.io, self.cfg.?.base_dir) catch null;
+        defer if (store) |*st| st.deinit();
+        if (std.mem.eql(u8, kind, "trust")) {
+            if (store) |*st| st.set(tp.cwd, true) catch {};
+            self.project_trusted = true;
+            self.note("Project trusted (saved)", .{});
+        } else if (std.mem.eql(u8, kind, "trust_parent")) {
+            if (store) |*st| st.setParent(tp.cwd) catch {};
+            self.project_trusted = true;
+            self.note("Parent folder trusted (saved)", .{});
+        } else if (std.mem.eql(u8, kind, "trust_session")) {
+            self.project_trusted = true;
+            self.note("Project trusted (this session only)", .{});
+        } else if (std.mem.eql(u8, kind, "distrust")) {
+            if (store) |*st| st.set(tp.cwd, false) catch {};
+            self.project_trusted = false;
+            self.note("Project marked untrusted (saved)", .{});
+        } else {
+            self.project_trusted = false;
+            self.note("Project untrusted (this session only)", .{});
+        }
+        if (self.trust_reload_fn) |f| {
+            if (self.trust_reload_ctx) |ctx| f(ctx, self, self.project_trusted);
+        }
+        self.endTrustPrompt(tp.from_command);
+    }
+
+    fn endTrustPrompt(self: *TUI, from_command: bool) void {
+        self.freeTrustPrompt();
+        self.menu_mode = .hidden;
+        self.refreshSlashExtras();
+        self.reloadResources() catch {};
+        self.redraw();
+        _ = from_command;
+    }
+
+    /// ESC in the trust prompt: startup ask cancels to untrusted (pi
+    /// resolveProjectTrusted returns false when the prompt is cancelled);
+    /// /trust just closes without changing anything.
+    fn trustMenuCancel(self: *TUI) void {
+        const tp = self.trust_prompt orelse {
+            self.menu_mode = .hidden;
+            return;
+        };
+        if (!tp.from_command) {
+            self.project_trusted = false;
+            if (self.trust_reload_fn) |f| {
+                if (self.trust_reload_ctx) |ctx| f(ctx, self, false);
+            }
+            self.note("Project untrusted (this session only)", .{});
+            self.endTrustPrompt(false);
+        } else {
+            self.freeTrustPrompt();
+            self.menu_mode = .hidden;
+            self.redraw();
+        }
     }
 
     /// Enter in the /mcp manager menus. Returns should_exit (always false).
@@ -4939,6 +5119,19 @@ pub const TUI = struct {
             return false;
         }
 
+        // /trust — re-run the project trust decision (pi showTrustSelector).
+        if (std.mem.eql(u8, word, "/trust")) {
+            var saved: ?bool = null;
+            if (self.cfg) |c| {
+                var store = trust.Store.init(self.alloc, self.io, c.base_dir) catch null;
+                defer if (store) |*st| st.deinit();
+                if (store) |*st| saved = st.get(self.cwd_abs);
+            }
+            self.beginTrustPrompt(self.cwd_abs, saved, true);
+            self.redraw();
+            return false;
+        }
+
         // /mcp — list configured MCP servers with their state (pi /mcp).
         if (std.mem.eql(u8, word, "/mcp")) {
             self.showMcpStatus();
@@ -5317,7 +5510,7 @@ pub const TUI = struct {
     }
 
     /// Format + add an owned note. On OOM, add a plain fallback (not freed).
-    fn note(self: *TUI, comptime fmt: []const u8, args: anytype) void {
+    pub fn note(self: *TUI, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.allocPrint(self.alloc, fmt, args) catch {
             self.addMessage("(note)");
             return;
@@ -5437,7 +5630,8 @@ pub const TUI = struct {
             const modal_open = self.menu_mode == .settings or self.menu_mode == .sessions or
                 self.menu_mode == .tree or self.menu_mode == .forksel or
                 self.menu_mode == .mcp or self.menu_mode == .mcp_server or
-                self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure;
+                self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure or
+                self.menu_mode == .trust;
             if (key == .unknown and !modal_open) {
                 // Timer tick (scrollbar hide deadline / throttled wheel-flush
                 // tail). Stats don't change on a timer — the cached-footer
@@ -5720,6 +5914,26 @@ pub const TUI = struct {
                     continue;
                 }
                 // anything else falls through to the editor (live filtering)
+            }
+            if (self.menu_mode == .trust) {
+                // Trust prompt: arrows + Enter + Esc only (pi TrustSelector).
+                if (self.bindings.matches(key, .menu_up)) {
+                    self.menu_selected = if (self.menu_selected == 0) self.sel_len - 1 else self.menu_selected - 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_down)) {
+                    self.menu_selected = if (self.menu_selected + 1 >= self.sel_len) 0 else self.menu_selected + 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_close)) {
+                    self.trustMenuCancel();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    _ = self.menuActivate();
+                    self.redraw();
+                    continue;
+                }
+                continue; // swallow everything else while the prompt is open
             }
             if (self.menu_mode == .settings) {
                 // Modal settings selector: only menu keys respond.

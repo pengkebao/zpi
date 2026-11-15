@@ -188,9 +188,9 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
 | settings.json（模型/工具/会话/压缩/交互/主题…） | ✅ 全量 | ⚠️ | 目前只读 defaultProvider/defaultModel |
-| 项目级 `.pi/settings.json`、`.pi/mcp.json`、`.pi/extensions/` | ✅ | ❌ | 受 trust 门控 |
-| 配置优先级 CLI > env > 项目 > 用户 | ✅ | ❌ | |
-| 项目信任（trust prompt、`/trust`、`-a/-na`） | ✅ | ❌ | |
+| 项目级 `.pi/settings.json`、`.pi/mcp.json`、`.pi/extensions/` | ✅ | ⚠️ | **trust 门控已落地**：trusted 时加载项目 settings/mcp/skills/prompts；extensions 待 Phase I |
+| 配置优先级 CLI > env > 项目 > 用户 | ✅ | ⚠️ | 项目 `.pi/settings.json`（trusted）覆盖用户级（defaultProvider/defaultModel/defaultTools/defaultProjectTrust/fullscreen*/compaction）；CLI --tools 仍最高；**defaultTools 项目覆盖在 ask 场景需重启生效**（CLI --tools 时跳过） |
+| 项目信任（trust prompt、`/trust`、`-a/-na`） | ✅ | ✅ | pi trust-manager/project-trust 完整移植（`src/core/trust.zig`）：`trust.json` `{abs-path: true|false}`（键排序+尾换行）；**get 沿祖先链就近继承**（父信任覆盖子项目）；门控资源检测（`.pi/{settings,mcp}.json/extensions/skills/prompts/themes/SYSTEM.md/APPEND_SYSTEM.md` + cwd 祖先链 `.agents/skills`）；resolve 顺序 = CLI override(`--approve/-a`、`--no-approve/-na`) > 存档 > 无门控资源默认信任 > defaultProjectTrust 设置(ask/always/never) > **TUI 交互提示**（pi TrustSelector 五选项：Trust / Trust parent / Trust session-only / Do not trust / Do not trust session-only；面板含 cwd/Saved decision/Current session）；**Trust 热加载**（项目 mcp 重连+工具重注册+过滤重放 + skills/prompts 刷新，reload 钩子 main→TUI 回调）；`/trust` 重选（pi showTrustSelector）；项目 skills/prompts discover 加 `include_project` 参数门控 |
 | 环境变量（PI_CODING_AGENT_DIR✅、SESSION_DIR、PI_OFFLINE…） | ✅ | ⚠️ | |
 
 ## 二、复刻路线图（按依赖顺序排列）

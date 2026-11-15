@@ -199,6 +199,7 @@ pub const Manager = struct {
         }
         self.servers.deinit();
         freeConfigs(self.alloc, self.configs);
+        if (self.auth_path) |p| self.alloc.free(p);
     }
 
     /// Manager-owned copies of the startup configs so `/mcp` reconnect can

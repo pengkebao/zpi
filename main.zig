@@ -7,6 +7,7 @@ const config = @import("src/core/config.zig");
 const agent = @import("src/core/agent.zig");
 const ai = @import("src/ai/openai.zig");
 const tools = @import("src/tools/registry.zig");
+const trust = @import("src/core/trust.zig");
 const selection = @import("src/tools/selection.zig");
 const tui = @import("src/ui/tui.zig");
 const ss = @import("src/core/session_store.zig");
@@ -305,6 +306,84 @@ fn installSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
+
+/// State the trust reload hook needs: everything main used to wire MCP up,
+/// kept alive on main's stack for the whole session.
+const TrustReloadCtx = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    cwd_abs: []const u8,
+    user_mcp: []const u8,
+    proj_mcp: []const u8,
+    registry: *tools.Registry,
+    mcp_mgr: *?*mcp.Manager,
+    exclude_list: ?[]const []const u8,
+    mcp_allowlist: ?[]const []const u8,
+};
+
+fn trustReloadCb(ctx_ptr: *anyopaque, t: *tui.TUI, trusted: bool) void {
+    const ctx: *TrustReloadCtx = @ptrCast(@alignCast(ctx_ptr));
+    const alloc = ctx.alloc;
+    if (!trusted) {
+        t.note("Project resources are not loaded (untrusted)", .{});
+        return;
+    }
+    // Rebuild the MCP manager with the project file included (pi loads
+    // project mcp.json only for trusted projects).
+    if (ctx.mcp_mgr.*) |old| {
+        mcp.Manager.setGlobal(null);
+        old.deinit();
+        alloc.destroy(old);
+        ctx.mcp_mgr.* = null;
+    }
+    // Drop previously registered MCP tools (user-level ones come back below).
+    const PrefixMatch = struct {
+        fn pred(patterns: []const []const u8, name: []const u8) bool {
+            return std.mem.startsWith(u8, name, patterns[0]);
+        }
+    };
+    const ResourceMatch = struct {
+        fn pred(patterns: []const []const u8, name: []const u8) bool {
+            _ = patterns;
+            return mcp.isMcpToolName(name) and !std.mem.startsWith(u8, name, "mcp__");
+        }
+    };
+    const mcp_prefix: []const u8 = "mcp__";
+    ctx.registry.removeMatchingOn(&.{mcp_prefix}, PrefixMatch.pred);
+    ctx.registry.removeMatchingOn(&.{"resource"}, ResourceMatch.pred);
+    blk: {
+        const mgr = alloc.create(mcp.Manager) catch break :blk;
+        mgr.* = mcp.Manager.init(alloc, ctx.io);
+        mgr.auth_path = std.fmt.allocPrint(alloc, "{s}/mcp-auth.json", .{ctx.cfg.base_dir}) catch break :blk;
+        mcp.Manager.setGlobal(mgr);
+        const cfgs = mcp.loadConfig(alloc, ctx.io, ctx.user_mcp, ctx.proj_mcp) catch break :blk;
+        mgr.rememberConfigs(cfgs);
+        mgr.connectAll(cfgs);
+        _ = mgr.registerTools(ctx.registry);
+        _ = mcp.registerResourceTools(mgr, ctx.registry);
+        ctx.mcp_mgr.* = mgr;
+        t.note("MCP: {d} server(s) after trust reload", .{mgr.servers.items.len});
+    }
+    // Replay the tool-selection filters over the fresh MCP tools.
+    if (ctx.exclude_list) |ex| {
+        ctx.registry.removeMatchingOn(ex, struct {
+            fn pred(patterns: []const []const u8, name: []const u8) bool {
+                return mcp.isMcpToolName(name) and selection.matchesAny(name, patterns);
+            }
+        }.pred);
+    }
+    if (ctx.mcp_allowlist) |allow| {
+        ctx.registry.removeMatchingOn(allow, struct {
+            fn pred(patterns: []const []const u8, name: []const u8) bool {
+                return mcp.isMcpToolName(name) and !selection.matchesAny(name, patterns);
+            }
+        }.pred);
+    }
+    // Project MCP tools may be searchable — keep tool_search available.
+    _ = ctx.registry.setActive("tool_search", true);
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const alloc = init.gpa;
@@ -353,6 +432,9 @@ pub fn main(init: std.process.Init) !void {
     var list_sessions = false;
     // Tool selection (Phase E7)
     var tools_arg: ?[]const u8 = null;
+    // Project-trust override (--approve/-a trusts, --no-approve/-na distrusts;
+    // pi projectTrustOverride). null = resolve from the store / interactively.
+    var trust_override: ?bool = null;
     var exclude_tools_arg: ?[]const u8 = null;
     var no_tools = false;
     var no_builtin_tools = false;
@@ -389,6 +471,10 @@ pub fn main(init: std.process.Init) !void {
             no_tui = true;
         } else if (std.mem.eql(u8, arg, "--list-models")) {
             list_models = true;
+        } else if (std.mem.eql(u8, arg, "--approve") or std.mem.eql(u8, arg, "-a")) {
+            trust_override = true;
+        } else if (std.mem.eql(u8, arg, "--no-approve") or std.mem.eql(u8, arg, "-na")) {
+            trust_override = false;
         } else if (std.mem.eql(u8, arg, "--no-session")) {
             no_session = true;
         } else if (std.mem.eql(u8, arg, "--continue") or std.mem.eql(u8, arg, "-c")) {
@@ -453,7 +539,12 @@ pub fn main(init: std.process.Init) !void {
             }
             const proj_mcp = try std.fmt.allocPrint(alloc, "{s}/.pi/mcp.json", .{proj_cwd});
             defer alloc.free(proj_mcp);
-            const cfgs = mcp.loadConfig(alloc, io, user_mcp, proj_mcp) catch &[_]mcp.ServerConfig{};
+            // Trust-gated (pi): without a saved decision this listing shows
+            // the user-level file only when the project is not yet trusted.
+            var early_store = trust.Store.init(alloc, io, base) catch null;
+            defer if (early_store) |*st| st.deinit();
+            const early_trusted = if (early_store) |*st| (st.get(proj_cwd) orelse false) else false;
+            const cfgs = mcp.loadConfig(alloc, io, user_mcp, if (early_trusted) proj_mcp else "/nonexistent/.pi/mcp.json") catch &[_]mcp.ServerConfig{};
             defer mcp.freeConfigs(alloc, cfgs);
             if (cfgs.len == 0) {
                 std.debug.print("no MCP servers configured\n", .{});
@@ -501,11 +592,83 @@ pub fn main(init: std.process.Init) !void {
 
     // Load config
     var cfg = try config.load(io, alloc, init.minimal.environ);
+
+    // ---- Project trust (H4, pi project-trust.js) ----
+    // Non-interactive resolution happens here (CLI override -> saved
+    // decision -> no gated resources -> defaultProjectTrust setting); the
+    // interactive ask runs in the TUI right before the main loop.
+    var trust_store_var: ?trust.Store = null;
+    trust_store_var = trust.Store.init(alloc, io, cfg.base_dir) catch null;
+    defer if (trust_store_var) |*ts| ts.deinit();
+    var project_trusted: bool = true;
+    var trust_needs_prompt = false;
+    var trust_saved_decision: ?bool = null;
+    // Home dir (user-level skill discovery ~/.agents/skills + trust checks).
+    const home_dir_early = std.process.Environ.getPosix(init.minimal.environ, "HOME") orelse
+        std.process.Environ.getPosix(init.minimal.environ, "USERPROFILE");
     defer cfg.deinit(alloc);
 
-    // Home dir (for user-level skill discovery: ~/.agents/skills).
-    const home_dir = std.process.Environ.getPosix(init.minimal.environ, "HOME") orelse
-        std.process.Environ.getPosix(init.minimal.environ, "USERPROFILE");
+    // Resolve cwd EARLY: the trust decision gates project settings (which
+    // feed defaultTools) and project resource loading.
+    var cwd_alloc: ?[]u8 = null;
+    const cwd_abs = blk2: {
+        if (cwd) |c| {
+            break :blk2 c;
+        }
+        cwd_alloc = try getCwdAlloc(alloc);
+        break :blk2 cwd_alloc.?;
+    };
+
+    // chdir so tools (read/bash/edit) resolve relative paths against --cwd.
+    if (builtin.os.tag != .windows) {
+        if (std.mem.indexOfScalar(u8, cwd_abs, 0) == null) {
+            const cwd_z = alloc.alloc(u8, cwd_abs.len + 1) catch null;
+            if (cwd_z) |z| {
+                @memcpy(z[0..cwd_abs.len], cwd_abs);
+                z[cwd_abs.len] = 0;
+                _ = std.c.chdir(@ptrCast(z.ptr));
+                alloc.free(z);
+            }
+        }
+    }
+
+    // pi resolveProjectTrusted, non-interactive part: CLI override wins;
+    // without gated resources everything is trusted by default; otherwise a
+    // saved decision (nearest ancestor) applies; defaultProjectTrust
+    // always/never short-circuits; "ask" (the default) defers to the TUI
+    // prompt (untrusted until confirmed; print mode stays untrusted).
+    const trust_store: ?*trust.Store = if (trust_store_var) |*ts| ts else null;
+    project_trusted = blk2: {
+        if (trust_override) |t| break :blk2 t;
+        if (trust_store) |ts| {
+            if (ts.getEntry(cwd_abs) catch null) |entry| {
+                defer alloc.free(entry.path);
+                trust_saved_decision = entry.decision;
+            }
+        }
+        const gated = trust.hasTrustRequiringResources(alloc, io, cwd_abs, home_dir_early);
+        if (!gated) {
+            // pi: trustStore.get(cwd) ?? true — no gated resources at all.
+            if (trust_saved_decision == null) break :blk2 true;
+        }
+        if (trust_saved_decision) |d| break :blk2 d;
+        switch (cfg.default_project_trust) {
+            .always => break :blk2 true,
+            .never => break :blk2 false,
+            .ask => {},
+        }
+        trust_needs_prompt = true;
+        break :blk2 false; // conservative until the prompt confirms
+    };
+
+    // Trusted projects may override settings via .pi/settings.json (pi
+    // settings-manager project scope): merged here so defaultTools and the
+    // default model resolution below see the effective values.
+    if (project_trusted) {
+        cfg.loadProjectSettings(alloc, io, cwd_abs) catch {};
+    }
+
+    const home_dir = home_dir_early;
 
     if (list_models) {
         std.debug.print("models ({s}):\n", .{cfg.base_dir});
@@ -643,29 +806,6 @@ pub fn main(init: std.process.Init) !void {
         break :blk if (has_mcp) list else null;
     };
 
-    // Resolve cwd (needed for the system prompt + sessions)
-    var cwd_alloc: ?[]u8 = null;
-    const cwd_abs = blk: {
-        if (cwd) |c| {
-            break :blk c;
-        }
-        cwd_alloc = try getCwdAlloc(alloc);
-        break :blk cwd_alloc.?;
-    };
-
-    // chdir so tools (read/bash/edit) resolve relative paths against --cwd.
-    if (builtin.os.tag != .windows) {
-        if (std.mem.indexOfScalar(u8, cwd_abs, 0) == null) {
-            const cwd_z = alloc.alloc(u8, cwd_abs.len + 1) catch null;
-            if (cwd_z) |z| {
-                @memcpy(z[0..cwd_abs.len], cwd_abs);
-                z[cwd_abs.len] = 0;
-                _ = std.c.chdir(@ptrCast(z.ptr));
-                alloc.free(z);
-            }
-        }
-    }
-
     // ---- MCP (PLAN 10): load mcp.json, connect stdio servers, register tools ----
     // The manager is heap-allocated so the shared MCP tool executor (which only
     // sees its own Tool name) can reach it via the global. It outlives the
@@ -676,12 +816,17 @@ pub fn main(init: std.process.Init) !void {
         defer alloc.free(user_mcp);
         const proj_mcp = std.fmt.allocPrint(alloc, "{s}/.pi/mcp.json", .{cwd_abs}) catch break :blk;
         defer alloc.free(proj_mcp);
-        const cfgs = mcp.loadConfig(alloc, io, user_mcp, proj_mcp) catch break :blk;
+        // Untrusted projects keep only the user-level file (pi gates
+        // .pi/mcp.json behind project trust); a sentinel empty path reads
+        // as an absent file.
+        const effective_proj: []const u8 = if (project_trusted) proj_mcp else "/nonexistent/.pi/mcp.json";
+        const cfgs = mcp.loadConfig(alloc, io, user_mcp, effective_proj) catch break :blk;
         defer mcp.freeConfigs(alloc, cfgs);
         const mgr = alloc.create(mcp.Manager) catch break :blk;
         mgr.* = mcp.Manager.init(alloc, io);
         const auth_path = std.fmt.allocPrint(alloc, "{s}/mcp-auth.json", .{cfg.base_dir}) catch break :blk;
-        defer alloc.free(auth_path);
+        // Owned by the manager (freed in Manager.deinit); freeing here would
+        // leave a dangling path behind HTTP 401 reconnects.
         mgr.auth_path = auth_path;
         mcp.Manager.setGlobal(mgr);
         mgr.rememberConfigs(cfgs);
@@ -760,6 +905,21 @@ pub fn main(init: std.process.Init) !void {
         alloc.destroy(m);
     };
 
+    // Trust reload hook state (kept on main's stack; the TUI prompt calls it
+    // when the user trusts a project at startup or via /trust).
+    var trust_reload = TrustReloadCtx{
+        .alloc = alloc,
+        .io = io,
+        .cfg = &cfg,
+        .cwd_abs = cwd_abs,
+        .user_mcp = std.fmt.allocPrint(alloc, "{s}/mcp.json", .{cfg.base_dir}) catch "",
+        .proj_mcp = std.fmt.allocPrint(alloc, "{s}/.pi/mcp.json", .{cwd_abs}) catch "",
+        .registry = &registry,
+        .mcp_mgr = &mcp_mgr,
+        .exclude_list = exclude_list,
+        .mcp_allowlist = mcp_allowlist,
+    };
+
     // ---- Initial prompt assembly (pi buildInitialMessage) ----
     // piped stdin (non-TTY); stdin presence downgrades interactive → print.
     var stdin_content: ?[]u8 = null;
@@ -823,7 +983,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Combine [stdin, @file text, prompt] (pi order), then expand templates.
     {
-        const templates = ptmod.discover(alloc, io, cfg.base_dir, cwd_abs);
+        const templates = ptmod.discover(alloc, io, cfg.base_dir, cwd_abs, project_trusted);
         defer ptmod.freeAll(alloc, templates);
         var combined = std.array_list.Managed(u8).init(alloc);
         defer combined.deinit();
@@ -846,7 +1006,7 @@ pub fn main(init: std.process.Init) !void {
 
 
     // Build the sectioned system prompt (Phase D) + advertise skills (Phase H1).
-    const skills_list = try skills.discover(alloc, io, cfg.base_dir, cwd_abs, home_dir);
+    const skills_list = try skills.discover(alloc, io, cfg.base_dir, cwd_abs, home_dir, project_trusted);
     defer skills.freeAll(alloc, skills_list);
     var skills_block: ?[]u8 = null;
     defer {
@@ -1030,8 +1190,18 @@ pub fn main(init: std.process.Init) !void {
     } else {
         // TUI mode
         var t = tui.TUI.init(io, alloc, &session, model.name, sessions_dir, cwd_abs, home_dir, &cfg, init.minimal.environ, append_system_prompt, system_prompt_override);
+        // Gate project discovery BEFORE the first dynamic-slash refresh.
+        t.project_trusted = project_trusted;
         t.initLate();
         defer t.deinit();
+        // Project trust ask (H4): pi TrustSelectorComponent runs before any
+        // other interaction; choosing Trust hot-loads project resources via
+        // the reload hook below.
+        if (trust_needs_prompt) {
+            t.trust_reload_ctx = @ptrCast(&trust_reload);
+            t.trust_reload_fn = &trustReloadCb;
+            t.beginTrustPrompt(cwd_abs, trust_saved_decision, false);
+        }
         // Persisted history → visible transcript (pi: renderInitialMessages
         // runs whenever the session has messages — continue/resume/--session).
         t.replaySession();
