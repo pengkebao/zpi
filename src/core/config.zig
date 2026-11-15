@@ -1126,10 +1126,13 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                                         }
                                         break :blk_cmap map;
                                     },
-                                    .cost_input = costIn(mo, "ci"),
-                                    .cost_output = costIn(mo, "co"),
-                                    .cost_cache_read = costIn(mo, "cr"),
-                                    .cost_cache_write = costIn(mo, "cw"),
+                                    // catalog.json stores rates flat (USD per
+                                    // million), unlike models.json's nested cost
+                                    // object.
+                                    .cost_input = floatIn(mo, "ci"),
+                                    .cost_output = floatIn(mo, "co"),
+                                    .cost_cache_read = floatIn(mo, "cr"),
+                                    .cost_cache_write = floatIn(mo, "cw"),
                                 });
                                 added = true;
                             }
