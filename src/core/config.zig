@@ -465,15 +465,24 @@ pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, 
         const buf: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch null;
         defer if (buf) |b| alloc.free(b);
 
+        // ONE arena owns parse + mutation + stringify (the setEntryField
+        // lesson: an arena-owned ObjectMap must never be grown with another
+        // allocator — gpa put on parsed keys/values panicked with
+        // "free after resize" as soon as a real settings.json grew the map).
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
         var root: std.json.Value = if (buf) |b| blk: {
-            const parsed = std.json.parseFromSlice(std.json.Value, alloc, b, .{}) catch break :blk .{ .object = std.json.ObjectMap.empty };
+            const parsed = std.json.parseFromSlice(std.json.Value, arena, b, .{}) catch break :blk .{ .object = std.json.ObjectMap.empty };
+            // NOT deinit'd: the outer arena frees everything at once.
             break :blk parsed.value;
         } else .{ .object = std.json.ObjectMap.empty };
 
         var comp = std.json.ObjectMap.empty;
-        try comp.put(alloc, "enabled", .{ .bool = self.compaction.enabled });
-        try comp.put(alloc, "reserveTokens", .{ .integer = @intCast(self.compaction.reserve_tokens) });
-        try comp.put(alloc, "keepRecentTokens", .{ .integer = @intCast(self.compaction.keep_recent_tokens) });
+        try comp.put(arena, "enabled", .{ .bool = self.compaction.enabled });
+        try comp.put(arena, "reserveTokens", .{ .integer = @intCast(self.compaction.reserve_tokens) });
+        try comp.put(arena, "keepRecentTokens", .{ .integer = @intCast(self.compaction.keep_recent_tokens) });
         // Preserve unknown compaction sub-fields.
         if (root.object.get("compaction")) |old_c| {
             if (old_c == .object) {
@@ -487,16 +496,15 @@ pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, 
                             break;
                         }
                     }
-                    if (!known) try comp.put(alloc, e.key_ptr.*, e.value_ptr.*);
+                    if (!known) try comp.put(arena, e.key_ptr.*, e.value_ptr.*);
                 }
             }
         }
-        try root.object.put(alloc, "compaction", .{ .object = comp });
-        if (self.default_provider) |dp| try root.object.put(alloc, "defaultProvider", .{ .string = dp });
-        if (self.default_model) |dm| try root.object.put(alloc, "defaultModel", .{ .string = dm });
+        try root.object.put(arena, "compaction", .{ .object = comp });
+        if (self.default_provider) |dp| try root.object.put(arena, "defaultProvider", .{ .string = dp });
+        if (self.default_model) |dm| try root.object.put(arena, "defaultModel", .{ .string = dm });
 
-        const json_text = try std.json.Stringify.valueAlloc(alloc, root, .{});
-        defer alloc.free(json_text);
+        const json_text = try std.json.Stringify.valueAlloc(arena, root, .{});
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json_text });
     }
 };

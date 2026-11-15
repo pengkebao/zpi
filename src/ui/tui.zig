@@ -1054,10 +1054,21 @@ pub const TUI = struct {
                 return self.handleCommand(e.name);
             },
             .models => {
-                // pi: an argument-completion Enter fills the value and closes
-                // the menu; the user submits again to execute.
-                self.menuComplete();
-                self.updateMenu();
+                // pi /model selector: Enter switches to the selected model
+                // right away (the menu is a picker, not an input completion —
+                // filling "/model provider/id " left it looking hung).
+                self.editor.clear() catch {};
+                if (e.model_idx) |idx| {
+                    self.switchModel(idx) catch |err| {
+                        self.note("model switch failed: {s}", .{@errorName(err)});
+                    };
+                } else {
+                    // No model mapping (synthetic entry): fall back to the
+                    // command path so at least the fuzzy command runs.
+                    const cmd = std.fmt.allocPrint(self.alloc, "/model {s}", .{e.name}) catch return false;
+                    defer self.alloc.free(cmd);
+                    return self.handleCommand(cmd);
+                }
                 return false;
             },
             .files => {
