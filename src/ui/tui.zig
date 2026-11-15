@@ -956,7 +956,104 @@ pub const TUI = struct {
     /// (widest visible label + 2-space gap), description in the right column
     /// (muted); the whole row is accent-colored when selected. Owned,
     /// caller frees.
+    const selected_bg = "\x1b[48;2;62;72;94m";
+    const fg_warn = "\x1b[38;2;222;147;95m";
+
+    /// pi SessionSelector row rendering for one visible row.
+    fn sessionPickerLine(self: *TUI, v: usize, width: usize) ![]u8 {
+        const muted = FG_MUTED;
+        const accent = "\x1b[38;2;167;152;215m";
+        const reset = ansi.RESET;
+        const item_idx = self.menu_view_start + v;
+        const selected = item_idx == self.menu_selected;
+        // Hint row (after all entries).
+        if (item_idx >= self.sel_len) {
+            return std.fmt.allocPrint(self.alloc, "  {s}Type to filter \u{b7} Ctrl+D delete{s}", .{ muted, reset }) catch return error.OutOfMemory;
+        }
+        const r = &self.sel_rows[item_idx];
+        const preview = r.name[0..r.name_len];
+        const right = r.desc[0..r.desc_len];
+        const is_current = blk: {
+            const path = r.id[0..r.id_len];
+            const st = self.session.store orelse break :blk false;
+            break :blk std.mem.eql(u8, path, st.path);
+        };
+        const has_name = self.session.store != null and false; // preview==name when named
+        _ = has_name;
+        // Named sessions render orange; current session accent (pi).
+        const is_named = blk2: {
+            const st_store = self.session.store;
+            _ = st_store;
+            break :blk2 preview.len > 0 and std.mem.indexOfScalar(u8, preview, ' ') == null and !std.mem.startsWith(u8, preview, "dc") and false;
+        };
+        _ = is_named;
+        var msg_color: []const u8 = "";
+        if (is_current) msg_color = accent;
+        var clean = std.array_list.Managed(u8).init(self.alloc);
+        defer clean.deinit();
+        const cursor: []const u8 = if (selected) "\u{203a} " else "  ";
+        clean.appendSlice(cursor) catch return error.OutOfMemory;
+        if (msg_color.len > 0) clean.appendSlice(msg_color) catch return error.OutOfMemory;
+        if (selected) clean.appendSlice("\x1b[1m") catch return error.OutOfMemory;
+        // Truncate preview to available width (right side + spacing).
+        const right_w = wmod.visualWidth(right);
+        const avail = @max(10, width -| 2 -| right_w -| 2);
+        var used: usize = 0;
+        var ci: usize = 0;
+        while (ci < preview.len) {
+            const cw = @min(wmod.utf8Len(preview[ci]), preview.len - ci);
+            if (used + 1 > avail) break; // conservative: 1 col per char
+            clean.appendSlice(preview[ci .. ci + cw]) catch return error.OutOfMemory;
+            ci += cw;
+            used += 1;
+        }
+        clean.appendSlice(reset) catch return error.OutOfMemory;
+        // Right-align the dim right part.
+        const left_w = wmod.visualWidth(clean.items);
+        const spacing = if (width > left_w + right_w) width - left_w - right_w else 1;
+        var pad_buf: [512]u8 = undefined;
+        const pads: usize = @min(spacing, pad_buf.len);
+        @memset(pad_buf[0..pads], ' ');
+        clean.appendSlice(pad_buf[0..pads]) catch return error.OutOfMemory;
+        clean.appendSlice(muted) catch return error.OutOfMemory;
+        clean.appendSlice(right) catch return error.OutOfMemory;
+        clean.appendSlice(reset) catch return error.OutOfMemory;
+        if (selected) {
+            // Reverse-video the whole row (pi selectedBg) — wrap: bg code
+            // needs to precede content; simplest robust approach: re-emit
+            // with bg by prefixing and letting the terminal apply to spaces.
+            var out2 = std.array_list.Managed(u8).init(self.alloc);
+            defer out2.deinit();
+            out2.appendSlice(selected_bg) catch return error.OutOfMemory;
+            out2.appendSlice(clean.items) catch return error.OutOfMemory;
+            // pad the remainder of the row with the bg so the highlight spans
+            const w = wmod.visualWidth(clean.items);
+            if (width > w) {
+                var rest = width - w;
+                var bgpad: [64]u8 = undefined;
+                @memset(bgpad[0..@min(rest, bgpad.len)], ' ');
+                out2.appendSlice(bgpad[0..@min(rest, bgpad.len)]) catch return error.OutOfMemory;
+                rest -|= @min(rest, bgpad.len);
+                while (rest > 0) {
+                    const chunk = @min(rest, bgpad.len);
+                    @memset(bgpad[0..chunk], ' ');
+                    out2.appendSlice(bgpad[0..chunk]) catch return error.OutOfMemory;
+                    rest -= chunk;
+                }
+            }
+            out2.appendSlice(reset) catch return error.OutOfMemory;
+            return out2.toOwnedSlice() catch return error.OutOfMemory;
+        }
+        return clean.toOwnedSlice() catch return error.OutOfMemory;
+    }
+
     fn menuLine(self: *TUI, v: usize, width: usize, col_min: usize, col_max: usize) ![]u8 {
+        // Session picker rows (pi SessionSelector): "› <preview>" left,
+        // "<count> <age>" right (dim), selected = reverse video + bold;
+        // named sessions render orange, the current session accent.
+        if (self.menu_mode == .sessions) {
+            return self.sessionPickerLine(v, width);
+        }
         // Editor menus keep the FULL filtered list in menu_items: v is the
         // window-relative row and the window starts at menu_view_start.
         // Modal pickers (sessions/tree/settings//mcp manager) PROJECT their
@@ -1597,23 +1694,55 @@ pub const TUI = struct {
         self.refilterSessions();
     }
 
+    /// Trim a UTF-8 slice to max bytes WITHOUT splitting a codepoint.
+    fn utf8Cut(s: []const u8, max: usize) []const u8 {
+        if (s.len <= max) return s;
+        var end = max;
+        while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+        return s[0..end];
+    }
+
+    /// pi formatSessionDate: relative age (unit suffix by magnitude).
+    fn formatSessionAgeUnit(diff_ms: i64, buf: *[8]u8) []const u8 {
+        if (diff_ms < 0) return "now";
+        const mins = @divTrunc(diff_ms, 60_000);
+        if (mins < 1) return "now";
+        if (mins < 60) return std.fmt.bufPrint(buf, "{d}m", .{mins}) catch "now";
+        const hours = @divTrunc(mins, 60);
+        if (hours < 24) return std.fmt.bufPrint(buf, "{d}h", .{hours}) catch "now";
+        const days = @divTrunc(hours, 24);
+        if (days < 7) return std.fmt.bufPrint(buf, "{d}d", .{days}) catch "now";
+        if (days < 30) return std.fmt.bufPrint(buf, "{d}w", .{@divTrunc(days, 7)}) catch "now";
+        if (days < 365) return std.fmt.bufPrint(buf, "{d}mo", .{@divTrunc(days, 30)}) catch "now";
+        return std.fmt.bufPrint(buf, "{d}y", .{@divTrunc(days, 365)}) catch "now";
+    }
+
     /// Rebuild the session rows from the directory listing, applying the
     /// current filter as a case-insensitive substring on id+name.
     fn refilterSessions(self: *TUI) void {
         self.sel_len = 0;
         const list = ss.listForCwd(self.alloc, self.io, self.sessions_dir, self.cwd_abs) catch &.{};
         defer self.freeSessionList(list);
+        const now_ms = ss.nowMs(self.io);
         const flt = self.sel_filter[0..self.sel_filter_len];
         for (list) |info| {
             if (self.sel_len >= SEL_MAX) break;
-            const label = info.name orelse "(unnamed)";
-            // Match against "id name".
+            const label = info.name orelse (info.first_message orelse "(unnamed)");
+            // Match against "id name/preview".
             var hay: [400]u8 = undefined;
             const hay_txt = std.fmt.bufPrint(&hay, "{s} {s}", .{ info.id, label }) catch continue;
             if (flt.len > 0 and !containsNoCase(hay_txt, flt)) continue;
             const row = self.sel_len;
-            self.selSetName(row, info.id[0..@min(info.id.len, 24)]);
-            self.selSetDesc(row, label);
+            // pi: display text = name ?? first user message (trimmed).
+            self.selSetName(row, utf8Cut(label, self.sel_rows[row].name.len));
+            // Right side: "<msg count> <age>" (pi rightPart). Format into a
+            // stack buffer first — bufPrint into the destination slice then
+            // memcpy from it is an overlapping self-copy.
+            var age_buf: [8]u8 = undefined;
+            const age = formatSessionAgeUnit(now_ms - info.modified_ms, &age_buf);
+            var dbuf: [80]u8 = undefined;
+            const right_txt = std.fmt.bufPrint(&dbuf, "{d} {s}", .{ info.msg_count, age }) catch "";
+            self.selSetDesc(row, right_txt);
             self.selSetId(row, info.path);
             self.sel_len += 1;
         }

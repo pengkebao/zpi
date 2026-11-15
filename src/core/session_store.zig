@@ -618,6 +618,10 @@ pub const SessionInfo = struct {
     name: ?[]u8,
     timestamp: []u8,
     msg_count: usize,
+    /// First user message (trimmed); pi shows this for unnamed sessions.
+    first_message: ?[]u8 = null,
+    /// Last modified time (ms epoch, file mtime) for the age column.
+    modified_ms: i64 = 0,
 };
 
 pub const Store = struct {
@@ -1589,6 +1593,7 @@ pub fn listForCwd(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8
         var id: []u8 = "";
         var name: ?[]u8 = null;
         var count: usize = 0;
+        var first_message: ?[]u8 = null;
         var lines = std.mem.splitScalar(u8, data, '\n');
         var first = true;
         while (lines.next()) |line_raw| {
@@ -1613,7 +1618,52 @@ pub fn listForCwd(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8
                 continue;
             }
             first = false;
-            if (std.mem.eql(u8, t, "message")) count += 1;
+            if (std.mem.eql(u8, t, "message")) {
+                count += 1;
+                // First USER message text (pi session selector preview).
+                // Entry shape: {"type":"message", "message":{role, blocks}}.
+                if (first_message == null) {
+                    const mv = o.get("message") orelse continue;
+                    const mo = switch (mv) {
+                        .object => |x| x,
+                        else => continue,
+                    };
+                    if (mo.get("role")) |rv| {
+                        const role = switch (rv) {
+                            .string => |s| s,
+                            else => "",
+                        };
+                        if (std.mem.eql(u8, role, "user")) {
+                            const cv = mo.get("content") orelse continue;
+                            switch (cv) {
+                                .string => |x| first_message = sanitizePreview(alloc, x),
+                                .array => |arr| {
+                                    for (arr.items) |blk| {
+                                        switch (blk) {
+                                            .object => |bo| {
+                                                const bt = bo.get("type") orelse continue;
+                                                const bt_s = switch (bt) {
+                                                    .string => |x| x,
+                                                    else => continue,
+                                                };
+                                                if (!std.mem.eql(u8, bt_s, "text")) continue;
+                                                const txt = bo.get("text") orelse continue;
+                                                switch (txt) {
+                                                    .string => |x| first_message = sanitizePreview(alloc, x),
+                                                    else => {},
+                                                }
+                                                break;
+                                            },
+                                            else => {},
+                                        }
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
+            }
             if (std.mem.eql(u8, t, "session_info")) {
                 if (o.get("name")) |nv| switch (nv) {
                     .string => |s| {
@@ -1630,9 +1680,38 @@ pub fn listForCwd(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8
             .name = name,
             .timestamp = try alloc.dupe(u8, std.fs.path.basename(p)),
             .msg_count = count,
+            .first_message = first_message,
+            .modified_ms = statFileMtime(io, p),
         });
     }
     return out.toOwnedSlice();
+}
+
+/// Trim control characters and cap the preview length (pi selector).
+fn sanitizePreview(alloc: std.mem.Allocator, text: []const u8) ?[]u8 {
+    var tmp = std.array_list.Managed(u8).init(alloc);
+    for (text) |c| {
+        if (c >= 0x20 and c != 0x7f) tmp.append(c) catch break;
+        if (tmp.items.len >= 200) break;
+    }
+    const trimmed = std.mem.trim(u8, tmp.items, " \t");
+    if (trimmed.len == 0) {
+        tmp.deinit();
+        return null;
+    }
+    // Trimmed may alias tmp's buffer; dupe the trimmed range and free.
+    const out = alloc.dupe(u8, trimmed) catch {
+        tmp.deinit();
+        return null;
+    };
+    tmp.deinit();
+    return out;
+}
+
+/// File mtime in ms epoch (0 when unavailable).
+fn statFileMtime(io: std.Io, path: []const u8) i64 {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
+    return @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_ms));
 }
 
 /// Find a session by partial/full id across all dirs under sessions_dir.
