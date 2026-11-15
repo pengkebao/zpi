@@ -1,6 +1,6 @@
 //! Phase I1 — Command tools: shell commands declared in settings.json and
 //! exposed to the model as callable tools (pi's `customTools` subset —
-//! pi's come from TypeScript extensions; rpi's are declarative because
+//! pi's come from TypeScript extensions; zpi's are declarative because
 //! there is no embedded interpreter).
 //!
 //! settings.json / .pi/settings.json (project-trust gated):

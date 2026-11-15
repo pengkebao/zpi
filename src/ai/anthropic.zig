@@ -190,7 +190,7 @@ pub const AnthropicProvider = struct {
                             try body.append('}');
                         },
                         .thinking => |t| {
-                            // rpi does not persist thinking signatures; pi
+                            // zpi does not persist thinking signatures; pi
                             // converts unsigned thinking to plain text for
                             // Anthropic (allowEmptySignature=false path).
                             if (t.len == 0) continue;

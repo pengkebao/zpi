@@ -38,7 +38,7 @@ pub const ServerConfig = struct {
     enabled: bool = true,
     description: ?[]const u8 = null,
     /// Tool exposure: "codemode" (pi default), "deferred", "direct", "hidden".
-    /// rpi has no codemode, so codemode/deferred register tools directly; only
+    /// zpi has no codemode, so codemode/deferred register tools directly; only
     /// "hidden" suppresses registration.
     exposure: ?[]const u8 = null,
     /// "user" or "project" — the file that defined (or overrode) this entry.
@@ -399,7 +399,7 @@ fn connectStdio(self: *Server, cfg: ServerConfig) !void {
     self.stderr = stderr;
 
     // 1) initialize
-    const init_params = "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"rpi\",\"version\":\"0.1.0\"}}";
+    const init_params = "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"zpi\",\"version\":\"0.1.0\"}}";
     const init_res = request(self, "initialize", init_params) catch |e| {
         teardownProcess(self);
         return e;
@@ -477,7 +477,7 @@ fn connectHttp(self: *Server, cfg: ServerConfig) !void {
     }
 
     // 1) initialize
-    const init_params = "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"rpi\",\"version\":\"0.1.0\"}}";
+    const init_params = "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"zpi\",\"version\":\"0.1.0\"}}";
     const init_res = httpRequest(self, "initialize", init_params) catch return;
     if (parseServerInfo(self.alloc, init_res)) |info| {
         self.server_info = info;

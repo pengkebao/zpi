@@ -63,7 +63,7 @@ test "parseToolCallResult text + isError" {
 test "loadConfig merges user + project (project overrides)" {
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const root = "/tmp/rpi-mcp-cfg-test";
+    const root = "/tmp/zpi-mcp-cfg-test";
     _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
     defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
 
@@ -139,9 +139,9 @@ test "parseEntry reads exposure + description" {
 test "addServer/removeServer round-trip" {
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const path = "/tmp/rpi-mcp-addtest/mcp.json";
-    _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/rpi-mcp-addtest") catch {};
-    defer _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/rpi-mcp-addtest") catch {};
+    const path = "/tmp/zpi-mcp-addtest/mcp.json";
+    _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/zpi-mcp-addtest") catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/zpi-mcp-addtest") catch {};
     const initial = "{\"mcpServers\":{\"a\":{\"command\":\"node\",\"args\":[\"a.js\"]}}}";
     try writeStr(io, path, initial);
     // add server b
@@ -172,9 +172,9 @@ test "addServer/removeServer round-trip" {
 test "auth token store/read/remove" {
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const path = "/tmp/rpi-mcp-authtest/mcp-auth.json";
-    _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/rpi-mcp-authtest") catch {};
-    defer _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/rpi-mcp-authtest") catch {};
+    const path = "/tmp/zpi-mcp-authtest/mcp-auth.json";
+    _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/zpi-mcp-authtest") catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, "/tmp/zpi-mcp-authtest") catch {};
     const replaced = mcp.storeAuthToken(alloc, io, path, "s1", "tok-1") catch return error.FileError;
     try std.testing.expect(!replaced);
     const t1 = mcp.readAuthToken(alloc, io, path, "s1") orelse return error.NotFound;

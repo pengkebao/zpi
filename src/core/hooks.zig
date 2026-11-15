@@ -1,7 +1,7 @@
 //! Declarative hooks (Phase I2) — `hooks.json` files that run shell
 //! scripts around agent events (pi parity: the equivalent of extension
 //! event handlers, delivered as declarative config + subprocess scripts
-//! since rpi does not embed a JS interpreter).
+//! since zpi does not embed a JS interpreter).
 //!
 //! Locations: `<agent-dir>/hooks.json` plus `<cwd>/.pi/hooks.json`
 //! (project-trust gated; entries are merged, project last).

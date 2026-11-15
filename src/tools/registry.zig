@@ -347,7 +347,7 @@ fn saveFullOutput(alloc: std.mem.Allocator, io: std.Io, data: []const u8) ?[]u8 
     const tmpdir = comptime if (builtin.os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
     const sep = comptime if (builtin.os.tag == .windows) "\\" else "/";
     const id = tmp_file_counter.fetchAdd(1, .monotonic);
-    const name = std.fmt.allocPrint(alloc, "rpi-bash-{d}.txt", .{id}) catch return null;
+    const name = std.fmt.allocPrint(alloc, "zpi-bash-{d}.txt", .{id}) catch return null;
     defer alloc.free(name);
     const path = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ tmpdir, sep, name }) catch return null;
     defer alloc.free(path);

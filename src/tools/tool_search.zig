@@ -5,14 +5,14 @@
 //! Mirrors pi's `extensions/tool-search/tool.js`:
 //!   - Unicode-ish tokenization with identifier boundaries, English stop words
 //!     and naive singular forms (pi additionally uses Intl.Segmenter for
-//!     non-ASCII scripts; rpi keeps whole non-ASCII runs as single terms).
+//!     non-ASCII scripts; zpi keeps whole non-ASCII runs as single terms).
 //!   - Okapi BM25 (k1=1.2, b=0.75) over the description with the name
 //!     (weight 3) and the namespace (weight 0.5) as separate fields.
 //!   - Ordering: exact-name queries first, then query coverage, then score;
 //!     ties keep document order.
 //!
 //! pi activates `tool_search` when a server with `deferred` exposure connects
-//! (and `codemode` — the script runner — for `codemode` servers). rpi has no
+//! (and `codemode` — the script runner — for `codemode` servers). zpi has no
 //! codemode yet, so it auto-activates `tool_search` for BOTH `codemode` and
 //! `deferred` servers; without it those tools would be unreachable.
 

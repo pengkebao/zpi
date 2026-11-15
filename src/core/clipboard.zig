@@ -103,9 +103,9 @@ pub fn readClipboardImage(alloc: std.mem.Allocator, io: std.Io, environ: std.pro
         },
         .windows => {
             // Native Windows: PowerShell saves the clipboard image (if any)
-            // to %TEMP%\rpi-clip.png; we read the file back as PNG bytes.
+            // to %TEMP%\zpi-clip.png; we read the file back as PNG bytes.
             const temp = std.process.Environ.getPosix(environ, "TEMP") orelse "C:\\Windows\\Temp";
-            const win_path = std.fmt.allocPrint(alloc, "{s}\\rpi-clipboard.png", .{temp}) catch return null;
+            const win_path = std.fmt.allocPrint(alloc, "{s}\\zpi-clipboard.png", .{temp}) catch return null;
             defer alloc.free(win_path);
             const script = std.fmt.allocPrint(alloc, "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $i = [System.Windows.Forms.Clipboard]::GetImage(); if ($i) {{ $i.Save('{s}', [System.Drawing.Imaging.ImageFormat]::Png); Write-Output ok }} else {{ Write-Output empty }}", .{win_path}) catch return null;
             defer alloc.free(script);
@@ -121,7 +121,7 @@ pub fn readClipboardImage(alloc: std.mem.Allocator, io: std.Io, environ: std.pro
             // Linux: WSL first (Windows screenshots never reach the X11/Wayland
             // clipboard — pi uses the same PowerShell fallback), then Wayland/X11.
             if (isWsl(environ)) {
-                const win_path = "C:\\Windows\\Temp\\rpi-clipboard.png";
+                const win_path = "C:\\Windows\\Temp\\zpi-clipboard.png";
                 const script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $i = [System.Windows.Forms.Clipboard]::GetImage(); if ($i) { $i.Save('" ++ win_path ++ "', [System.Drawing.Imaging.ImageFormat]::Png); Write-Output ok } else { Write-Output empty }";
                 raw.clearRetainingCapacity();
                 if (runPowerShell(alloc, io, "powershell.exe", script, &raw)) {
@@ -190,7 +190,7 @@ pub fn readClipboardText(alloc: std.mem.Allocator, io: std.Io, environ: std.proc
 /// images), matching pi's "images are attached via temporary files" flow.
 pub fn writeImageTempFile(alloc: std.mem.Allocator, io: std.Io, data: ImageData, ext: []const u8) ?[]u8 {
     const dir: []const u8 = if (@import("builtin").os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
-    const path = std.fmt.allocPrint(alloc, "{s}/rpi-clipboard-{d}.{s}", .{ dir, @as(u64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, 1_000_000))), ext }) catch return null;
+    const path = std.fmt.allocPrint(alloc, "{s}/zpi-clipboard-{d}.{s}", .{ dir, @as(u64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, 1_000_000))), ext }) catch return null;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data.bytes }) catch {
         alloc.free(path);
         return null;

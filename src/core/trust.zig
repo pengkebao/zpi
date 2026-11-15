@@ -4,7 +4,7 @@
 //! decisions (`true`/`false`/`null` = remove). Reading a decision walks UP
 //! from the cwd to the nearest ancestor with an entry, so trusting a parent
 //! covers all nested projects (pi findNearestTrustEntry). Entries are
-//! written sorted with a trailing newline (pi writeTrustFile); rpi is
+//! written sorted with a trailing newline (pi writeTrustFile); zpi is
 //! single-process so the lockfile step is omitted.
 
 const std = @import("std");
@@ -22,7 +22,7 @@ fn processCwd(alloc: std.mem.Allocator) ![]u8 {
     return alloc.dupe(u8, p[0..end]);
 }
 
-/// Canonical absolute path (pi normalizeCwd). pi uses realpath; rpi uses a
+/// Canonical absolute path (pi normalizeCwd). pi uses realpath; zpi uses a
 /// hand-rolled lexical normalization — std.fs.path.resolve's ArrayList
 /// shrink trips the SafeAllocator's remap tracking (double free), and
 /// symlink-resolving realpath is unavailable in Zig 0.17 std anyway. Trust
@@ -99,7 +99,7 @@ pub const Store = struct {
             const decision: ?bool = switch (v) {
                 .bool => |b| b,
                 .null => null,
-                else => continue, // pi throws on invalid values; rpi skips
+                else => continue, // pi throws on invalid values; zpi skips
             };
             const key = try self.alloc.dupe(u8, k);
             try map.put(self.alloc, key, decision orelse false);

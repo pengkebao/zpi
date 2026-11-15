@@ -52,11 +52,11 @@
 
 ### 斜杠命令
 
-| 命令 | pi | rpi | 说明 |
+| 命令 | pi | zpi | 说明 |
 |---|---|---|---|
 | /help /clear /exit /quit /hotkeys | ✅ | ✅ | |
 | /model [name] | ✅ | ✅ | 模糊匹配直接切换 |
-| /thinking [level] | ✅ | ✅ | rpi 命令名 `/think` |
+| /thinking [level] | ✅ | ✅ | zpi 命令名 `/think` |
 | /session /name /new /tree /fork /resume | ✅ | ✅ | |
 | /compact [hint] | ✅ | ✅ | 含阈值自动压缩 |
 | /copy | ✅ | ⏳ | 键位 ctrl+x 已覆盖主要场景 |
@@ -67,7 +67,7 @@
 
 ### 全局键位
 
-| pi action | pi 默认键 | rpi | 状态 |
+| pi action | pi 默认键 | zpi | 状态 |
 |---|---|---|---|
 | app.interrupt（中止） | esc | ✅ | |
 | app.clear（清空/退出） | ctrl+c | ✅ | |
@@ -92,7 +92,7 @@
 
 ### 交互与渲染
 
-| 功能 | pi | rpi | 状态 |
+| 功能 | pi | zpi | 状态 |
 |---|---|---|---|
 | 差分渲染 + DECSTBM 原生滚动 + 位移检测 | ✅ | ✅ | |
 | 滚动条（auto 显隐 / 拖拽 / 点击） | ✅ | ✅ | |
@@ -116,9 +116,9 @@
 
 ```bash
 zig build          # Zig 0.17.0
-./zig-out/bin/rpi  # 运行（REPL / TUI）
-./zig-out/bin/rpi -c        # 继续当前目录最近会话
-./zig-out/bin/rpi -p "问题"  # 单条模式（输出到 stdout）
+./zig-out/bin/zpi  # 运行（REPL / TUI）
+./zig-out/bin/zpi -c        # 继续当前目录最近会话
+./zig-out/bin/zpi -p "问题"  # 单条模式（输出到 stdout）
 ```
 
 ## 测试与基准

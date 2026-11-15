@@ -19,7 +19,7 @@ pi-ai (provider 抽象)    →  src/ai/                    (openai-completions�
 pi-tools (内置工具)      →  src/tools/                 (read✅ bash✅ edit✅ write✅ grep✅ find✅ ls✅ + codemode, tool_search)
 pi-tui (组件系统)        →  src/ui/                    (fullscreen✅粗糙版, 组件, 主题, 快捷键)
 pi-mcp (MCP 客户端)      →  src/mcp/                   (stdio + streamable HTTP)
-rpi 扩展系统             →  src/ext/                   (扩展点、钩子、资源加载)
+zpi 扩展系统             →  src/ext/                   (扩展点、钩子、资源加载)
 ```
 
 ## 一、功能对比矩阵（pi 1.5.0 全量 vs 当前）
@@ -74,7 +74,7 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | ls | ✅ 原生 | ✅ | 原生实现；path/limit；case-insensitive 排序；目录加 / 后缀；含 dotfiles；500/50KB 截断+notice |
 | powershell | ✅ Win | ➖ | 后续 Windows 支持时做 |
 | codemode（QuickJS 沙箱调用其他工具） | ✅ | 砍掉→原生并行工具执行 | 零依赖约束下不内嵌 C 解释器，并行执行入 A 阶段 |
-| tool_search（未声明工具的搜索装载） | ✅ | ✅ | pi 同款 BM25（k1=1.2 b=0.75，name 权重 3、namespace 0.5，exact>coverage>score 稳定排序）；搜索未激活的 codemode/deferred 工具并装载至下一轮声明；注册即 inactive（`defaultActive:false`），`--tools tool_search`/`defaultTools`/搜索性 MCP 服务器自动激活（pi 激活 codemode 脚本工具，rpi 无 codemode 以 tool_search 兜底）；E2E：搜索→装载→下一轮 tools 数组含 `mcp__mini__screenshot` |
+| tool_search（未声明工具的搜索装载） | ✅ | ✅ | pi 同款 BM25（k1=1.2 b=0.75，name 权重 3、namespace 0.5，exact>coverage>score 稳定排序）；搜索未激活的 codemode/deferred 工具并装载至下一轮声明；注册即 inactive（`defaultActive:false`），`--tools tool_search`/`defaultTools`/搜索性 MCP 服务器自动激活（pi 激活 codemode 脚本工具，zpi 无 codemode 以 tool_search 兜底）；E2E：搜索→装载→下一轮 tools 数组含 `mcp__mini__screenshot` |
 | 工具选择：`--tools`/`+name`/`-name`/`*` 通配 | ✅ | ✅ | selection.zig（E7）+ MCP 接入：`-nt` 禁一切（含 MCP 不注册）、`-nbt` 只禁内置、plain `--tools` 替换内置且仅含 `mcp__` 前缀条目时过滤 MCP（精确/glob，未匹配者不注册）、全 modifier 改默认集不动 MCP、`--exclude-tools` 波及一切（MCP 不注册）；Registry 改 `activateOnly`（inactive 保注册可被 tool_search 装载）+ `removeMatchingOn` |
 | `defaultTools` 设置 | ✅ | ✅ | settings.json `defaultTools`（plain 替换/modifier 修改，同 pi resolveDefaultTools）；项目级合并待 H4（`.pi/settings.json` + trust） |
 | ToolResult 所有权契约 | n/a | ✅ | 本次修复：content 一律堆分配、move 进消息、零泄漏 |
@@ -146,7 +146,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 | `/` 命令菜单 + 模糊搜索 | ✅ | ✅ | **pi SelectList 全面复刻 + 一级命令全对齐（pi BUILTIN_SLASH_COMMANDS 24 项原序原文）**：settings/model/tree/thinking（原 /think 改名，别名保留）/scoped-models（**新增**：ScopedModelsSelector——Enter 切换 ✓/✗、Esc 关闭、session-only、Ctrl+P 循环消费 scope）/export（补 .jsonl 分支=store 原文）/import/share（占位：需 Radius/gist 后端）/bug（issue 链接+版本）/copy/name/session/changelog（git 链接）/hotkeys/fork/clone/trust/login/logout/new/compact/resume/reload/quit + /mcp（等价 pi 的 mcp 扩展命令位）；**删** pi 没有的菜单项：/help /clear /debug /exit（handleCommand 保留兼容手打）；**pi SelectList 全面复刻**（对照 pi editor.js/autocomplete.js/select-list.js）：`→ ` 选中前缀 + 两列布局（主列 = clamp(最宽名+2, 12, 32)（slash layout）/默认 32，desc 右列 muted、选中整行 accent）；菜单**渲染在输入框下方**（pi editor.render：bottom border 之后）；窗口 5 行居中（pi autocompleteMaxVisible 默认 5）+ `(sel/total)` muted 滚动指示；up/down **环绕循环** + pgup/pgdn 按页（pi getSelectPageIndex）；命令名显示**不带 `/`**；pi fuzzy.js 完整移植（`src/ui/fuzzy.zig`：贪心字符对齐打分（连续 -5、间隙 +2、词首 -10、位置 +0.1、全等 -100、字母数字交换 +5；token 按空格/斜杠拆分、全 token 必须命中、升序稳定）；`skill:` 条目裸名匹配 + 全名兜底（pi bareNameMatches/fullNameOnlyMatches）；初始选中 = exact > startsWith（pi getBestAutocompleteMatchIndex）；**updateMenu 带文本守卫**（pi 只在 editor onChange 重建——主循环每键都调 updateMenu，无守卫会在导航键上重置 menu_selected 回第一行：菜单"卡住"＋两帧内容叠加的根因）；extras 与内置命令重名跳过（pi getBuiltInCommandConflictDiagnostics）；条目 = 内置命令 + **动态条目**（prompt templates + `skill:<name>`，desc 带 `[u]`/`[p]` scope tag，pi prefixAutocompleteDescription；/reload 刷新）；models 补全显示 id、值 = provider/id（pi label/value 分离）；enter（takes_arg）= 补全 `/name ` 后菜单切参数模式（pi selector UI 等价）；`/model` 无参 = 打开模型补全菜单（pi opens selector UI）|
 | `/model`（Ctrl+L）、`/thinking`（Shift+Tab 循环） | ✅ | ✅ | **pi ModelSelectorComponent 全对齐**：/model（带/不带搜索词）打开**边框内模态选择器**（蓝边框）——`> ` 搜索行、橙色 "Only showing models from configured providers. Use /login" 提示（有 scope 时换 Scope: all\|scoped + tab 切换）、条目 `→ ✓ id [provider] · default`（当前模型 ✓、settings 默认 · default 徽章）、(n/total)、空行 + `Model Name: <name>` 详情、hint `Enter to select · Ctrl+S to set as default · Escape/Ctrl+C`；**排序**=当前模型→default→provider 字母序（pi sortModels）；搜索=pi 搜索文本（provider + provider/id + id + name）contains + **"default" 前缀置顶 default 项**；**Ctrl+S 设默认模型**（settings defaultProvider/defaultModel 落盘）；**Tab 切 all/scoped**（scoped_models 存在时）；Enter 切换并关闭；旧 autocomplete 形态的 models 菜单删除；ctrl+p/shift+ctrl+p 循环 + ctrl+l 列表不变；/think + shift+tab 档位循环 |
 | `/hotkeys` | ✅ | ✅ | |
-| `/settings` 对话框、`/debug` | ✅ | ✅ | **pi SettingsSelectorComponent 全对齐（35 项）**：渲染在**编辑器边框内**（搜索行/条目/计数 (n/35)/空行/描述/键位提示行——pi SettingsList.renderMainList 逐行复刻）；**Type to search**（editor 即搜索框）+ Enter/Space 循环值 + Esc 关闭；条目=pi 全集原序原文 desc；真实生效项=Auto-compact/Skill commands/Autocomplete max/Steering/Follow-up/Hide thinking/Default project trust/Fullscreen scrollbar/Copy on select/Wheel scrolling，其余占位（Enter 提示 not implemented）；**切换静默**（pi 无 "set to" note，行内值即反馈）且 **Auto-compact 同步 session.compaction 副本**（footer "(auto)" 标记与 maybeAutoCompact 立即生效）；改动即 persistSettings；**模态选择器边框固定蓝**（pi theme.border：settings/scoped/sessions/tree/fork/mcp/trust 打开时 BORDER_INFO 蓝，退出恢复 thinking 档位色——idle 紫/high 紫等）；编辑器补 **`> ` prompt**（wrap 缩进+光标 inset）；/debug（隐藏命令）：终端尺寸 + 渲染行 + 会话 JSONL → /tmp/rpi-debug-*.log |
+| `/settings` 对话框、`/debug` | ✅ | ✅ | **pi SettingsSelectorComponent 全对齐（35 项）**：渲染在**编辑器边框内**（搜索行/条目/计数 (n/35)/空行/描述/键位提示行——pi SettingsList.renderMainList 逐行复刻）；**Type to search**（editor 即搜索框）+ Enter/Space 循环值 + Esc 关闭；条目=pi 全集原序原文 desc；真实生效项=Auto-compact/Skill commands/Autocomplete max/Steering/Follow-up/Hide thinking/Default project trust/Fullscreen scrollbar/Copy on select/Wheel scrolling，其余占位（Enter 提示 not implemented）；**切换静默**（pi 无 "set to" note，行内值即反馈）且 **Auto-compact 同步 session.compaction 副本**（footer "(auto)" 标记与 maybeAutoCompact 立即生效）；改动即 persistSettings；**模态选择器边框固定蓝**（pi theme.border：settings/scoped/sessions/tree/fork/mcp/trust 打开时 BORDER_INFO 蓝，退出恢复 thinking 档位色——idle 紫/high 紫等）；编辑器补 **`> ` prompt**（wrap 缩进+光标 inset）；/debug（隐藏命令）：终端尺寸 + 渲染行 + 会话 JSONL → /tmp/zpi-debug-*.log |
 | `!cmd` / `!!cmd`、`@file` 补全、Tab 路径补全 | ✅ | ✅ | !cmd/!!cmd ✅；**@file 实时菜单** ✅（输入 `@token` 即弹：token 边界检测（@ 在行首/空白后、无空格）、目录部分进入子目录、fuzzy 过滤+目录加权+深度排序、目录带 `/` 补全、选择后抑制重弹（token 相同不再弹出）、Tab/Enter 应用、Esc 关闭、继续输入实时过滤——pi autocomplete `@` 触发语义；**Tab 在无菜单时手动（重新）打开 @ 菜单**（含目录内二次补全：@zebra_dir/ + Tab → 列出目录内文件）；简化：无 fd 工具递归遍历（仅 cwd+子目录进入））；CLI `@file` 位置参数 ✅ |
 | Ctrl+G 外部编辑器 | ✅ | ✅ | $EDITOR/VISUAL，挂起→编辑→恢复全量重绘 |
 | 运行中输入（steering/follow-up/Escape 中断） | ✅ | ✅ | Escape/Ctrl+C 中断✅；**steering 队列**✅（运行中 Enter → 下一 LLM 请求前注入 context，pi getSteeringMessages 语义）；**follow-up 队列**✅（alt+enter 排队 → 回合结束自动续跑为新回合，pi followUpQueue）；**alt+up/alt+v 恢复排队消息到编辑器**✅（app.message.dequeue）；运行中编辑器 live（watcher 分发编辑器键，光标常驻输入框） |
@@ -189,7 +189,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 | streamable HTTP + bearer 认证 | ✅ | ✅ | POST JSON-RPC（application/json + SSE 双格式解析）、`Mcp-Session-Id` 捕获回传、`Authorization: Bearer`（来自 login 或配置）；E2E 验证（含需鉴权服务器） |
 | mcp.json（用户/项目，项目覆盖 user 同名项） | ✅ | ✅ | `<base>/mcp.json` + `.pi/mcp.json`，同名项目覆盖 |
 | `/mcp` 管理、exposure 模式 | ✅ | ✅ | **pi McpManagerView 复刻**（交互式管理器，替代旧文本列表）：servers 菜单（attention 排序：failed > disabled > connected；desc = `state · exposure · scope`，pi describeState/exposureOf）→ server 菜单（Enable/Tools/Reconnect/Exposure/Disable，按状态裁剪）→ tools 列表（首行 description）/ exposure 四值选择（✓ 当前值）；写回 mcp.json（`setEntryField`：**自有 arena 统一 parse+put+stringify**，修混用分配器 free-after-resize panic）；enable = reconnect + re-register（`Manager.rememberConfigs` 保存启动配置副本供 respawn）；disable = teardown + 注销工具；工具重注册 = `registerToolsInto`（单服务器，exposure 语义同 registerTools）；ESC 逐级返回 |
-| `rpi mcp add/remove/list/login/logout` | ✅ | ✅ | add（stdio/http，--local/--env/--cwd/--description/--exposure/-- 参数）；remove；list；login/logout（`mcp-auth.json` 存 bearer token，纯 std 近似 pi 的浏览器 OAuth） |
+| `zpi mcp add/remove/list/login/logout` | ✅ | ✅ | add（stdio/http，--local/--env/--cwd/--description/--exposure/-- 参数）；remove；list；login/logout（`mcp-auth.json` 存 bearer token，纯 std 近似 pi 的浏览器 OAuth） |
 | MCP resources（list/read） | ✅ | ✅ | 三个全局工具 `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource`，跨服务器聚合 + cursor；E2E 验证 |
 | OAuth 浏览器流程 | ✅ | ❌ | 以 login 存 token 近似（无浏览器）；完整 OAuth 待做 |
 
@@ -225,7 +225,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 - [x] B4 CLI：`--continue` `--resume` `--session <path|id>` `--fork <path|id>` `--no-session` `--name` `--session-dir` `--list-sessions`
 - [x] B5 TUI 命令：`/new` `/resume [id]` `/name <n>` `/session` `/tree` `/fork` `/copy`
 - [x] B6 `/export [path]`（HTML）、`/copy`（OSC 52 剪贴板）
-- 验证：rpi↔pi 双向读写会话文件；`/tree` 缩进树、`/fork` 继承 name+parent、`/export` 生成独立 HTML、`/resume` 上下文重放（模型回忆暗号）全部通过
+- 验证：zpi↔pi 双向读写会话文件；`/tree` 缩进树、`/fork` 继承 name+parent、`/export` 生成独立 HTML、`/resume` 上下文重放（模型回忆暗号）全部通过
 
 ### Phase C — 压缩（~1k 行）✅ 核心完成（C1–C4，C5 分支摘要留待）
 - [x] C1 compaction 设置（reserveTokens/keepRecentTokens/enabled）→ `compaction.Settings` + settings.json 解析
@@ -295,7 +295,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
   - **kitty 状态感知 legacy 映射**（parseSequence）：`ESC CR`=shift_enter(kitty)/alt+enter(非kitty)；`ESC OM`=numpad enter；**`\n`（Ctrl+J）永远 = 换行**（有意偏离 pi：默认终端无 shift+enter，Ctrl+J 是唯一换行键；pi 在非 kitty 下将 `\n` 映射为 enter）
   - **CSI-u 增强**：codepoint 27→escape；alt+letter（`97;3u`）；ctrl+大写字母；repeat 事件（`:2`）当 press 处理（打字重复）
   - E2E 证明（session 文件）：kitty 模式 press+release 批次 → `'hi\nthe'` 单换行；拼音+IME+ctrl+j → `'ni你\n好'` 精确；无 kitty 终端（仅 DA 回复）→ modifyOtherKeys fallback 立即生效，`\x1b[27;2;13~`→换行，`'a\nb'` 精确；CSI-u ctrl+c 退出 ✓；13+44+46 测试全过
-- [x] G3 多行编辑器：✅ editor.zig（多行/光标/历史 Up-Down/@Tab 补全/Ctrl+K/U/W/A/E/Home/End/Ctrl+J 换行）+ **Ctrl+G 外部编辑器**（$EDITOR→$VISUAL→vi；临时退出 alt-screen/cooked 模式给编辑器 tty；临时文件 /tmp/rpi-prompt-{pid}.md；退出后重进 alt-screen + 强制全量重绘 + 读回内容 trim 尾部空白；E2E：fake editor 追加文本 → 会话收到 'a-appended'）
+- [x] G3 多行编辑器：✅ editor.zig（多行/光标/历史 Up-Down/@Tab 补全/Ctrl+K/U/W/A/E/Home/End/Ctrl+J 换行）+ **Ctrl+G 外部编辑器**（$EDITOR→$VISUAL→vi；临时退出 alt-screen/cooked 模式给编辑器 tty；临时文件 /tmp/zpi-prompt-{pid}.md；退出后重进 alt-screen + 强制全量重绘 + 读回内容 trim 尾部空白；E2E：fake editor 追加文本 → 会话收到 'a-appended'）
 - **批次 4 ✅（Escape 中止）**：working 期间后台 stdin watch 线程（200ms 轮询 VMIN=0/VTIME=2）：单字节 ESC → `agent.requestAbort()` 中止（对齐 pi `app.interrupt: escape`）；其它按键捕获进 watch_captured，turn 结束后注入 KeyReader.pending 重放（working 期间打字不丢）；watch_stop 原子标志 + join（≤200ms）；"· interrupted" 笔记显示；E2E：bash sleep 30 → ESC → 中止 ✓ → 正常退出 ✓；全部旧 E2E 回归通过
 - **批次 3 ✅（G4 命令菜单 + G6 markdown）**：
   - **markdown.zig**（零依赖 markdown→ANSI，6 测试）：标题三级配色+粗体、围栏代码块（关键字/字符串/数字/注释高亮，多语言关键字表）、行内代码/粗体/斜体/删除线/链接、列表（• 缩进）、引用（│ 前缀）、分隔线；ANSI 感知换行（样式跨行重发）；assistant 消息全走 markdown 渲染；thinking 流分离（stream_text/stream_thinking，thinking 单独暗色块）
@@ -314,11 +314,11 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
   - **页脚**（新 `src/ui/footer.zig`，12 测试）：两行 pi 全量——cwd（~缩写）+ ` (git branch)`（零依赖读 .git/HEAD，支持 worktree gitdir）+ ` • session name`；`↑in ↓out R/W CH% $0.123 x.x%/window (auto)`（ctx% >70 黄 >90 红）；右侧 `(provider) model • thinking off|level`（多 provider 才显示 provider；非 reasoning 模型无 level）；formatTokens pi 阶梯（850/1.2k/45k/1.3M）；窄屏降级（先去 provider 再截 model）
   - **markdown 重写**（26 测试）：标题三式（H1 粗+下划线、H2 粗、H3+ 保留 `###` 前缀，统一黄）；围栏 ```` ```lang ````（无语言=pi 绿、text=无色、其他=轻量高亮）；列表（`-` 紫色、有序保留 `1.`、task `[x]`/`[ ]`、嵌套每层 4 列、延续行对齐、缩进段落归属正确的列表层）；表格（`┌┬┐├┼┤└┴┘` 全边框、表头粗体、行行分隔、单元格 wrap、pi 列宽收缩算法移植）；引用（`│ ` 边框+斜体 muted，换行重复边框）；hr≤80；链接（蓝+下划线+` (url)`，裸 URL 自动链接且不重复、CJK 标点截断）；**按词换行**（原为按字符硬切；CJK 单字可断；超长词硬拆）；宽字符精确 2 列（原 3 字节全按 2 列，`─│•` 错算）；行内样式用各自 off-code + base 重发（标题里的 `code` 不再丢标题色）；`_` 词内不斜体（snake_case 修复）；块间恰好一空行；`renderWith(base_style)` 支持给段落/列表/单元格整体底色（thinking 用）
   - **消息本体**：user=markdown+userMessageBg 全宽背景块（上下背景空行、每行补齐到整宽、reset 后背景重发）；assistant 去掉 `● Assistant` 头、缩进 1 列（width-2 渲染）；thinking=暗色斜体 markdown（无头部行，Ctrl+T 按索引隐藏，替换原脆弱的前缀字符串匹配）；compaction=`[compaction]` 粗体紫标签+customMessageBg 背景块+`Compacted from N tokens (ctrl+o to expand)`（runCompaction 改返回 tokens_before 并发事件，手动/自动压缩统一走此路径）；中止=红 `Operation aborted`
-  - **顺手修复的既有 bug**：`formatTokens` 返回栈缓冲切片（页脚 `↑20` 乱码，E2E 抓到）；outputCallback 流式追加与 spinner 线程读取的数据竞争（加 render_mutex）；statusLine 在 spinner 线程遍历 session.messages 与 agent 线程追加的 UAF 竞争（footer_stats 主线程刷新缓存，watcher 线程走 redrawCached）；`/clear`/`/new` scrollback 泄漏；`deinit→restoreTerminal` 在未 setup 时写垃圾 termios（term_restored 初值改 true，修掉泄漏测试的 errno:19 噪音）；edit_diff `trimEnd` 缺 `\n` 导致 diff 每行后多一空行（发给模型的输出同样受影响，已修+精确格式断言）；`truncateToWidth` 按字节计宽（改按字符显示宽度，CJK 行不再被截短）；stdin EOF 时 run 循环空转（nextKey 改返回 EndOfStream，`catch break` 生效，`rpi < pipe` 干净退出）
-  - 验证：119 UI 集成 + 99 泄漏（SafeAllocator 0 泄漏：pending→结果→双 Ctrl+O→孤儿结果→未完成 pending 全路径）+ 26 markdown + 23 tool_block + 12 footer + 10 edit_diff 全过；**本地 E2E**（/tmp/rpi-e2e：假 OpenAI SSE（127.0.0.1）+ pty 驱动 release 二进制 + 迷你终端模拟器逐行核对背景/全宽）：完整回合（thinking/文本/4 工具含失败与 edit diff/表格/围栏/Ctrl+O/Ctrl+T）全对齐，干净退出
+  - **顺手修复的既有 bug**：`formatTokens` 返回栈缓冲切片（页脚 `↑20` 乱码，E2E 抓到）；outputCallback 流式追加与 spinner 线程读取的数据竞争（加 render_mutex）；statusLine 在 spinner 线程遍历 session.messages 与 agent 线程追加的 UAF 竞争（footer_stats 主线程刷新缓存，watcher 线程走 redrawCached）；`/clear`/`/new` scrollback 泄漏；`deinit→restoreTerminal` 在未 setup 时写垃圾 termios（term_restored 初值改 true，修掉泄漏测试的 errno:19 噪音）；edit_diff `trimEnd` 缺 `\n` 导致 diff 每行后多一空行（发给模型的输出同样受影响，已修+精确格式断言）；`truncateToWidth` 按字节计宽（改按字符显示宽度，CJK 行不再被截短）；stdin EOF 时 run 循环空转（nextKey 改返回 EndOfStream，`catch break` 生效，`zpi < pipe` 干净退出）
+  - 验证：119 UI 集成 + 99 泄漏（SafeAllocator 0 泄漏：pending→结果→双 Ctrl+O→孤儿结果→未完成 pending 全路径）+ 26 markdown + 23 tool_block + 12 footer + 10 edit_diff 全过；**本地 E2E**（/tmp/zpi-e2e：假 OpenAI SSE（127.0.0.1）+ pty 驱动 release 二进制 + 迷你终端模拟器逐行核对背景/全宽）：完整回合（thinking/文本/4 工具含失败与 edit diff/表格/围栏/Ctrl+O/Ctrl+T）全对齐，干净退出
   - **滚动修复**（用户报告"滚不到底/点击无效/提示行背景不对"后对齐 pi `TuiAltScreen`）：
     - **下滚回绕**：`scroll_offset` 是 usize，`fetchSub(3)` 在偏移 <3 时回绕成天文数字，渲染 clamp 又把它送到 `max_offset`（=顶部）——滚到底再滚一下直接跳回最顶，表现为"永远滚不到底"。改 `scrollBy`：饱和加减（`+|`/`-|`）+ CAS 循环（主循环/watcher 线程共用）
-    - **内容锚定**：pi 不跟随末尾时 scrollTop 固定；rpi 偏移是"距底部行数"，新增内容会把视口推走。`anchorScroll`：offset>0 时 append/加宽工具块按新增行数同加 offset（addMessage、renderToolBlockAt 新增与原地加宽两条路径）；滚动时流式 live 预览属于末尾、不再显示
+    - **内容锚定**：pi 不跟随末尾时 scrollTop 固定；zpi 偏移是"距底部行数"，新增内容会把视口推走。`anchorScroll`：offset>0 时 append/加宽工具块按新增行数同加 offset（addMessage、renderToolBlockAt 新增与原地加宽两条路径）；滚动时流式 live 预览属于末尾、不再显示
     - **Jump to latest 对齐 pi compositeScrollToEndIndicator**：不再独占一行整行反色（`hint_h` 布局行删除），改为**叠在 transcript 最后一行**上居中的小标签（` ↓ Jump to latest message · ctrl+end `，selectedBg=blueBg 背景+text 前景，仅标签带背景）。新 `src/ui/overlay.zig` 移植 pi `compositeTuiLine`+`AnsiCodeTracker`：ANSI 感知按列切分（严格边界、宽字符跨界丢弃）、overlay 后重放原行活跃 SGR 态（背景行右侧 padding 不掉色），8 测试
     - **点击跳转**：keys.zig 新 `parseSgrMouse`（button/col/row/release，0 基坐标；wheel 按 `btn&64`+`btn&3` 识别、带修饰键也认）+ `mouse_click` Key（仅左键 press；release/motion/其他键忽略）；tui 打包 `jump_hint` 矩形（原子 u64，渲染线程写、两条输入路径无锁命中检测），命中即 `scroll_offset=0`；Ctrl+End 走同一 scrollToLatest
   - 验证（滚动修复后）：zig build ✓；test_ui 131（新增滚轮回绕/锚定/命中 3 测试）；leak_g2 108 含提示条合成路径 0 泄漏；E2E 新增滚动段：滚上去后标签行 selectedBg=True/label-only=True、回滚到底后多滚一格 no-op=True（不再跳顶）、点击标签后画面与底部逐字节一致=True，退出干净
@@ -359,7 +359,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
   - **流式末尾吸附**(用户反馈"流式中往下滚弹来弹去"的残余:回合流式时文档不断变长,小步下滚永远差 1-2 行够到末尾 → 跟随挂不上、hint 每次闪烁):scrollBy 向下落点距末尾 ≤2 行时**直接吸附到底并重新跟随**(ScrollView SNAP_TO_END_WITHIN)——下滚一定收敛到跟随态,流式期间也不再闪烁;e2e 退出等待改为等回合真正结束("Working" 消失),修掉 Ctrl+C 落在回合内被 watcher 当 abort 的时序竞争
   - **滚轮方向修复**（用户反馈"滚动方向与原版和其它应用相反"）：watcher 的滚轮路径符号写反（SGR 低位 0=上却 scrollBy(+3) 向下）——流式期间滚动方向与空闲时相反；改为与主循环同款语义（wheel 下 → scroll_top 增大 → 视口向尾）并同样接入 WheelScrollAccelerator（连发加速）
   - **表格流式排查**（用户反馈"表格线画好后不再流式"）：12/2 字符粒度模拟 + e2e 慢速流式实测均证明表格逐行流出（top border→空表体→行逐步），本端无停滞；观感停顿来自 provider 端把表格/整行作为大 chunk 发送（常见于非逐 token 流式），如仍复现需 provider/model 信息
-  - 验证：test_ui 172（新增流式/已完成 thinking 点击收起测试）；全套件过 + LSP 0；**E2E 第二回合流式段**（服务器第二回合 0.25s/chunk 拉长窗口；基准帧改为等回合完全稳定后截取）：流式中点击 read 块展开（块高 gap 变大判定，容忍视口行漂移）→ 点击 thinking 收起（"Thinking…" 出现）→ 再点展开复原 → 拖选新用户消息复制（OSC52 增量）；调试中先后揪出并修：ESC 分片误中止、watcher 不处理滚动键、e2e 基准帧在流式中截取、Python replay 不排空 pty 导致 rpi 写阻塞持锁全局停摆（测试侧修复）
+  - 验证：test_ui 172（新增流式/已完成 thinking 点击收起测试）；全套件过 + LSP 0；**E2E 第二回合流式段**（服务器第二回合 0.25s/chunk 拉长窗口；基准帧改为等回合完全稳定后截取）：流式中点击 read 块展开（块高 gap 变大判定，容忍视口行漂移）→ 点击 thinking 收起（"Thinking…" 出现）→ 再点展开复原 → 拖选新用户消息复制（OSC52 增量）；调试中先后揪出并修：ESC 分片误中止、watcher 不处理滚动键、e2e 基准帧在流式中截取、Python replay 不排空 pty 导致 zpi 写阻塞持锁全局停摆（测试侧修复）
 
 ### Phase G.5 — 滚动渲染深优化（对照 pi tui-main-screen 差分渲染 + 终端原生滚动）
 
@@ -375,9 +375,9 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 - **搜索 shift+enter（向上导航）修复**（用户实测反馈失效）：三层键解析对齐——① keys.zig parseCsi 的 Enter(13) 分支补 **alt**（kitty `CSI 13;3u` = alt+enter，此前被映射为 .enter 丢失 steering follow-up 提交）；② ESC CR 恢复**双模式**（kitty 协商成功 → .shift_enter（搜索向上），非 kitty → alt+enter（steering follow-up）——两种终端形态下搜索导航与 follow-up 提交互不抢占）；③ alt+up 解析（kitty 57419+alt，app.message.dequeue）。用户真终端实测确认。已知边界：测试 harness 的 bash 链会屏蔽 SIGTSTP，ctrl+z 挂起需真实终端验证
 - **steering / follow-up 运行中输入**（用户要求补齐 pi 的运行中交互）：对照 pi-agent-core agent-loop 语义实现——steering 队列在**每轮 LLM 请求前** drain 进 context（工具调用间生效，pi getSteeringMessages）；follow-up 队列在**回合结束**后作为新回合 prompt 续跑（pi 外层循环）。三层改动：① **agent.zig**：Session 增 steering/followup 队列（Io.Mutex 保护，watcher 线程 push / agent 线程 drain）、runPrompt 外层 follow-up 循环 + 轮首 drainSteeringIntoContext（appendAndRecord 进 context+持久化，无 turn event——TUI 排队时已显示）。② **tui.zig watcher**：运行中键分发重构——可打印/编辑键 live 应用到编辑器（render_mutex.lockUncancelable，pi：编辑器流式期间保持可交互、光标常驻输入框），Enter → queueSteering + 立即显示用户块 + 钉底，alt+enter → queueFollowUp + note，alt+up/alt+v → 恢复队首消息到编辑器（app.message.dequeue）；**watcher 线程渲染调用必须在锁外**（note/addUserMessage 自取非递归锁，锁内调用静默失败），渲染用 redrawCached（redraw 的 computeFooterStats 主线程专用）。③ **keys.zig**：ESC CR 双模式统一解析为 alt+enter（kitty 下 shift+enter 走 CSI 13;2u）、alt+up 解析（kitty 57419+alt）。E2E：运行中排队 fu1/steering → req2 body 含 ['go','fu1','steer me']（fu1 续跑 + steering 注入）✓；alt+up 恢复 ✓。排查备注：lock 是 Cancelable（cancel 点可静默失败）→ watcher 用 lockUncancelable
 - **TUI 功能对齐审计 + 六个缺失键位**（用户要求盘点差距并实现）：对照 pi 1.5.0 的 47 个 keybinding 与全部命令逐一核对。**新实现**（pi 默认键位）：shift+tab → thinking 档位循环（app.thinking.cycle，off→low→…→max→off，flash 提示）；ctrl+p / shift+ctrl+p → 模型循环切换（app.model.cycleForward/Backward，按 cfg.models 展平列表 wrap）；ctrl+l → 模型列表展示（app.model.select 的弱选择器替代）；ctrl+x → 复制选区或最后 assistant 回复（app.message.copy，OSC52）；ctrl+z → 挂起后台（app.suspend，restoreTerminal → SIGTSTP → SIGCONT 后 resumeTui 全量重绘）；ctrl+d → 空编辑器时退出（app.exit）。附带修复：copyLastMessage 漏 redraw 导致 flash 不显示；openExternalEditor 用 std.os.linux.getpid()（macOS 假实现）改 std.c.getpid()。E2E 6/6 过。**已实现清单**（详见本条目后附表）与**暂缓差距**（steering/follow-up 排队、图片粘贴/文件拖放、/themes /settings /skills /trust /login /share /import /clone、editor undo/kill-ring、app.session.toggleNamedFilter）见审计表
-- **欢迎头对齐 pi 结构与文案**（用户反馈：pi 继续会话时欢迎/技能信息不展示在历史下，要求对齐）：查证 pi 结构——headerContainer 是 documentContainer 的子节点，**欢迎头就是滚动文档的第一块**（随文档滚动，继续会话时视窗钉底故日常不可见；技能列表默认隐藏仅 verbose 展开；changelog 有历史时跳过）。我们此前把欢迎信息用 addMessage 加在 run() 里——排在 replaySession 的历史**之后**，夹在历史和输入框之间。修复：新增 `addWelcomeHeader()`（bold wordmark `rpi` + dim `v0.1.0` + muted 快捷键行 `esc interrupt · ctrl+c clear/exit · / commands · ctrl+o tools · ctrl+t thinking` + dim onboarding 行，对齐 pi compact header 文案），replaySession 开头先加欢迎头再回放历史（header 恒为文档首块）；删除 run() 里的旧欢迎块（模型信息 footer 已有，对齐 pi）。实测：新会话顶部显示新欢迎头、继续会话底部视口纯历史、181+153 测试全过
+- **欢迎头对齐 pi 结构与文案**（用户反馈：pi 继续会话时欢迎/技能信息不展示在历史下，要求对齐）：查证 pi 结构——headerContainer 是 documentContainer 的子节点，**欢迎头就是滚动文档的第一块**（随文档滚动，继续会话时视窗钉底故日常不可见；技能列表默认隐藏仅 verbose 展开；changelog 有历史时跳过）。我们此前把欢迎信息用 addMessage 加在 run() 里——排在 replaySession 的历史**之后**，夹在历史和输入框之间。修复：新增 `addWelcomeHeader()`（bold wordmark `zpi` + dim `v0.1.0` + muted 快捷键行 `esc interrupt · ctrl+c clear/exit · / commands · ctrl+o tools · ctrl+t thinking` + dim onboarding 行，对齐 pi compact header 文案），replaySession 开头先加欢迎头再回放历史（header 恒为文档首块）；删除 run() 里的旧欢迎块（模型信息 footer 已有，对齐 pi）。实测：新会话顶部显示新欢迎头、继续会话底部视口纯历史、181+153 测试全过
 - **`-c` 回放宽度错误**（用户截图：历史内容固定半屏 ~80 列宽，不铺满终端）：replaySession 在 run()/setupTerminal 之前执行，此时 width 仍是 init 默认 80——所有回放块按 80 列渲染；而 setupTerminal 的 measureSize 只改字段不触发重渲染，首帧 refreshSize 比较发现“无变化”，rerenderAtWidth 永不执行，80 列渲染永久保留。修复：replaySession 开头在 render_mutex 下先 measureSize() 再渲染。实测 117 列终端下历史内容铺满全宽（气泡/文本/工具块），181+153 测试全过
-- **`-c`/`-r` 继续会话界面回放**（用户反馈：`rpi -c` 不能继续会话）：对比 pi 原版发现上下文恢复其实早已实现（`-p` 模式验证通过、branchMessages → session.context），缺的是 **TUI 界面回放**——pi 启动时 `renderInitialMessages → renderSessionEntries` 把持久化消息渲染进 chat（assistant 文本/thinking 为消息块、toolCall 为工具块、toolResult 按 id 配对回填）。修复：TUI 新增 `replaySession()`（main.zig 启动时调用，无 store/空分支 no-op）——user → 用户消息块（多 text 拼接）、assistant 按块序 thinking/text/tool_call → thinking 块/markdown/折叠工具块（ToolEntry 直接入列）、tool 角色 → 按 tool_call_id 匹配回填结果。实测：-c 打开后历史完整可见（thinking、用户消息、markdown 回复、`edit ~/.pi/agent/models.json` 折叠工具块），滚动可及；新会话启动无变化；181+153 测试全过
+- **`-c`/`-r` 继续会话界面回放**（用户反馈：`zpi -c` 不能继续会话）：对比 pi 原版发现上下文恢复其实早已实现（`-p` 模式验证通过、branchMessages → session.context），缺的是 **TUI 界面回放**——pi 启动时 `renderInitialMessages → renderSessionEntries` 把持久化消息渲染进 chat（assistant 文本/thinking 为消息块、toolCall 为工具块、toolResult 按 id 配对回填）。修复：TUI 新增 `replaySession()`（main.zig 启动时调用，无 store/空分支 no-op）——user → 用户消息块（多 text 拼接）、assistant 按块序 thinking/text/tool_call → thinking 块/markdown/折叠工具块（ToolEntry 直接入列）、tool 角色 → 按 tool_call_id 匹配回填结果。实测：-c 打开后历史完整可见（thinking、用户消息、markdown 回复、`edit ~/.pi/agent/models.json` 折叠工具块），滚动可及；新会话启动无变化；181+153 测试全过
 - **流式输出平滑化**（用户反馈：对比 pi 原版，流式文本“很生硬、一段段往外蹦”，怀疑少了打字机效果）：pi 并无打字机动画——它对每个 message_update requestRender、16ms 节流，平滑感来自“包级到达 × 高频渲染”。我们三层各有阻塞：① **SSE 客户端攒批**：`readAllocShort(dest, 4096)` 的 readSliceShort 只有攒满 dest 或 EOF 才返回，把平滑到达（实测 socket 级 2-3ms/事件）攒成 ~70-100ms 的 4KB 块；改 `takeDelimiterInclusive('\n')` 逐行即时处理（注意：takeDelimiter**Exclusive** 不消费分隔符，`
 ` 留在缓冲头导致每次返回空切片的死循环——std 文档与实现不符的坑）。实测到达 627 行/789ms、中位 1ms。② **渲染窗口拼装 bug**：buildTranscript 在 `scroll_top > doc_lines.len`（流式时 committed 行数少）时从 live[0] 开始填窗口——增长的新内容永远在窗口之下不可见，文本只在回合提交时一次性出现；修复为按 `start - doc_lines.len` 跳进 live 尾部。③ **spinner 节奏**：流式帧此前搭 80ms spinner tick（12.5fps）；改固定 22ms 时钟（自适应 dirty-flag 方案实测会被到达停顿的相位卡回 80ms，弃用），spinner 字形仍按 80ms 推进。**验证**：尾部逐帧连续推进（段落 2→19→29→43→57→71→79）、显示更新中位 42ms（原 85-90ms）、有效 ~24fps；回归：光标 park、到底惰性、抖动拉拽 3/3 全过。附注：滚轮加速器按手势速率限制行数（pi 语义），上行爆发后需对称量才能滚回——测试曾误判为回归
 - **滚动期间光标外泄修复**（用户反馈：上拉时输入光标跑到滚动条处、停止时跳到内容最后一行末尾，打字才回输入框）：根因是上一项“光标 park 去重”破坏了帧不变量——**任何写入屏幕字节的帧都会移动硬件光标**，而去重让“位置未变”的帧跳过 park；滚动帧的 body 恰恰只含滚动条 cell（拉拽时）或暴露行（停止时）→ 光标遗留在最后写入的 cell 之后。修复：去重仅对**完全空 body** 生效，body 有任何字节都必须重发 park（隐藏态 sticky 除外）。帧边界采样验证：上拉 24/24、下拉 44/44 帧终光标均在输入行； 到底惰性/空闲往返/抖动拉拽回归全过
@@ -419,8 +419,8 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 - [x] J1b resources/list、resources/read（全局工具聚合 + cursor，E2E 验证）
 - [x] J2 streamable HTTP + bearer 认证（SSE/JSON 双解析、session-id、Bearer；E2E 含需鉴权服务器）
 - [x] J3 mcp.json 加载（用户/项目覆盖规则）+ `/mcp` 状态列出（后升级为 pi McpManagerView 交互式管理器：servers→server→tools/exposure 三层菜单 + enable/disable/reconnect 写回，见矩阵）
-- [x] J4 `rpi mcp add/remove/list/login/logout` 子命令（login/logout 存 `mcp-auth.json`）
-- [x] J5 exposure 模式（pi 四值：`direct` 直接声明；`codemode`（默认）/`deferred` 注册但**不声明**，由 tool_search 装载；`hidden` 不注册；`toolExposure` 单工具覆盖待 I 阶段）。rpi 适配：codemode 服务器自动激活 `tool_search`（pi 激活 codemode 脚本工具；rpi 无 codemode 以 tool_search 兜底）
+- [x] J4 `zpi mcp add/remove/list/login/logout` 子命令（login/logout 存 `mcp-auth.json`）
+- [x] J5 exposure 模式（pi 四值：`direct` 直接声明；`codemode`（默认）/`deferred` 注册但**不声明**，由 tool_search 装载；`hidden` 不注册；`toolExposure` 单工具覆盖待 I 阶段）。zpi 适配：codemode 服务器自动激活 `tool_search`（pi 激活 codemode 脚本工具；zpi 无 codemode 以 tool_search 兜底）
 - [x] J7 `tool_search` 工具（pi BM25 同款：分词=camelCase 拆分+停用词+naive 单数化（Intl.Segmenter 的 ASCII 近似）；k1=1.2 b=0.75；name 权重 3 / namespace 0.5（namespace=MCP 服务器 description）；exact-name 查询最优先、coverage 次之、score 再次、并列保持文档序）。注册即 inactive；激活路径：`--tools tool_search`、`+tool_search`、defaultTools 设置、搜索性 MCP 服务器自动激活。装载=翻 active 位，下一轮请求即声明（E2E 双轮验证）
 - [x] J8 工具选择 × MCP（pi sdk.js `_isAllowedTool` 语义）：`-nt`（noTools=all）禁一切含 MCP 不注册；`-nbt`（noTools=builtin）只禁内置；plain `--tools` 替换内置、仅当含 `mcp__` 前缀条目时过滤 MCP（未匹配者不注册、tool_search 未列入亦不注册）；全 modifier 修改默认集且 MCP 绕过；`--exclude-tools` 波及一切（MCP 不注册）。Registry：`Tool.exposure`+`Tool.active`、`activateOnly`（inactive 保注册）、`removeMatchingOn`、`toolSchemasJson` 只出 active + JSON 字符串转义（修 request 体裸换行 bug）
 - [ ] J6 OAuth 浏览器流程（以 login 存 token 近似；完整 OAuth 待做）
@@ -435,7 +435,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 
 ### Phase L — /settings 占位项接线清单（对照 pi settings-selector，逐项待后端）
 > 22 项设置已在 /settings 里可循环切换（会话态，placeholder_idx），
-> 但 rpi 尚无对应子系统——各子系统落地时按本清单补：**持久化键名
+> 但 zpi 尚无对应子系统——各子系统落地时按本清单补：**持久化键名
 > （与 pi settings.json 完全一致，双向兼容）+ 功能消费点**，然后把该
 > 项从 placeholder_idx 迁到真实字段（参照 skill_commands/autocomplete_max
 > 的接线模式：settingsApplyNext 写字段 + 消费点读字段）。
@@ -459,7 +459,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 | Cache miss notices (cache-miss-notices) | `showCacheMissNotices` | cache 成本/恢复诊断的 transcript 通知 | — |
 | Collapse changelog (collapse-changelog) | `collapseChangelog` | 更新后的 changelog 折叠展示 | K6 |
 | Quiet startup (quiet-startup) | `quietStartup` | 启动头精简（只留 header） | 7 节 header 行 |
-| Install telemetry (install-telemetry) | `enableInstallTelemetry` | 匿名版本 ping（rpi 大概率不做） | — |
+| Install telemetry (install-telemetry) | `enableInstallTelemetry` | 匿名版本 ping（zpi 大概率不做） | — |
 | Double-escape action (double-escape-action) | `doubleEscapeAction` | 空编辑器双 Esc 的动作（清除/退出） | — |
 | Tree filter mode (tree-filter-mode) | `treeFilterMode` | /tree 打开时的默认过滤 | — |
 | TUI mode (tui-mode) | `tuiMode` | regular 模式（终端原生 scrollback） | K5 前 |
@@ -505,7 +505,7 @@ fs_wheel_lines。
 
 ### 命令
 
-| 命令 | pi | rpi | 状态 |
+| 命令 | pi | zpi | 状态 |
 |---|---|---|---|
 | /help /clear /exit /quit /hotkeys | ✓ | ✓ | 已实现 |
 | /model [name] | ✓ | ✓ | 已实现（模糊匹配切换） |
@@ -519,7 +519,7 @@ fs_wheel_lines。
 
 ### 全局键位（主界面）
 
-| pi action | 默认键 | rpi | 状态 |
+| pi action | 默认键 | zpi | 状态 |
 |---|---|---|---|
 | app.interrupt | esc | ✓ | 已实现（中止运行中回合） |
 | app.clear | ctrl+c | ✓ | 已实现（清空编辑器/退出） |
@@ -544,7 +544,7 @@ fs_wheel_lines。
 
 ### 交互与渲染
 
-| 功能 | pi | rpi | 状态 |
+| 功能 | pi | zpi | 状态 |
 |---|---|---|---|
 | 差分渲染 + DECSTBM 原生滚动 + 位移检测 | ✓ | ✓ | 已实现（自研差分 + 校验回退） |
 | 滚动条（auto 显隐 + 拖拽 + 点击吸附） | ✓ | ✓ | 已实现 |

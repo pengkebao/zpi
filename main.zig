@@ -64,7 +64,7 @@ fn jstr(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// `rpi mcp add <name> [options] (-- <command> [args...] | --url <url>)`.
+/// `zpi mcp add <name> [options] (-- <command> [args...] | --url <url>)`.
 fn mcpAdd(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, argv: []const []const u8) !void {
     const base = try config.baseDir(alloc, environ);
     defer alloc.free(base);
@@ -172,10 +172,10 @@ fn mcpAdd(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, ar
     const replaced = try mcp.addServer(alloc, io, path, n, entry_json);
     const scope = if (local) "project" else "global";
     std.debug.print("{s} {s} MCP server \"{s}\" in {s}.\n", .{ if (replaced) "Replaced" else "Added", scope, n, path });
-    std.debug.print("Check it with: rpi mcp list\n", .{});
+    std.debug.print("Check it with: zpi mcp list\n", .{});
 }
 
-/// `rpi mcp login <server>` — store a bearer token (pure-std approximation of
+/// `zpi mcp login <server>` — store a bearer token (pure-std approximation of
 /// pi's browser OAuth flow: the user pastes the token).
 fn mcpLogin(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, argv: []const []const u8) !void {
     const base = try config.baseDir(alloc, environ);
@@ -213,7 +213,7 @@ fn mcpLogin(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, 
     std.debug.print("{s} token for MCP server \"{s}\".\n", .{ if (replaced) "Replaced" else "Stored", name.? });
 }
 
-/// `rpi mcp logout <server>` — remove a stored bearer token.
+/// `zpi mcp logout <server>` — remove a stored bearer token.
 fn mcpLogout(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, argv: []const []const u8) !void {
     const base = try config.baseDir(alloc, environ);
     defer alloc.free(base);
@@ -236,7 +236,7 @@ fn mcpLogout(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ,
     }
 }
 
-/// `rpi mcp remove <name> [-l]`.
+/// `zpi mcp remove <name> [-l]`.
 fn mcpRemove(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, argv: []const []const u8) !void {
     const base = try config.baseDir(alloc, environ);
     defer alloc.free(base);
@@ -609,7 +609,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // `rpi mcp <subcommand>` (pi `pi mcp …`). Handled before config load —
+    // `zpi mcp <subcommand>` (pi `pi mcp …`). Handled before config load —
     // it only needs the base dir, not a model.
     if (argv.items.len >= 2 and std.mem.eql(u8, argv.items[1], "mcp")) {
         const sub = if (argv.items.len >= 3) argv.items[2] else "";
@@ -671,7 +671,7 @@ pub fn main(init: std.process.Init) !void {
                 return error.McpCli;
             };
         }
-        std.debug.print("usage: rpi mcp <list|add|remove|login|logout>\n", .{});
+        std.debug.print("usage: zpi mcp <list|add|remove|login|logout>\n", .{});
         return;
     }
 
@@ -1035,7 +1035,7 @@ pub fn main(init: std.process.Init) !void {
     // selection includes it (`--tools tool_search`, `--tools +tool_search`,
     // the defaultTools setting) or automatically when a server with
     // codemode/deferred exposure connected (pi activates the codemode script
-    // runner for codemode servers; rpi has no codemode yet, so tool_search is
+    // runner for codemode servers; zpi has no codemode yet, so tool_search is
     // the access path for those tools). Registration follows the selection:
     // excluded tools never register, and a `mcp__`-prefixed plain allowlist
     // that does not list tool_search drops it (pi _isAllowedTool).

@@ -658,7 +658,7 @@ fn appendJsonString(out: *std.array_list.Managed(u8), s: []const u8) !void {
 
 // ── Built-in provider catalog (generated from pi-ai's model catalog) ──
 // tools/gen_catalog.py regenerates src/ai/catalog.json from pi 1.5.0:
-// chat models on the four wire protocols rpi implements, from providers
+// chat models on the four wire protocols zpi implements, from providers
 // that authenticate with a plain API-key env var (~23 providers, ~700
 // models: openai-completions / anthropic-messages / openai-responses /
 // google-generative-ai).

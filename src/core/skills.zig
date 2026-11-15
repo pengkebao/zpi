@@ -477,7 +477,7 @@ test "discover scans agent + project dirs recursively" {
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     // Unique temp root so parallel test runs don't collide.
-    const root = try alloc.dupe(u8, "/tmp/rpi-skill-test");
+    const root = try alloc.dupe(u8, "/tmp/zpi-skill-test");
     defer alloc.free(root);
     // Clean any stale run, then build the tree.
     _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};

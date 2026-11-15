@@ -136,7 +136,7 @@ pub const TUI = struct {
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
 
     /// pi settings-selector items (pi-tui SettingsList + settings-selector.js),
-    /// same ids/labels/descriptions/values. Items rpi cannot back yet render
+    /// same ids/labels/descriptions/values. Items zpi cannot back yet render
     /// their default and say so on Enter (settingsApply returns false).
     const SettingKind = enum {
         autocompact, show_images, image_width, auto_resize_images, block_images,
@@ -1631,7 +1631,7 @@ pub const TUI = struct {
         };
     }
 
-    /// Cycle to the next value; returns false when rpi cannot back the
+    /// Cycle to the next value; returns false when zpi cannot back the
     /// setting (placeholder items don't cycle — pi backs all of them).
     fn settingsApplyNext(self: *TUI, def: SettingDef) bool {
         var vbuf: [64]u8 = undefined;
@@ -1686,7 +1686,7 @@ pub const TUI = struct {
                     c.fullscreen_wheel_lines = if (std.mem.eql(u8, next, "auto")) null else std.fmt.parseInt(u16, next, 10) catch null;
                 }
             },
-            // tui_mode/theme/etc: rpi cannot back these yet.
+            // tui_mode/theme/etc: zpi cannot back these yet.
             else => return false,
         }
         if (cfg) |c| c.persistSettings(self.alloc, self.io) catch {};
@@ -2072,7 +2072,7 @@ pub const TUI = struct {
             ss.writeMessageJson(&out, m) catch break;
             out.appendSlice("\n") catch break;
         }
-        const path = std.fmt.allocPrint(alloc, "/tmp/rpi-debug-{d}.log", .{ss.nowMs(self.io)}) catch return;
+        const path = std.fmt.allocPrint(alloc, "/tmp/zpi-debug-{d}.log", .{ss.nowMs(self.io)}) catch return;
         defer alloc.free(path);
         self.note("debug: writing {d} bytes to {s}", .{ out.items.len, path });
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = out.items }) catch {
@@ -2773,7 +2773,7 @@ pub const TUI = struct {
             std.process.Environ.getPosix(self.environ, "VISUAL") orelse "vi";
 
         var path_buf: [64]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/tmp/rpi-prompt-{d}.md", .{std.c.getpid()}) catch return;
+        const path = std.fmt.bufPrint(&path_buf, "/tmp/zpi-prompt-{d}.md", .{std.c.getpid()}) catch return;
 
         // Write the current editor content to the temp file.
         const text = self.editor.getText() catch return;
@@ -5413,10 +5413,10 @@ pub const TUI = struct {
     /// history and the input). Content follows pi's compact header: bold
     /// wordmark + dim version, muted key hints, dim onboarding line.
     pub fn addWelcomeHeader(self: *TUI) void {
-        const text = "\x1b[1mrpi\x1b[0m" ++ FG_MUTED ++ " v" ++ VERSION ++
+        const text = "\x1b[1mzpi\x1b[0m" ++ FG_MUTED ++ " v" ++ VERSION ++
             "\x1b[0m  " ++ FG_MUTED ++
             "esc interrupt · ctrl+c clear/exit · / commands · ctrl+o tools · ctrl+t thinking\x1b[0m\n" ++
-            FG_MUTED ++ "Ask rpi how to use or extend it — it can explain its own features.\x1b[0m";
+            FG_MUTED ++ "Ask zpi how to use or extend it — it can explain its own features.\x1b[0m";
         self.addMessage(text);
     }
 
@@ -6556,24 +6556,24 @@ pub const TUI = struct {
         }
 
         // /share — pi shares via Radius artifact or GitHub gist; both need a
-        // remote backend rpi does not have yet (K3).
+        // remote backend zpi does not have yet (K3).
         if (std.mem.eql(u8, word, "/share")) {
             self.addMessage("\x1b[90mshare is not available yet (needs a Radius/gist backend — planned)\x1b[0m");
             self.redraw();
             return false;
         }
 
-        // /bug — report to the rpi repository.
+        // /bug — report to the zpi repository.
         if (std.mem.eql(u8, word, "/bug")) {
             const detail = if (arg.len > 0) arg else "(no description)";
-            self.addMessageFmt("bug tracker: https://git.yumakeji.cn/pengkebao/zpi/issues\nplease include: rpi v0.1.0 ({s}), the command you ran, and this description:\n  {s}", .{ @tagName(builtin.os.tag), detail });
+            self.addMessageFmt("bug tracker: https://git.yumakeji.cn/pengkebao/zpi/issues\nplease include: zpi v0.1.0 ({s}), the command you ran, and this description:\n  {s}", .{ @tagName(builtin.os.tag), detail });
             self.redraw();
             return false;
         }
 
-        // /changelog — rpi keeps no packaged changelog file yet; point at git.
+        // /changelog — zpi keeps no packaged changelog file yet; point at git.
         if (std.mem.eql(u8, word, "/changelog")) {
-            self.addMessage("rpi v0.1.0\nchangelog: https://git.yumakeji.cn/pengkebao/zpi/-/commits/main");
+            self.addMessage("zpi v0.1.0\nchangelog: https://git.yumakeji.cn/pengkebao/zpi/-/commits/main");
             self.redraw();
             return false;
         }
