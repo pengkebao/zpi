@@ -131,7 +131,7 @@ pub const TUI = struct {
     /// leading slash (pi item.value: label may differ, e.g. models show the
     /// id but complete to "provider/id"); empty = use `name`.
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null, value: []const u8 = "" };
-    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust };
+    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
     /// Selector row capacity (sessions/tree/fork pickers).
     const SEL_MAX = 64;
@@ -206,28 +206,34 @@ pub const TUI = struct {
         }
     };
     const COMMANDS = [_]CommandDef{
-        .{ .name = "/help", .desc = "Show help" },
-        .{ .name = "/clear", .desc = "Clear conversation" },
-        .{ .name = "/model", .desc = "Switch model", .takes_arg = true },
-        .{ .name = "/think", .desc = "Show/set thinking level", .takes_arg = true },
-        .{ .name = "/session", .desc = "Session info" },
-        .{ .name = "/name", .desc = "Name this session", .takes_arg = true },
-        .{ .name = "/new", .desc = "Start a new session" },
-        .{ .name = "/tree", .desc = "Navigate the session tree" },
-        .{ .name = "/fork", .desc = "Fork from an earlier user message" },
-        .{ .name = "/clone", .desc = "Duplicate session at current position" },
-        .{ .name = "/import", .desc = "Import a session JSONL", .takes_arg = true },
-        .{ .name = "/resume", .desc = "Resume a session (picker, or /resume <id>)" },
-        .{ .name = "/export", .desc = "Export session to HTML", .takes_arg = true },
-        .{ .name = "/compact", .desc = "Compact the conversation" },
-        .{ .name = "/reload", .desc = "Reload skills + rebuild system prompt" },
-        .{ .name = "/mcp", .desc = "List MCP servers and their state" },
-        .{ .name = "/copy", .desc = "Copy last reply to clipboard" },
-        .{ .name = "/settings", .desc = "Open settings (Enter cycles values)" },
-        .{ .name = "/debug", .desc = "Write debug log" },
+        // pi BUILTIN_SLASH_COMMANDS (core/slash-commands.js), same order and
+        // descriptions. /mcp sits at the end (pi registers it as an extension
+        // command, which pi renders after templates and before skills).
+        .{ .name = "/settings", .desc = "Open settings menu" },
+        .{ .name = "/model", .desc = "Select model (opens selector UI)", .takes_arg = true },
+        .{ .name = "/tree", .desc = "Navigate session tree (switch branches)" },
+        .{ .name = "/thinking", .desc = "Set thinking level", .takes_arg = true },
+        .{ .name = "/scoped-models", .desc = "Enable/disable models for Ctrl+P cycling" },
+        .{ .name = "/export", .desc = "Export session (HTML default, or specify path: .html/.jsonl)" },
+        .{ .name = "/import", .desc = "Import a JSONL session, preserving its ID and working directory" },
+        .{ .name = "/share", .desc = "Share session via a Radius artifact or a GitHub gist" },
+        .{ .name = "/bug", .desc = "Report a bug to the Pi developers", .takes_arg = true },
+        .{ .name = "/copy", .desc = "Copy last agent message to clipboard" },
+        .{ .name = "/name", .desc = "Set session display name" },
+        .{ .name = "/session", .desc = "Show session info and stats" },
+        .{ .name = "/changelog", .desc = "Show changelog entries" },
+        .{ .name = "/hotkeys", .desc = "Show all keyboard shortcuts" },
+        .{ .name = "/fork", .desc = "Create a new fork from a previous user message" },
+        .{ .name = "/clone", .desc = "Duplicate the current session at the current position" },
         .{ .name = "/trust", .desc = "Save project trust decision for future sessions" },
-        .{ .name = "/exit", .desc = "Quit" },
+        .{ .name = "/login", .desc = "Configure provider authentication", .takes_arg = true },
+        .{ .name = "/logout", .desc = "Remove provider authentication" },
+        .{ .name = "/new", .desc = "Start a new session" },
+        .{ .name = "/compact", .desc = "Manually compact the session context" },
+        .{ .name = "/resume", .desc = "Resume another session" },
+        .{ .name = "/reload", .desc = "Reload keybindings, extensions, skills, prompts, themes, and context files" },
         .{ .name = "/quit", .desc = "Quit" },
+        .{ .name = "/mcp", .desc = "Show MCP servers and their state" },
     };
 
     io: std.Io,
@@ -393,6 +399,10 @@ pub const TUI = struct {
     watch_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Providers created by /model switches; freed in deinit.
     owned_provider: ?aiprovider.AnyProvider = null,
+    /// /scoped-models: models (as "provider/id") enabled for Ctrl+P
+    /// cycling. null = all enabled (pi session.scopedModels). Session-only
+    /// (pi persists via Ctrl+S — not implemented yet).
+    scoped_models: ?std.ArrayListUnmanaged([]u8) = null,
     /// Last emitted cursor park (hidden flag + row<<32|col): a no-change
     /// frame re-parking the same cursor used to emit bytes every tick.
     cursor_park_key: u64 = std.math.maxInt(u64),
@@ -548,9 +558,9 @@ pub const TUI = struct {
     /// moves the selection; pi updateAutocomplete semantics).
     pub fn updateMenu(self: *TUI) void {
         // Modal dialogs (settings, session/tree/fork pickers, the /mcp
-        // manager) are not driven by editor text.
+        // manager, scoped-models) are not driven by editor text.
         switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => return,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped => return,
             else => {},
         }
         const text = self.editor.getText() catch {
@@ -946,7 +956,7 @@ pub const TUI = struct {
         // projected window directly and menu_view_start only decides the
         // selection marker.
         const projected = switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => true,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped => true,
             else => false,
         };
         const item_idx = if (projected) v else self.menu_view_start + v;
@@ -1062,6 +1072,15 @@ pub const TUI = struct {
                     self.menu_text_cache = null;
                 }
                 return self.handleCommand(e.name);
+            },
+            .scoped => {
+                // pi ScopedModelsSelector: Enter toggles the model's enabled
+                // state; the menu stays open for more toggles (Esc closes).
+                if (e.model_idx) |idx| {
+                    self.toggleScopedModel(idx);
+                    self.note("{s} {s}", .{ e.name, self.modelScoped(e.model_idx.?) });
+                }
+                return false;
             },
             .models => {
                 // pi /model selector: Enter switches to the selected model
@@ -1620,6 +1639,80 @@ pub const TUI = struct {
         self.redraw();
     }
 
+    /// pi ScopedModelsSelector.isEnabled: null = all enabled.
+    fn modelScoped(self: *TUI, idx: usize) []const u8 {
+        if (self.scoped_models == null) return "\u{2713} enabled";
+        return if (self.isModelScoped(idx)) "\u{2713} enabled" else "\u{2717} disabled";
+    }
+
+    fn isModelScoped(self: *TUI, idx: usize) bool {
+        const cfg = self.cfg orelse return true;
+        if (idx >= cfg.models.items.len) return true;
+        const list = &(self.scoped_models orelse return true);
+        var fbuf: [256]u8 = undefined;
+        const full = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ cfg.models.items[idx].provider, cfg.models.items[idx].id }) catch return true;
+        for (list.items) |id| {
+            if (std.mem.eql(u8, id, full)) return true;
+        }
+        return false;
+    }
+
+    fn toggleScopedModel(self: *TUI, idx: usize) void {
+        const cfg = self.cfg orelse return;
+        if (idx >= cfg.models.items.len) return;
+        var fbuf: [256]u8 = undefined;
+        const full = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ cfg.models.items[idx].provider, cfg.models.items[idx].id }) catch return;
+        if (self.scoped_models == null) {
+            // null = all enabled → disabling one starts an explicit list of
+            // every OTHER model (pi toggle()).
+            var list = std.ArrayListUnmanaged([]u8).empty;
+            for (cfg.models.items, 0..) |*m, i| {
+                if (i == idx) continue;
+                const mid = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ m.provider, m.id }) catch continue;
+                const id = self.alloc.dupe(u8, mid) catch continue;
+                list.append(self.alloc, id) catch {};
+            }
+            self.scoped_models = list;
+            return;
+        }
+        var list = &self.scoped_models.?;
+        for (list.items, 0..) |id, i| {
+            if (std.mem.eql(u8, id, full)) {
+                self.alloc.free(id);
+                _ = list.orderedRemove(i);
+                return;
+            }
+        }
+        const id = self.alloc.dupe(u8, full) catch return;
+        list.append(self.alloc, id) catch self.alloc.free(id);
+    }
+
+    /// /scoped-models — pi ScopedModelsSelector: list all models with their
+    /// enabled state; Enter toggles, Esc closes. Session-only.
+    fn openScopedModelsMenu(self: *TUI) void {
+        const cfg = self.cfg orelse {
+            self.note("no config loaded", .{});
+            self.redraw();
+            return;
+        };
+        var n: usize = 0;
+        for (cfg.models.items, 0..) |*m, i| {
+            if (n >= self.menu_items.len) break;
+            self.menu_items[n] = .{
+                .name = m.id,
+                .desc = self.modelScoped(i),
+                .model_idx = i,
+            };
+            n += 1;
+        }
+        self.menu_len = n;
+        self.menu_selected = 0;
+        self.menu_mode = .scoped;
+        self.editor.clear() catch {};
+        self.note("Enter toggles; Esc closes (session-only)", .{});
+        self.redraw();
+    }
+
     /// Cycle to the next/previous configured model (pi: app.model.cycle,
     /// ctrl+p / shift+ctrl+p). Wraps around the flattened models list.
     fn cycleModel(self: *TUI, dir: isize) void {
@@ -1633,8 +1726,16 @@ pub const TUI = struct {
         for (cfg.models.items, 0..) |m, i| {
             if (std.mem.eql(u8, m.name, self.model_name)) idx = i;
         }
-        const next: usize = @intCast(@mod(@as(isize, @intCast(idx)) + dir, @as(isize, @intCast(n))));
-        self.switchModel(next) catch |err| {
+        // pi: scoped models limit the Ctrl+P cycle; null = all.
+        var step: usize = 0;
+        var cur = idx;
+        while (step < n) : (step += 1) {
+            const cand: isize = @mod(@as(isize, @intCast(cur)) + dir, @as(isize, @intCast(n)));
+            cur = @intCast(cand);
+            if (self.isModelScoped(cur)) break;
+        }
+        if (step >= n) return; // everything disabled — stay put
+        self.switchModel(cur) catch |err| {
             self.note("model switch failed: {s}", .{@errorName(err)});
         };
     }
@@ -2155,6 +2256,10 @@ pub const TUI = struct {
         self.editor.deinit();
         self.stream_text.deinit();
         self.stream_thinking.deinit();
+        if (self.scoped_models) |*list| {
+            for (list.items) |id| self.alloc.free(id);
+            list.deinit(self.alloc);
+        }
         if (self.owned_provider) |p| {
             p.deinit();
         }
@@ -3897,6 +4002,14 @@ pub const TUI = struct {
         self.addBlockWithSrc(text, .plain);
     }
 
+    /// addMessage with formatting (allocPrint's into a transient buffer that
+    /// addBlockWithSrc copies).
+    fn addMessageFmt(self: *TUI, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
+        defer self.alloc.free(text);
+        self.addMessage(text);
+    }
+
     /// Append a rendered block plus how it re-renders on a resize. Owns the
     /// strings of `src` on success (frees them on failure). The spinner
     /// thread reads scrollback while working; guard the append.
@@ -5345,7 +5458,37 @@ pub const TUI = struct {
             return false;
         }
 
-        if (std.mem.eql(u8, word, "/think")) {
+        // /scoped-models — pi ScopedModelsSelector (Enter toggles, Esc closes).
+        if (std.mem.eql(u8, word, "/scoped-models")) {
+            self.openScopedModelsMenu();
+            return false;
+        }
+
+        // /share — pi shares via Radius artifact or GitHub gist; both need a
+        // remote backend rpi does not have yet (K3).
+        if (std.mem.eql(u8, word, "/share")) {
+            self.addMessage("\x1b[90mshare is not available yet (needs a Radius/gist backend — planned)\x1b[0m");
+            self.redraw();
+            return false;
+        }
+
+        // /bug — report to the rpi repository.
+        if (std.mem.eql(u8, word, "/bug")) {
+            const detail = if (arg.len > 0) arg else "(no description)";
+            self.addMessageFmt("bug tracker: https://git.yumakeji.cn/pengkebao/zpi/issues\nplease include: rpi v0.1.0 ({s}), the command you ran, and this description:\n  {s}", .{ @tagName(builtin.os.tag), detail });
+            self.redraw();
+            return false;
+        }
+
+        // /changelog — rpi keeps no packaged changelog file yet; point at git.
+        if (std.mem.eql(u8, word, "/changelog")) {
+            self.addMessage("rpi v0.1.0\nchangelog: https://git.yumakeji.cn/pengkebao/zpi/-/commits/main");
+            self.redraw();
+            return false;
+        }
+
+        // /thinking (pi) with the legacy /think kept as an alias.
+        if (std.mem.eql(u8, word, "/think") or std.mem.eql(u8, word, "/thinking")) {
             if (arg.len == 0) {
                 self.note("Thinking level: {s} (off|low|medium|high|xhigh|max)", .{self.session.thinking_level.name()});
             } else if (config.ThinkingLevel.fromStr(arg)) |lvl| {
@@ -5515,11 +5658,26 @@ pub const TUI = struct {
                 arg
             else
                 std.fmt.bufPrint(&def_path, "{s}.html", .{st.path}) catch arg;
-            st.exportHtml(self.alloc, out_path) catch {
-                self.addMessage("\x1b[91m[export failed]\x1b[0m");
-                self.redraw();
-                return false;
-            };
+            if (std.mem.endsWith(u8, out_path, ".jsonl")) {
+                // pi: .jsonl export = the raw session file (same entry stream).
+                const data = std.Io.Dir.cwd().readFileAlloc(self.io, st.path, self.alloc, .limited(1 << 30)) catch {
+                    self.addMessage("\x1b[91m[export failed: cannot read session file]\x1b[0m");
+                    self.redraw();
+                    return false;
+                };
+                defer self.alloc.free(data);
+                std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = out_path, .data = data }) catch {
+                    self.addMessage("\x1b[91m[export failed]\x1b[0m");
+                    self.redraw();
+                    return false;
+                };
+            } else {
+                st.exportHtml(self.alloc, out_path) catch {
+                    self.addMessage("\x1b[91m[export failed]\x1b[0m");
+                    self.redraw();
+                    return false;
+                };
+            }
             self.note("\x1b[90mexported → {s}\x1b[0m", .{out_path});
             self.redraw();
             return false;
@@ -6018,6 +6176,28 @@ pub const TUI = struct {
                     continue;
                 }
                 continue; // swallow everything else while the prompt is open
+            }
+            if (self.menu_mode == .scoped) {
+                // Scoped-models selector (pi ScopedModelsSelector): arrows +
+                // Enter toggle; Esc closes. Session-only.
+                if (self.bindings.matches(key, .menu_up)) {
+                    self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_down)) {
+                    self.menu_selected = if (self.menu_selected + 1 >= self.menu_len) 0 else self.menu_selected + 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_close)) {
+                    self.menu_mode = .hidden;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    _ = self.menuActivate();
+                    self.redraw();
+                    continue;
+                }
+                continue; // swallow everything else while the selector is open
             }
             if (self.menu_mode == .settings) {
                 // Modal settings selector: only menu keys respond.
