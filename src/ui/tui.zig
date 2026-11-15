@@ -1051,6 +1051,16 @@ pub const TUI = struct {
                     return false;
                 }
                 self.editor.clear() catch {};
+                // Close the menu BEFORE running the command: the command may
+                // rebuild slash_extras (/reload) — menu_items holds borrowed
+                // pointers into it, and the command's own redraw would then
+                // render freed entries (segfault in menuLine).
+                self.menu_mode = .hidden;
+                self.menu_len = 0;
+                if (self.menu_text_cache) |c| {
+                    self.alloc.free(c);
+                    self.menu_text_cache = null;
+                }
                 return self.handleCommand(e.name);
             },
             .models => {
@@ -1058,6 +1068,14 @@ pub const TUI = struct {
                 // right away (the menu is a picker, not an input completion —
                 // filling "/model provider/id " left it looking hung).
                 self.editor.clear() catch {};
+                // Close the menu first: switchModel redraws from inside
+                // handleCommand-style paths and must not render the picker.
+                self.menu_mode = .hidden;
+                self.menu_len = 0;
+                if (self.menu_text_cache) |c| {
+                    self.alloc.free(c);
+                    self.menu_text_cache = null;
+                }
                 if (e.model_idx) |idx| {
                     self.switchModel(idx) catch |err| {
                         self.note("model switch failed: {s}", .{@errorName(err)});
