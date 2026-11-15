@@ -1256,6 +1256,7 @@ pub fn main(init: std.process.Init) !void {
                 alloc.free(info.path);
                 alloc.free(info.id);
                 if (info.name) |n| alloc.free(n);
+                if (info.first_message) |fm| alloc.free(fm);
                 alloc.free(info.timestamp);
             }
             alloc.free(list);
@@ -1342,6 +1343,7 @@ pub fn main(init: std.process.Init) !void {
                         alloc.free(info.path);
                         alloc.free(info.id);
                         if (info.name) |n| alloc.free(n);
+                        if (info.first_message) |fm| alloc.free(fm);
                         alloc.free(info.timestamp);
                     }
                     alloc.free(list);
