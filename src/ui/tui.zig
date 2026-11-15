@@ -133,6 +133,64 @@ pub const TUI = struct {
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null, value: []const u8 = "" };
     const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
+
+    /// pi settings-selector items (pi-tui SettingsList + settings-selector.js),
+    /// same ids/labels/descriptions/values. Items rpi cannot back yet render
+    /// their default and say so on Enter (settingsApply returns false).
+    const SettingKind = enum {
+        autocompact, show_images, image_width, auto_resize_images, block_images,
+        skill_commands, show_hardware_cursor, editor_padding, output_padding,
+        autocomplete_max, clear_on_shrink, terminal_progress, steering_mode,
+        follow_up_mode, transport, share_destination, http_idle_timeout,
+        cache_warming, hide_thinking, mermaid, cache_miss_notices,
+        collapse_changelog, quiet_startup, install_telemetry,
+        default_project_trust, double_escape, tree_filter, warnings,
+        model_thinking, tui_mode, fs_exit_output, fs_scrollbar,
+        fs_copy_on_select, fs_wheel_lines, theme,
+    };
+    const SettingDef = struct {
+        kind: SettingKind,
+        label: []const u8,
+        desc: []const u8,
+        values: []const []const u8,
+    };
+    const SETTING_DEFS = [_]SettingDef{
+        .{ .kind = .autocompact, .label = "Auto-compact", .desc = "Automatically compact context when it gets too large", .values = &.{ "true", "false" } },
+        .{ .kind = .show_images, .label = "Show images", .desc = "Render images inline in terminal", .values = &.{ "true", "false" } },
+        .{ .kind = .image_width, .label = "Image width", .desc = "Preferred inline image width in terminal cells", .values = &.{ "60", "80", "120" } },
+        .{ .kind = .auto_resize_images, .label = "Auto-resize images", .desc = "Resize large images to 2000x2000 max for better model compatibility", .values = &.{ "true", "false" } },
+        .{ .kind = .block_images, .label = "Block images", .desc = "Prevent images from being sent to LLM providers", .values = &.{ "true", "false" } },
+        .{ .kind = .skill_commands, .label = "Skill commands", .desc = "Register skills as /skill:name commands", .values = &.{ "true", "false" } },
+        .{ .kind = .show_hardware_cursor, .label = "Show hardware cursor", .desc = "Use the terminal cursor instead of Pi's drawn cursor", .values = &.{ "true", "false" } },
+        .{ .kind = .editor_padding, .label = "Editor padding", .desc = "Horizontal padding for input editor (0-3)", .values = &.{ "0", "1", "2", "3" } },
+        .{ .kind = .output_padding, .label = "Output padding", .desc = "Horizontal padding for messages, tool output, and command output", .values = &.{ "0", "1" } },
+        .{ .kind = .autocomplete_max, .label = "Autocomplete max items", .desc = "Max visible items in autocomplete dropdown (3-20)", .values = &.{ "3", "5", "7", "10", "15", "20" } },
+        .{ .kind = .clear_on_shrink, .label = "Clear on shrink", .desc = "Clear empty rows when content shrinks (may cause flicker)", .values = &.{ "true", "false" } },
+        .{ .kind = .terminal_progress, .label = "Terminal progress", .desc = "Show OSC 9;4 progress indicators in the terminal tab bar", .values = &.{ "true", "false" } },
+        .{ .kind = .steering_mode, .label = "Steering mode", .desc = "Enter while streaming queues steering messages. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.", .values = &.{ "one-at-a-time", "all" } },
+        .{ .kind = .follow_up_mode, .label = "Follow-up mode", .desc = "alt+enter queues follow-up messages until agent stops. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.", .values = &.{ "one-at-a-time", "all" } },
+        .{ .kind = .transport, .label = "Transport", .desc = "Preferred transport for providers that support multiple transports", .values = &.{"auto"} },
+        .{ .kind = .share_destination, .label = "Session share destination", .desc = "Where to upload sessions with /share (auto prefers Radius when authenticated, otherwise GitHub Gist)", .values = &.{ "auto", "radius", "gist" } },
+        .{ .kind = .http_idle_timeout, .label = "HTTP idle timeout", .desc = "Maximum idle gap while waiting for HTTP headers or body chunks. Disable for local models that pause longer than five minutes.", .values = &.{"default"} },
+        .{ .kind = .cache_warming, .label = "Cache warming", .desc = "off; streaming while the agent runs; idle also between runs while continuation stays profitable", .values = &.{"off"} },
+        .{ .kind = .hide_thinking, .label = "Hide thinking", .desc = "Hide thinking blocks in assistant responses", .values = &.{ "true", "false" } },
+        .{ .kind = .mermaid, .label = "Mermaid diagrams", .desc = "Render Mermaid code blocks as Unicode diagrams", .values = &.{"off"} },
+        .{ .kind = .cache_miss_notices, .label = "Cache miss notices", .desc = "Show transcript notices for cache costs and provider recovery diagnostics", .values = &.{ "true", "false" } },
+        .{ .kind = .collapse_changelog, .label = "Collapse changelog", .desc = "Show condensed changelog after updates", .values = &.{ "true", "false" } },
+        .{ .kind = .quiet_startup, .label = "Quiet startup", .desc = "Disable verbose printing at startup (header: keep only the startup header)", .values = &.{"false"} },
+        .{ .kind = .install_telemetry, .label = "Install telemetry", .desc = "Send an anonymous version/update ping after changelog-detected updates", .values = &.{ "true", "false" } },
+        .{ .kind = .default_project_trust, .label = "Default project trust", .desc = "Fallback behavior when no extension or saved trust decision decides project trust", .values = &.{ "Ask", "Always trust", "Never trust" } },
+        .{ .kind = .double_escape, .label = "Double-escape action", .desc = "Action when pressing Escape twice with empty editor", .values = &.{"none"} },
+        .{ .kind = .tree_filter, .label = "Tree filter mode", .desc = "Default filter when opening /tree", .values = &.{"all"} },
+        .{ .kind = .warnings, .label = "Warnings", .desc = "Enable or disable individual warnings", .values = &.{"true"} },
+        .{ .kind = .model_thinking, .label = "Default thinking level per model", .desc = "Override the default thinking level for specific models.", .values = &.{"none"} },
+        .{ .kind = .tui_mode, .label = "TUI mode", .desc = "Interface layout; regular mode uses the terminal's normal scrollback", .values = &.{ "regular", "fullscreen" } },
+        .{ .kind = .fs_exit_output, .label = "Fullscreen exit output", .desc = "Print the transcript or only a session resume hint when exiting fullscreen mode", .values = &.{ "transcript", "resume-hint" } },
+        .{ .kind = .fs_scrollbar, .label = "Fullscreen scrollbar", .desc = "Scrollbar behavior in fullscreen mode; has no effect in regular mode", .values = &.{ "auto", "always", "hidden" } },
+        .{ .kind = .fs_copy_on_select, .label = "Fullscreen copy on select", .desc = "Automatically copy selected text in fullscreen mode; disable to copy selections with Ctrl+X", .values = &.{ "true", "false" } },
+        .{ .kind = .fs_wheel_lines, .label = "Fullscreen wheel scrolling", .desc = "Lines per mouse-wheel event in fullscreen mode; 'auto' speeds up fast wheel spins where the terminal does not", .values = &.{ "auto", "1", "2", "3", "5", "10" } },
+        .{ .kind = .theme, .label = "Theme", .desc = "Color theme for the interface", .values = &.{"dark"} },
+    };
     /// Selector row capacity (sessions/tree/fork pickers).
     const SEL_MAX = 64;
     /// One picker row: display name/desc + attached id (entry id or path).
@@ -403,6 +461,17 @@ pub const TUI = struct {
     /// cycling. null = all enabled (pi session.scopedModels). Session-only
     /// (pi persists via Ctrl+S — not implemented yet).
     scoped_models: ?std.ArrayListUnmanaged([]u8) = null,
+    /// /settings selector state (pi SettingsSelectorComponent): the editor
+    /// line doubles as the search input; these hold the filtered view.
+    settings_filtered: [SETTING_DEFS.len]usize = undefined,
+    settings_visible: usize = 0,
+    settings_sel: usize = 0,
+    /// Backed settings fields (see settingsApply).
+    skill_commands: bool = true,
+    steering_mode_all: bool = true,
+    follow_up_mode_all: bool = true,
+    fullscreen_copy_on_select: bool = true,
+    autocomplete_max: usize = 5,
     /// Last emitted cursor park (hidden flag + row<<32|col): a no-change
     /// frame re-parking the same cursor used to emit bytes every tick.
     cursor_park_key: u64 = std.math.maxInt(u64),
@@ -902,6 +971,7 @@ pub const TUI = struct {
     /// autocomplete shows AUTOCOMPLETE_MAX_VISIBLE (default 5) rows centered
     /// on the selection; modal pickers show up to 16.
     fn menuMaxVisible(self: *const TUI) usize {
+        if (self.menu_mode == .settings) return 10;
         return switch (self.menu_mode) {
             .commands, .models, .files => 5,
             .mcp => @min(self.sel_len, 12),
@@ -1113,15 +1183,15 @@ pub const TUI = struct {
                 return false;
             },
             .settings => {
-                const label = e.name;
-                self.cycleSetting(self.menu_selected);
-                // Refresh the row's current-value description, then report
-                // the NEW value (desc buffer is reused across rows — read
-                // after the refresh, never the stale `e` copy).
-                const labels = self.settingsLabels();
-                if (self.menu_selected < labels.len) {
-                    self.menu_items[self.menu_selected].desc = labels[self.menu_selected].desc;
-                    self.note("{s} set to {s}", .{ label, labels[self.menu_selected].desc });
+                // pi SettingsList: Enter/Space cycles the selected value.
+                if (self.settings_visible > 0) {
+                    var vbuf: [64]u8 = undefined;
+                    const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
+                    if (self.settingsApplyNext(def)) {
+                        self.note("{s} set to {s}", .{ def.label, self.settingsCurrentValue(def, &vbuf) });
+                    } else {
+                        self.note("{s}: not implemented yet", .{def.label});
+                    }
                 }
                 return false;
             },
@@ -1173,47 +1243,288 @@ pub const TUI = struct {
 
     /// Current label/description rows for the settings menu (owned by
     /// menu_items' static slices + formatted descs in a small buffer).
-    fn settingsLabels(self: *TUI) []MenuEntry {
-        const cfg = self.cfg;
-        var n: usize = 0;
-        // Static labels with dynamic descs formatted into rows_buf.
-        for (settingsKinds(), 0..) |kind, i| {
-            if (n >= self.menu_items.len) break;
-            var db: [64]u8 = undefined;
-            const desc: []const u8 = switch (kind) {
-                .autocompact => if (cfg) |c| (if (c.compaction.enabled) "true" else "false") else "true",
-                .reserve_tokens => std.fmt.bufPrint(&db, "{d}", .{if (cfg) |c| c.compaction.reserve_tokens else 16384}) catch "?",
-                .keep_recent => std.fmt.bufPrint(&db, "{d}", .{if (cfg) |c| c.compaction.keep_recent_tokens else 20000}) catch "?",
-                .default_model => if (cfg) |c| blk: {
-                    if (c.findDefaultModel()) |m| {
-                        break :blk std.fmt.bufPrint(&db, "{s}/{s}", .{ m.provider, m.id }) catch "(session)";
-                    }
-                    break :blk "(session)";
-                } else "(session)",
-            };
-            // desc must outlive this call: copy into settings_desc_buf.
-            const dst = self.settings_desc_buf[i][0..desc.len];
-            @memcpy(dst, desc);
-            self.menu_items[n] = .{
-                .name = switch (kind) {
-                    .autocompact => "Auto-compact",
-                    .reserve_tokens => "Context reserve tokens",
-                    .keep_recent => "Keep recent tokens",
-                    .default_model => "Default model",
-                },
-                .desc = self.settings_desc_buf[i][0..desc.len],
-            };
-            n += 1;
+    const SPACES48: [48]u8 = @splat(' ');
+
+    /// Total frame rows the settings view occupies below the editor line
+    /// (matches renderSettingsView): blank + min(visible,10) items + count
+    /// (when the list scrolls) + blank + description + hint. The editor
+    /// line itself is already in editor_h.
+    fn settingsViewHeight(self: *TUI, editor_h: usize) usize {
+        _ = editor_h;
+        const visible_rows = @min(self.settings_visible, 10);
+        var h: usize = 1 + visible_rows; // blank + items
+        if (self.settings_visible > 10) h += 1; // "(n/total)"
+        h += 1; // blank
+        if (self.settings_visible > 0) {
+            const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
+            h += wrapDescLines(def.desc, self.width).len; // description
         }
-        self.menu_len = n;
-        return self.menu_items[0..n];
+        h += 1; // hint
+        return h;
+    }
+
+    /// pi wrapTextWithAnsi (plain text here): word wrap to width.
+    fn wrapDescLines(text: []const u8, width: usize) []const []const u8 {
+        // Static output buffer (renderSettingsView consumes immediately).
+        const S = struct {
+            var lines_buf: [8][]const u8 = undefined;
+            var text_buf: [512]u8 = undefined;
+        };
+        const max_w = @max(1, width -| 6);
+        var n: usize = 0;
+        var used: usize = 0;
+        var it = std.mem.tokenizeAny(u8, text, " ");
+        while (it.next()) |word| {
+            const wl = wmod.visualWidth(word);
+            if (used > 0 and used + 1 + wl > max_w) {
+                n += 1;
+                if (n >= S.lines_buf.len) break;
+                used = 0;
+            }
+            if (used == 0) {
+                @memcpy(S.text_buf[n * max_w ..][0..wl], word);
+                S.lines_buf[n] = S.text_buf[n * max_w ..][0..wl];
+                used = wl;
+            } else {
+                if (used + 1 + wl > max_w) continue;
+                S.text_buf[n * max_w + used] = ' ';
+                @memcpy(S.text_buf[n * max_w + used + 1 ..][0..wl], word);
+                S.lines_buf[n] = S.text_buf[n * max_w ..][0 .. used + 1 + wl];
+                used += 1 + wl;
+            }
+        }
+        if (used > 0 and (n == 0 or S.lines_buf[n].len > 0)) n += 1;
+        return S.lines_buf[0..n];
+    }
+
+    fn renderSettingsView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), editor_h: usize, settings_h: usize) void {
+        _ = settings_h;
+        const width = self.width;
+        const muted = FG_MUTED;
+        const accent = "\x1b[38;2;167;152;215m";
+        const reset = ansi.RESET;
+        // Blank line after the search input (pi: searchInput then "").
+        frame.append(self.alloc, "") catch return;
+        // Skip past the editor rows already appended (transcript + border +
+        // editor lines); we append right after them, in order.
+        const visible_rows = @min(self.settings_visible, 10);
+        if (self.settings_visible == 0) {
+            const line = std.fmt.allocPrint(self.alloc, "  {s}No matching settings{s}", .{ muted, reset }) catch return;
+            frame.append(self.alloc, line) catch return;
+        } else {
+            // Max label width across ALL settings (pi: min(36, widest)).
+            var max_label: usize = 0;
+            for (SETTING_DEFS) |def| {
+                const w = wmod.visualWidth(def.label);
+                if (w > max_label) max_label = w;
+            }
+            if (max_label > 36) max_label = 36;
+            // Scroll window centered on the selection.
+            const total = self.settings_visible;
+            const start: usize = if (self.settings_sel >= visible_rows)
+                @min(self.settings_sel - visible_rows / 2, total -| visible_rows)
+            else
+                0;
+            var vbuf: [64]u8 = undefined;
+            for (0..visible_rows) |v| {
+                const idx = self.settings_filtered[start + v];
+                const def = SETTING_DEFS[idx];
+                const selected = (start + v) == self.settings_sel;
+                const prefix: []const u8 = if (selected) "\u{2192} " else "  ";
+                const cur = self.settingsCurrentValue(def, &vbuf);
+                // label padded to max_label + two spaces + value
+                const label_w = wmod.visualWidth(def.label);
+                const pad = if (max_label > label_w) max_label - label_w else 0;
+                const line = std.fmt.allocPrint(
+                    self.alloc,
+                    "{s}{s}{s}{s}{s}  {s}{s}{s}",
+                    .{
+                        prefix,
+                        if (selected) accent else "",
+                        def.label,
+                        reset,
+                        (SPACES48)[0..@min(48, pad)],
+                        if (selected) muted else muted,
+                        cur,
+                        reset,
+                    },
+                ) catch return;
+                frame.append(self.alloc, line) catch return;
+            }
+            if (total > visible_rows) {
+                const cnt = std.fmt.allocPrint(self.alloc, "  {s}({d}/{d}){s}", .{ muted, self.settings_sel + 1, total, reset }) catch return;
+                frame.append(self.alloc, cnt) catch return;
+            }
+            // Blank + wrapped description.
+            if (self.settings_visible > 0) {
+                const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
+                frame.append(self.alloc, "") catch return;
+                for (wrapDescLines(def.desc, width)) |dl| {
+                    const dl_line = std.fmt.allocPrint(self.alloc, "  {s}{s}{s}", .{ muted, dl, reset }) catch return;
+                    frame.append(self.alloc, dl_line) catch return;
+                }
+            }
+        }
+        // Hint line (pi addHintLine: search enabled → includes "Type to search").
+        const hint = std.fmt.allocPrint(self.alloc, "  {s}Type to search \u{b7} Enter/Space to change \u{b7} Esc to cancel{s}", .{ muted, reset }) catch return;
+        frame.append(self.alloc, hint) catch return;
+        // NOTE: frame rows are pre-allocated to height by the caller's blank
+        // fill below; appends beyond editor_h shift nothing (caller pads).
+        _ = editor_h;
     }
 
     fn openSettingsMenu(self: *TUI) void {
-        _ = self.settingsLabels();
+        if (self.cfg != null) {
+            // Reflect persisted values (compaction etc.) in the selector.
+            self.settingsRefilter();
+        }
         self.menu_selected = 0;
+        self.settings_sel = 0;
         self.menu_mode = .settings;
         self.editor.clear() catch {};
+        self.menu_text_cache = null;
+        self.redraw();
+    }
+
+    /// pi SettingsList: label contains the query (case-insensitive).
+    fn settingsRefilter(self: *TUI) void {
+        const query_raw = self.editor.getText() catch "";
+        defer self.alloc.free(query_raw);
+        const query = std.mem.trim(u8, query_raw, " ");
+        var n: usize = 0;
+        for (SETTING_DEFS, 0..) |def, i| {
+            if (query.len > 0 and !containsIgnoreCase2(def.label, query)) continue;
+            self.settings_filtered[n] = i;
+            n += 1;
+        }
+        self.settings_visible = n;
+        if (self.settings_sel >= n) self.settings_sel = if (n > 0) n - 1 else 0;
+    }
+
+    fn containsIgnoreCase2(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0) return true;
+        if (needle.len > haystack.len) return false;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+        }
+        return false;
+    }
+
+    /// Current value of a setting (pi item.currentValue). `buf` holds small
+    /// formatted numbers; static strings are returned directly.
+    fn settingsCurrentValue(self: *TUI, def: SettingDef, buf: *[64]u8) []const u8 {
+        const cfg = self.cfg;
+        return switch (def.kind) {
+            .autocompact => if (cfg) |c| (if (c.compaction.enabled) "true" else "false") else "true",
+            .show_images => "true",
+            .image_width => "60",
+            .auto_resize_images => "true",
+            .block_images => "false",
+            .skill_commands => if (self.skill_commands) "true" else "false",
+            .show_hardware_cursor => "false",
+            .editor_padding => "0",
+            .output_padding => "1",
+            .autocomplete_max => std.fmt.bufPrint(buf, "{d}", .{self.autocomplete_max}) catch "5",
+            .clear_on_shrink => "false",
+            .terminal_progress => "false",
+            .steering_mode => if (self.steering_mode_all) "all" else "one-at-a-time",
+            .follow_up_mode => if (self.follow_up_mode_all) "all" else "one-at-a-time",
+            .transport => "auto",
+            .share_destination => "auto",
+            .http_idle_timeout => "default",
+            .cache_warming => "off",
+            .hide_thinking => if (self.thinking_hidden) "true" else "false",
+            .mermaid => "off",
+            .cache_miss_notices => "false",
+            .collapse_changelog => "true",
+            .quiet_startup => "false",
+            .install_telemetry => "false",
+            .default_project_trust => if (cfg) |c| switch (c.default_project_trust) {
+                .ask => "Ask",
+                .always => "Always trust",
+                .never => "Never trust",
+            } else "Ask",
+            .double_escape => "none",
+            .tree_filter => "all",
+            .warnings => "true",
+            .model_thinking => "none",
+            .tui_mode => "fullscreen",
+            .fs_exit_output => "transcript",
+            .fs_scrollbar => if (cfg) |c| switch (c.fullscreen_scrollbar) {
+                .auto => "auto",
+                .always => "always",
+                .hidden => "hidden",
+            } else "auto",
+            .fs_copy_on_select => if (self.fullscreen_copy_on_select) "true" else "false",
+            .fs_wheel_lines => blk_wl: {
+                if (cfg) |c| {
+                    if (c.fullscreen_wheel_lines) |wl| {
+                        break :blk_wl std.fmt.bufPrint(buf, "{d}", .{wl}) catch "auto";
+                    }
+                }
+                break :blk_wl "auto";
+            },
+            .theme => "dark",
+        };
+    }
+
+    /// Cycle to the next value; returns false when rpi cannot back the
+    /// setting (placeholder items don't cycle — pi backs all of them).
+    fn settingsApplyNext(self: *TUI, def: SettingDef) bool {
+        var vbuf: [64]u8 = undefined;
+        const cur = self.settingsCurrentValue(def, &vbuf);
+        var pos: usize = 0;
+        var found = false;
+        for (def.values, 0..) |v, i| {
+            if (std.mem.eql(u8, v, cur)) {
+                pos = i;
+                found = true;
+                break;
+            }
+        }
+        const next = def.values[if (found) (pos + 1) % def.values.len else 0];
+        const cfg = self.cfg;
+        switch (def.kind) {
+            .autocompact => {
+                if (cfg) |c| c.compaction.enabled = std.mem.eql(u8, next, "true");
+            },
+            .skill_commands => self.skill_commands = std.mem.eql(u8, next, "true"),
+            .autocomplete_max => self.autocomplete_max = std.fmt.parseInt(usize, next, 10) catch 5,
+            .steering_mode => self.steering_mode_all = std.mem.eql(u8, next, "all"),
+            .follow_up_mode => self.follow_up_mode_all = std.mem.eql(u8, next, "all"),
+            .hide_thinking => self.thinking_hidden = std.mem.eql(u8, next, "true"),
+            .default_project_trust => {
+                if (cfg) |c| {
+                    c.default_project_trust = if (std.mem.eql(u8, next, "Always trust"))
+                        .always
+                    else if (std.mem.eql(u8, next, "Never trust"))
+                        .never
+                    else
+                        .ask;
+                }
+            },
+            .fs_scrollbar => {
+                if (cfg) |c| {
+                    c.fullscreen_scrollbar = if (std.mem.eql(u8, next, "always"))
+                        .always
+                    else if (std.mem.eql(u8, next, "hidden"))
+                        .hidden
+                    else
+                        .auto;
+                }
+            },
+            .fs_copy_on_select => self.fullscreen_copy_on_select = std.mem.eql(u8, next, "true"),
+            .fs_wheel_lines => {
+                if (cfg) |c| {
+                    c.fullscreen_wheel_lines = if (std.mem.eql(u8, next, "auto")) null else std.fmt.parseInt(u16, next, 10) catch null;
+                }
+            },
+            // tui_mode/theme/etc: rpi cannot back these yet.
+            else => return false,
+        }
+        if (cfg) |c| c.persistSettings(self.alloc, self.io) catch {};
+        return true;
     }
 
     // ---- modal selectors (pi session/tree selectors) ----
@@ -1535,46 +1846,6 @@ pub const TUI = struct {
 
     /// Enter on a settings row: cycle to the next value, apply in memory and
     /// persist to settings.json (pi settings-selector semantics).
-    fn cycleSetting(self: *TUI, idx: usize) void {
-        const kinds = settingsKinds();
-        if (idx >= kinds.len) return;
-        const cfg = self.cfg orelse return;
-        switch (kinds[idx]) {
-            .autocompact => {
-                cfg.compaction.enabled = !cfg.compaction.enabled;
-            },
-            .reserve_tokens => {
-                const choices = &[_]usize{ 8192, 16384, 32768, 65536 };
-                cfg.compaction.reserve_tokens = @intCast(nextSettingChoice(choices, cfg.compaction.reserve_tokens));
-            },
-            .keep_recent => {
-                const choices = &[_]usize{ 4096, 10000, 20000, 40000 };
-                cfg.compaction.keep_recent_tokens = @intCast(nextSettingChoice(choices, cfg.compaction.keep_recent_tokens));
-            },
-            .default_model => {
-                if (cfg.models.items.len > 0) {
-                    // Find current default position, then advance (wrap).
-                    var pos: usize = 0;
-                    for (cfg.models.items, 0..) |m, i| {
-                        if (cfg.default_provider != null and cfg.default_model != null and
-                            std.mem.eql(u8, m.provider, cfg.default_provider.?) and
-                            std.mem.eql(u8, m.id, cfg.default_model.?))
-                        {
-                            pos = i;
-                            break;
-                        }
-                    }
-                    const nm = &cfg.models.items[(pos + 1) % cfg.models.items.len];
-                    cfg.setDefaultProviderModel(self.alloc, nm.provider, nm.id) catch {};
-                }
-            },
-        }
-        cfg.persistSettings(self.alloc, self.io) catch |err| {
-            self.note("settings save failed: {s}", .{@errorName(err)});
-        };
-        _ = self.settingsLabels(); // refresh descs
-    }
-
     /// /debug (pi handleDebugCommand): dump terminal size, every scrollback
     /// row with its visible width, and the session messages (JSONL) to a log
     /// file; report the path.
@@ -2510,7 +2781,11 @@ pub const TUI = struct {
         // list and a key-hint footer below (pi TrustSelectorComponent frame).
         const trust_head: usize = if (self.menu_mode == .trust) 4 else 0;
         const trust_foot: usize = if (self.menu_mode == .trust) 1 else 0;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot;
+        // Settings selector (pi SettingsSelectorComponent): renders inside
+        // the editor borders — search line (the editor), blank, up to 10
+        // item rows, scroll count, blank, wrapped description, hint.
+        const settings_h: usize = if (self.menu_mode == .settings) self.settingsViewHeight(editor_h) else 0;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -2604,6 +2879,13 @@ pub const TUI = struct {
         while (frame.items.len < transcript_h + 1 + editor_h) {
             const blank = self.alloc.dupe(u8, "") catch return;
             frame.append(self.alloc, blank) catch return;
+        }
+
+        // 3.5 Settings selector view (pi SettingsList.renderMainList):
+        // blank, item rows (label padded to min(36, widest) + two spaces +
+        // value), scroll count, blank, wrapped description, hint line.
+        if (self.menu_mode == .settings and settings_h > 0) {
+            self.renderSettingsView(&frame, editor_h, settings_h);
         }
 
         // 4. Bottom border.
@@ -6199,27 +6481,77 @@ pub const TUI = struct {
                 }
                 continue; // swallow everything else while the selector is open
             }
+            var settings_vbuf: [64]u8 = undefined;
             if (self.menu_mode == .settings) {
-                // Modal settings selector: only menu keys respond.
+                // Settings selector (pi SettingsSelectorComponent): the
+                // editor line is the search input; arrows navigate; Enter/
+                // Space cycles the value; Esc cancels. Printable keys and
+                // backspace edit the search.
                 if (self.bindings.matches(key, .menu_up)) {
-                    self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
+                    if (self.settings_sel > 0) self.settings_sel -= 1;
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_down)) {
-                    self.menu_selected = if (self.menu_selected + 1 >= self.menu_len) 0 else self.menu_selected + 1;
+                    if (self.settings_sel + 1 < self.settings_visible) self.settings_sel += 1;
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_close)) {
                     self.menu_mode = .hidden;
+                    self.editor.clear() catch {};
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_confirm)) {
-                    const should_exit = self.menuActivate();
-                    if (should_exit) break;
+                    if (self.settings_visible > 0) {
+                        const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
+                        if (self.settingsApplyNext(def)) {
+                            self.note("{s} set to {s}", .{ def.label, self.settingsCurrentValue(def, &settings_vbuf) });
+                        } else {
+                            self.note("{s}: not implemented yet", .{def.label});
+                        }
+                    }
                     self.redraw();
                     continue;
                 }
-                continue; // swallow everything else while the dialog is open
+                // Space also cycles (pi Enter/Space to change).
+                if (key == .space) {
+                    if (self.settings_visible > 0) {
+                        const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
+                        if (self.settingsApplyNext(def)) {
+                            self.note("{s} set to {s}", .{ def.label, self.settingsCurrentValue(def, &settings_vbuf) });
+                        } else {
+                            self.note("{s}: not implemented yet", .{def.label});
+                        }
+                    }
+                    self.redraw();
+                    continue;
+                }
+                if (key == .backspace) {
+                    // Backspace: drop the last search character.
+                    const t = self.editor.getText() catch "";
+                    if (t.len > 0) {
+                        const cut = t[t.len - 1] & 0x7f;
+                        _ = cut;
+                        self.editor.replaceRange(t.len - 1, t.len, "") catch {};
+                        self.settingsRefilter();
+                        self.settings_sel = 0;
+                    }
+                    self.redraw();
+                    continue;
+                }
+                switch (key) {
+                    .char => |c| {
+                        // Printable: append to the search line and refilter.
+                        if (!c.ctrl and !c.alt and c.c >= 0x20 and c.c != 127) {
+                            self.editor.insertChar(c.c) catch {};
+                            self.settingsRefilter();
+                            self.settings_sel = 0;
+                            self.redraw();
+                            continue;
+                        }
+                    },
+                    else => {},
+                }
+                continue; // swallow everything else while the selector is open
             }
             if (self.menu_mode == .sessions or self.menu_mode == .tree or self.menu_mode == .forksel) {
                 // Modal session/tree pickers (pi SessionSelector/
@@ -6461,19 +6793,6 @@ pub const TUI = struct {
 
 /// Visible line count of a scrollback block: the blocks are '\n'-joined rows
 /// (appendTranscript splits them the same way).
-const SettingsKind = enum { autocompact, reserve_tokens, keep_recent, default_model };
-
-fn settingsKinds() []const SettingsKind {
-    return &.{ .autocompact, .reserve_tokens, .keep_recent, .default_model };
-}
-
-fn nextSettingChoice(choices: []const usize, current: usize) usize {
-    for (choices, 0..) |c, i| {
-        if (c == current) return choices[(i + 1) % choices.len];
-    }
-    return choices[0];
-}
-
 pub fn countLines(block: []const u8) usize {
     var n: usize = 1;
     for (block) |c| {

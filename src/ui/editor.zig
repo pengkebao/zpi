@@ -140,9 +140,21 @@ pub const Editor = struct {
             out.deinit(self.alloc);
         }
         const w: u32 = @intCast(width);
-        for (self.lines.items) |line| {
-            const wrapped = wrapLine(self.alloc, line, w) catch return error.OutOfMemory;
-            for (wrapped) |vl| out.append(self.alloc, vl) catch return error.OutOfMemory;
+        // pi editor renders a "> " prompt on the first visual line and two
+        // spaces on continuation lines; wrapping happens inside that inset.
+        const inner_w: u32 = if (w > 2) w - 2 else 1;
+        for (self.lines.items, 0..) |line, li| {
+            const wrapped = wrapLine(self.alloc, line, inner_w) catch return error.OutOfMemory;
+            const prefix: []const u8 = if (li == 0) "> " else "  ";
+            for (wrapped, 0..) |vl, vi| {
+                const row = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+                    if (vi == 0) prefix else (if (li == 0) "  " else "  "),
+                    vl,
+                    "",
+                });
+                out.append(self.alloc, row) catch return error.OutOfMemory;
+                self.alloc.free(vl);
+            }
             self.alloc.free(wrapped);
         }
         return out;
@@ -174,14 +186,14 @@ pub const Editor = struct {
             const vl = wrapped[vline];
             if (self.cursor_col <= byte_offset + vl.len) {
                 const col_in_vl = self.cursor_col - byte_offset;
-                const col = wmod.visualWidth(vl[0..col_in_vl]);
+                const col = wmod.visualWidth(vl[0..col_in_vl]) + 2; // "> " prompt inset
                 return .{ .row = row + vline, .col = col };
             }
             byte_offset += vl.len;
         }
         // Cursor at the very end; place at the end of the last visual line.
         const last = wrapped[wrapped.len - 1];
-        return .{ .row = row + @as(u32, @intCast(wrapped.len - 1)), .col = wmod.visualWidth(last) };
+        return .{ .row = row + @as(u32, @intCast(wrapped.len - 1)), .col = wmod.visualWidth(last) + 2 };
     }
 
     /// Handle a key. Returns `.submit` if the user pressed Enter to submit.
