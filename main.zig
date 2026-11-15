@@ -8,6 +8,9 @@ const agent = @import("src/core/agent.zig");
 const ai = @import("src/ai/openai.zig");
 const tools = @import("src/tools/registry.zig");
 const trust = @import("src/core/trust.zig");
+const events = @import("src/core/events.zig");
+const hooks = @import("src/core/hooks.zig");
+const command_tools = @import("src/tools/command_tools.zig");
 const selection = @import("src/tools/selection.zig");
 const tui = @import("src/ui/tui.zig");
 const ss = @import("src/core/session_store.zig");
@@ -320,6 +323,8 @@ const TrustReloadCtx = struct {
     mcp_mgr: *?*mcp.Manager,
     exclude_list: ?[]const []const u8,
     mcp_allowlist: ?[]const []const u8,
+    hooks_cfg: *hooks.HooksConfig,
+    bus: *events.Bus,
 };
 
 fn trustReloadCb(ctx_ptr: *anyopaque, t: *tui.TUI, trusted: bool) void {
@@ -382,7 +387,49 @@ fn trustReloadCb(ctx_ptr: *anyopaque, t: *tui.TUI, trusted: bool) void {
     }
     // Project MCP tools may be searchable — keep tool_search available.
     _ = ctx.registry.setActive("tool_search", true);
+
+    // Reload hooks (project hooks.json now included) and re-register the
+    // command tools (project settings may add more).
+    hooks.freeConfig(alloc, ctx.hooks_cfg);
+    ctx.hooks_cfg.* = hooks.loadConfig(alloc, ctx.io, ctx.cfg.base_dir, ctx.cwd_abs, true) catch ctx.hooks_cfg.*;
+    for (ctx.cfg.command_tools) |*ct| {
+        ctx.registry.register(.{
+            .name = ct.name,
+            .description = ct.description,
+            .parameters_json = ct.schema_json,
+            .execute = command_tools.execute,
+            .exposure = "direct",
+            .active = true,
+        }) catch continue;
+    }
+    command_tools.setGlobal(ctx.cfg.command_tools);
 }
+
+/// Events -> hooks.json scripts (Phase I2 bridge). Synchronous; runs on the
+/// caller's thread (tool worker threads for tool events — safe, hooks are
+/// short-lived subprocesses).
+const HooksListener = struct {
+    cfg: *hooks.HooksConfig,
+    io: std.Io,
+    cwd: []const u8,
+
+    fn onEvent(ctx: *anyopaque, event: events.Event, bus_alloc: std.mem.Allocator) ?[]const u8 {
+        const self: *HooksListener = @ptrCast(@alignCast(ctx));
+        switch (event) {
+            .pre_tool_call => |p| {
+                return hooks.preToolCall(self.cfg, bus_alloc, self.io, p.name, p.args_json, self.cwd);
+            },
+            .post_tool_call => |p| {
+                hooks.postToolCall(self.cfg, bus_alloc, self.io, p.name, p.args_json, p.result, self.cwd);
+                return null;
+            },
+            .input => |text| {
+                return hooks.runPayloadSection(self.cfg.input, bus_alloc, self.io, "input", text, self.cwd);
+            },
+            else => return null,
+        }
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -905,6 +952,36 @@ pub fn main(init: std.process.Init) !void {
         alloc.destroy(m);
     };
 
+    // ---- Phase I: event bus + hooks.json + command tools ----
+    var ev_bus = events.Bus.init(alloc);
+    defer ev_bus.deinit();
+    var hooks_cfg = hooks.loadConfig(
+        alloc,
+        io,
+        cfg.base_dir,
+        cwd_abs,
+        project_trusted,
+    ) catch hooks.HooksConfig{};
+    defer hooks.freeConfig(alloc, &hooks_cfg);
+    var hooks_listener = HooksListener{ .cfg = &hooks_cfg, .io = io, .cwd = cwd_abs };
+    ev_bus.add(.{ .ctx = &hooks_listener, .onEvent = HooksListener.onEvent }) catch {};
+    events.setGlobal(&ev_bus);
+
+    // Command tools (Phase I1): register each declared shell command.
+    for (cfg.command_tools) |*ct| {
+        registry.register(.{
+            .name = ct.name,
+            .description = ct.description,
+            .parameters_json = ct.schema_json,
+            .execute = command_tools.execute,
+            .exposure = "direct",
+            .active = true,
+        }) catch continue;
+    }
+    command_tools.setGlobal(cfg.command_tools);
+
+    ev_bus.emit(.session_start);
+
     // Trust reload hook state (kept on main's stack; the TUI prompt calls it
     // when the user trusts a project at startup or via /trust).
     var trust_reload = TrustReloadCtx{
@@ -918,6 +995,8 @@ pub fn main(init: std.process.Init) !void {
         .mcp_mgr = &mcp_mgr,
         .exclude_list = exclude_list,
         .mcp_allowlist = mcp_allowlist,
+        .hooks_cfg = &hooks_cfg,
+        .bus = &ev_bus,
     };
 
     // ---- Initial prompt assembly (pi buildInitialMessage) ----

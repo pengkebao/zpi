@@ -396,9 +396,9 @@ rpi 扩展系统             →  src/ext/                   (扩展点、钩子
 
 ### Phase I — 扩展系统（~1.5k 行，零依赖方案）
 > 决策（已定）：**不用内嵌解释器，不 vendor QuickJS**。扩展 = 声明式配置 + 钩子脚本 + 编译期注册三层，覆盖 pi 扩展 80% 实用场景。
-- [ ] I1 命令工具（command tools）：settings 里声明 `{name, command, description, schema}`，包装 shell 命令为 LLM 可调工具
-- [ ] I2 钩子（hooks）：`hooks.json` 声明 pre/post 工具执行脚本（stdin 收 JSON、exit code/输出可 block/修改），覆盖权限门、路径保护、git checkpoint 类需求
-- [ ] I3 事件总线（内部）：session_start/tool_call/input/compaction 统一事件，为 I1/I2 和内置扩展提供同一挂载点
+- [x] I1 命令工具：settings/项目 `.pi/settings.json` 的 `"commandTools": [{name, command, description, schema}]`（`src/tools/command_tools.zig`）——JSON args 走 stdin、stdout（4KB cap）即结果、非零 exit = is_error（含 stderr）；名字校验 `[A-Za-z0-9_]`、重名后者覆盖（global→项目合并）；exposure=direct
+- [x] I2 钩子（hooks）：`<agent>/hooks.json` + 项目 `.pi/hooks.json`（**trust 门控**，条目合并）（`src/core/hooks.zig`）——`pre_tool_call`/`post_tool_call`（可 `tools` 过滤、`timeout_ms` 100-120s 默认 10s）/`input`/`session_start`/`compaction`；stdin 收 JSON payload（tool/args/result/text/cwd）；**exit 2 = block**（stderr 即给模型的 reason）、exit 0 = 放行、其它 = 非阻断错误；实现 = spawn + `Io.File.MultiReader` drain（fill timeout 到点 kill）+ stderr 读端关闭后置 null（BADF 教训）；agent `execToolTimed` 头部 pre（block → "blocked by hook: <reason>" is_error）+ 尾部 post
+- [x] I3 事件总线（`src/core/events.zig`）：session_start / pre_tool_call（可 block，first-reason-wins）/ post_tool_call / input（TUI submit，block = 拦截输入 + note）/ compaction（runCompaction）；同步监听器列表 + 全局 handle（setGlobal）；hooks 引擎以 listener 形态挂接（I4 内置扩展形态的同一挂载点）
 - [ ] I4 编译期扩展点：仓库内 `src/ext/builtin/` 模块 comptime 注册（对齐 pi 的 `builtin:mcp` 模式），功能以“内置扩展”形态交付
 - [ ] I5 资源打包即扩展：skills/prompts/themes/hooks 目录本身可分发（配合 K4 package 安装）
 - [ ] ~~codemode~~：**砍掉**（需 C 解释器）。其核心价值改为原生实现：**并行工具执行**（独立 tool call 线程池并发 + 按 id 归位），归入 A 阶段

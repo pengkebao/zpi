@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const compact = @import("compaction.zig");
+const command_tools = @import("../tools/command_tools.zig");
 
 /// Model thinking/reasoning effort level. Drives the TUI border color (pi's
 /// theme maps each level to a color: off=gray, low=blue, medium=indigo,
@@ -98,6 +99,14 @@ pub const Config = struct {
     /// "never" — what to do when a project has trust-gated resources and no
     /// saved decision.
     default_project_trust: DefaultProjectTrust = .ask,
+    /// settings.json "commandTools" (Phase I1): shell commands exposed to
+    /// the model as tools. Owned; merged across global + project settings.
+    command_tools: []command_tools.CommandTool = &.{},
+
+    pub fn deinitCommandTools(self: *Config, alloc: std.mem.Allocator) void {
+        command_tools.freeAll(alloc, self.command_tools);
+        self.command_tools = &.{};
+    }
 
     pub const Model = struct {
         provider: []u8,
@@ -132,6 +141,7 @@ pub const Config = struct {
     };
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
+        command_tools.freeAll(alloc, self.command_tools);
         for (self.models.items) |m| {
             alloc.free(m.provider);
             alloc.free(m.id);
@@ -266,6 +276,34 @@ pub const Config = struct {
             if (numIn(obj, "reserveTokens")) |n| self.compaction.reserve_tokens = @intCast(n);
             if (numIn(obj, "keepRecentTokens")) |n| self.compaction.keep_recent_tokens = @intCast(n);
             self.compaction.enabled = boolIn(obj, "enabled", self.compaction.enabled);
+        }
+        // commandTools (Phase I1): merged — project entries append to the
+        // global ones (names later in the list shadow earlier duplicates).
+        if (root.get("commandTools")) |_| {
+            const extra = command_tools.parseSettings(alloc, root);
+            // NOTE: entries are MOVED into the merged list below — do NOT
+            // freeAll(extra) here (the strings now belong to cfg).
+            var merged = std.array_list.Managed(command_tools.CommandTool).init(alloc);
+            merged.appendSlice(self.command_tools) catch return;
+            for (extra) |e| {
+                // skip same-name duplicates (later wins — free the old entry)
+                var replaced = false;
+                for (merged.items) |*m| {
+                    if (std.mem.eql(u8, m.name, e.name)) {
+                        alloc.free(m.command);
+                        alloc.free(m.description);
+                        alloc.free(m.schema_json);
+                        m.* = e;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) merged.append(e) catch {};
+            }
+            // entries moved into `merged`; drop the extra shell list
+            if (extra.len > 0) alloc.free(extra);
+            if (self.command_tools.len > 0) alloc.free(self.command_tools);
+            self.command_tools = merged.toOwnedSlice() catch &.{};
         }
     }
 

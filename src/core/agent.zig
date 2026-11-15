@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const msg = @import("message.zig");
 const ai = @import("../ai/openai.zig");
+const events = @import("events.zig");
 const tools = @import("../tools/registry.zig");
 const config = @import("config.zig");
 const ss = @import("session_store.zig");
@@ -438,6 +439,7 @@ pub const Session = struct {
     /// Run (or force) a compaction. Returns the context size before it, or
     /// null when nothing was compacted. `custom` optionally focuses the summary.
     pub fn runCompaction(self: *Session, custom: ?[]const u8) !?u64 {
+        if (events.getGlobal()) |bus| bus.emit(.compaction);
         const st = self.store orelse return null;
         const msgs = self.context.messages.items;
         const L: usize = msgs.len;
@@ -879,10 +881,34 @@ pub const Session = struct {
         out.* = self.execToolTimed(tc.name, tc.arguments);
     }
 
-    /// execTool with the wall time filled in.
+    /// execTool with the wall time filled in. The pre_tool_call hook (Phase
+    /// I2) may BLOCK the call — the model then receives the hook's reason as
+    /// a tool error; post_tool_call runs observe-only.
     fn execToolTimed(self: *Session, name: []const u8, args_json: []const u8) tools.ToolResult {
         const start = ss.nowMs(self.io);
+        if (events.getGlobal()) |bus| {
+            if (bus.emitBlocking(.{ .pre_tool_call = .{ .name = name, .args_json = args_json } })) |reason| {
+                // The hook's reason (hook stderr) is fed back to the model
+                // (Claude Code semantics: exit 2 stderr becomes the error).
+                const blocked = std.fmt.allocPrint(
+                    self.alloc,
+                    "blocked by hook: {s}",
+                    .{reason},
+                ) catch std.fmt.allocPrint(self.alloc, "blocked by hook", .{}) catch "";
+                bus.alloc.free(reason);
+                return .{ .content = blocked, .is_error = true, .duration_ms = 0 };
+            }
+        }
         var result = self.execTool(name, args_json);
+        if (events.getGlobal()) |bus| {
+            bus.emit(.{ .post_tool_call = .{
+                .name = name,
+                .args_json = args_json,
+                .result = result.content,
+                .is_error = result.is_error,
+                .duration_ms = @intCast(ss.nowMs(self.io) - start),
+            } });
+        }
         const elapsed = ss.nowMs(self.io) - start;
         result.duration_ms = if (elapsed > 0) @intCast(elapsed) else 0;
         return result;

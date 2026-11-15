@@ -17,6 +17,7 @@ const shell = @import("../tools/shell.zig");
 const clipboard = @import("../core/clipboard.zig");
 const ptmod = @import("../core/prompt_template.zig");
 const trust = @import("../core/trust.zig");
+const events = @import("../core/events.zig");
 const fuzzy = @import("fuzzy.zig");
 const compact = @import("../core/compaction.zig");
 const skills = @import("../core/skills.zig");
@@ -4991,9 +4992,9 @@ pub const TUI = struct {
     /// the output callback while the turn runs (boxes appear as tools finish)
     /// and once more when it ends.
     fn drainTurnEvents(self: *TUI) void {
-        const events = self.session.takeTurnEvents();
-        defer self.session.alloc.free(events);
-        for (events) |ev| {
+        const turn_events = self.session.takeTurnEvents();
+        defer self.session.alloc.free(turn_events);
+        for (turn_events) |ev| {
             switch (ev) {
                 .thinking => |t| {
                     defer self.session.alloc.free(t);
@@ -5016,7 +5017,7 @@ pub const TUI = struct {
                 },
             }
         }
-        if (events.len == 0) return;
+        if (turn_events.len == 0) return;
         // The usage totals moved with the round that just finished. This is
         // the main thread, so the session is safe to read.
         const stats = self.computeFooterStats();
@@ -6089,6 +6090,16 @@ pub const TUI = struct {
                 if (input.len > 0) {
                     self.editor.addToHistory(input);
                     self.editor.clear() catch {};
+                    // Phase I3: the input event (hooks.json "input" scripts).
+                    if (events.getGlobal()) |bus| {
+                        if (bus.emitBlocking(.{ .input = input })) |reason| {
+                            bus.alloc.free(reason);
+                            self.note("input blocked by hook", .{});
+                            self.redraw();
+                            self.alloc.free(input);
+                            continue;
+                        }
+                    }
                     if (std.mem.startsWith(u8, input, "/")) {
                         const should_exit = self.handleCommand(input);
                         self.alloc.free(input);
