@@ -7728,7 +7728,7 @@ pub const TUI = struct {
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_down)) {
-                    if (self.menu_selected + 1 < self.menu_len) self.menu_selected += 1;
+                    self.menu_selected = if (self.menu_selected + 1 >= self.menu_len) 0 else self.menu_selected + 1;
                     self.redraw();
                     continue;
                 } else if (key == .page_up or key == .page_down) {

@@ -337,13 +337,9 @@ fn trustReloadCb(ctx_ptr: *anyopaque, t: *tui.TUI, trusted: bool) void {
     }
     // Rebuild the MCP manager with the project file included (pi loads
     // project mcp.json only for trusted projects).
-    if (ctx.mcp_mgr.*) |old| {
-        mcp.Manager.setGlobal(null);
-        old.deinit();
-        alloc.destroy(old);
-        ctx.mcp_mgr.* = null;
-    }
-    // Drop previously registered MCP tools (user-level ones come back below).
+    // Drop previously registered MCP tools FIRST (their name/desc slices
+    // live inside the manager; it must not be freed while we still match
+    // against them), then tear the manager down.
     const PrefixMatch = struct {
         fn pred(patterns: []const []const u8, name: []const u8) bool {
             return std.mem.startsWith(u8, name, patterns[0]);
@@ -358,6 +354,12 @@ fn trustReloadCb(ctx_ptr: *anyopaque, t: *tui.TUI, trusted: bool) void {
     const mcp_prefix: []const u8 = "mcp__";
     ctx.registry.removeMatchingOn(&.{mcp_prefix}, PrefixMatch.pred);
     ctx.registry.removeMatchingOn(&.{"resource"}, ResourceMatch.pred);
+    if (ctx.mcp_mgr.*) |old| {
+        mcp.Manager.setGlobal(null);
+        old.deinit();
+        alloc.destroy(old);
+        ctx.mcp_mgr.* = null;
+    }
     blk: {
         const mgr = alloc.create(mcp.Manager) catch break :blk;
         mgr.* = mcp.Manager.init(alloc, ctx.io);
