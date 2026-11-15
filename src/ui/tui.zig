@@ -467,6 +467,53 @@ pub const TUI = struct {
     settings_filtered: [SETTING_DEFS.len]usize = undefined,
     settings_visible: usize = 0,
     settings_sel: usize = 0,
+    /// Placeholder settings: current index into their values array (backed
+    /// settings use real fields; these cycle in-session until their
+    /// subsystems exist, then persist like pi).
+    placeholder_idx: [SETTING_DEFS.len]u8 = blk: {
+        var idx: [SETTING_DEFS.len]u8 = undefined;
+        for (SETTING_DEFS, 0..) |def, i| {
+            // Default = the pi default for that setting (first value whose
+            // text matches the documented default; compute lazily below by
+            // scanning for the known defaults).
+            idx[i] = 0;
+            for (def.values, 0..) |v, vi| {
+                const is_default = switch (def.kind) {
+                    .show_images => std.mem.eql(u8, v, "true"),
+                    .image_width => std.mem.eql(u8, v, "60"),
+                    .auto_resize_images => std.mem.eql(u8, v, "true"),
+                    .block_images => std.mem.eql(u8, v, "false"),
+                    .show_hardware_cursor => std.mem.eql(u8, v, "false"),
+                    .editor_padding => std.mem.eql(u8, v, "0"),
+                    .output_padding => std.mem.eql(u8, v, "1"),
+                    .clear_on_shrink => std.mem.eql(u8, v, "false"),
+                    .terminal_progress => std.mem.eql(u8, v, "false"),
+                    .transport => std.mem.eql(u8, v, "auto"),
+                    .share_destination => std.mem.eql(u8, v, "auto"),
+                    .http_idle_timeout => std.mem.eql(u8, v, "default"),
+                    .cache_warming => std.mem.eql(u8, v, "off"),
+                    .mermaid => std.mem.eql(u8, v, "off"),
+                    .cache_miss_notices => std.mem.eql(u8, v, "false"),
+                    .collapse_changelog => std.mem.eql(u8, v, "true"),
+                    .quiet_startup => std.mem.eql(u8, v, "false"),
+                    .install_telemetry => std.mem.eql(u8, v, "false"),
+                    .double_escape => std.mem.eql(u8, v, "none"),
+                    .tree_filter => std.mem.eql(u8, v, "all"),
+                    .warnings => std.mem.eql(u8, v, "true"),
+                    .model_thinking => std.mem.eql(u8, v, "none"),
+                    .tui_mode => std.mem.eql(u8, v, "fullscreen"),
+                    .fs_exit_output => std.mem.eql(u8, v, "transcript"),
+                    .theme => std.mem.eql(u8, v, "dark"),
+                    else => false,
+                };
+                if (is_default) {
+                    idx[i] = @intCast(vi);
+                    break;
+                }
+            }
+        }
+        break :blk idx;
+    },
     /// Backed settings fields (see settingsApply).
     skill_commands: bool = true,
     steering_mode_all: bool = true,
@@ -1187,10 +1234,7 @@ pub const TUI = struct {
                 // pi SettingsList: Enter/Space cycles the selected value
                 // silently (the row already shows the new value).
                 if (self.settings_visible > 0) {
-                    const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
-                    if (!self.settingsApplyNext(def)) {
-                        self.note("{s}: not implemented yet", .{def.label});
-                    }
+                    _ = self.settingsApplyNext(SETTING_DEFS[self.settings_filtered[self.settings_sel]]);
                 }
                 return false;
             },
@@ -1416,40 +1460,16 @@ pub const TUI = struct {
         const cfg = self.cfg;
         return switch (def.kind) {
             .autocompact => if (cfg) |c| (if (c.compaction.enabled) "true" else "false") else "true",
-            .show_images => "true",
-            .image_width => "60",
-            .auto_resize_images => "true",
-            .block_images => "false",
             .skill_commands => if (self.skill_commands) "true" else "false",
-            .show_hardware_cursor => "false",
-            .editor_padding => "0",
-            .output_padding => "1",
             .autocomplete_max => std.fmt.bufPrint(buf, "{d}", .{self.autocomplete_max}) catch "5",
-            .clear_on_shrink => "false",
-            .terminal_progress => "false",
             .steering_mode => if (self.steering_mode_all) "all" else "one-at-a-time",
             .follow_up_mode => if (self.follow_up_mode_all) "all" else "one-at-a-time",
-            .transport => "auto",
-            .share_destination => "auto",
-            .http_idle_timeout => "default",
-            .cache_warming => "off",
             .hide_thinking => if (self.thinking_hidden) "true" else "false",
-            .mermaid => "off",
-            .cache_miss_notices => "false",
-            .collapse_changelog => "true",
-            .quiet_startup => "false",
-            .install_telemetry => "false",
             .default_project_trust => if (cfg) |c| switch (c.default_project_trust) {
                 .ask => "Ask",
                 .always => "Always trust",
                 .never => "Never trust",
             } else "Ask",
-            .double_escape => "none",
-            .tree_filter => "all",
-            .warnings => "true",
-            .model_thinking => "none",
-            .tui_mode => "fullscreen",
-            .fs_exit_output => "transcript",
             .fs_scrollbar => if (cfg) |c| switch (c.fullscreen_scrollbar) {
                 .auto => "auto",
                 .always => "always",
@@ -1464,7 +1484,14 @@ pub const TUI = struct {
                 }
                 break :blk_wl "auto";
             },
-            .theme => "dark",
+            // Placeholder settings cycle in-session (pi backs all of them;
+            // rpi persists them once their subsystems exist).
+            else => blk_ph: {
+                for (SETTING_DEFS, 0..) |d, i| {
+                    if (d.kind == def.kind) break :blk_ph def.values[self.placeholder_idx[i]];
+                }
+                break :blk_ph def.values[0];
+            },
         };
     }
 
@@ -1485,6 +1512,28 @@ pub const TUI = struct {
         const next = def.values[if (found) (pos + 1) % def.values.len else 0];
         const cfg = self.cfg;
         switch (def.kind) {
+            // Placeholder settings cycle their in-session value (pi backs
+            // all of these; rpi persists them once the subsystems exist).
+            .show_images, .image_width, .auto_resize_images, .block_images,
+            .show_hardware_cursor, .editor_padding, .output_padding,
+            .clear_on_shrink, .terminal_progress, .transport,
+            .share_destination, .http_idle_timeout, .cache_warming, .mermaid,
+            .cache_miss_notices, .collapse_changelog, .quiet_startup,
+            .install_telemetry, .double_escape, .tree_filter, .warnings,
+            .model_thinking, .tui_mode, .fs_exit_output, .theme => {
+                for (SETTING_DEFS, 0..) |d, i| {
+                    if (d.kind == def.kind) {
+                        for (def.values, 0..) |v, vi| {
+                            if (std.mem.eql(u8, v, next)) {
+                                self.placeholder_idx[i] = @intCast(vi);
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                return true;
+            },
             .autocompact => {
                 const on = std.mem.eql(u8, next, "true");
                 if (cfg) |c| c.compaction.enabled = on;
@@ -1523,8 +1572,6 @@ pub const TUI = struct {
                     c.fullscreen_wheel_lines = if (std.mem.eql(u8, next, "auto")) null else std.fmt.parseInt(u16, next, 10) catch null;
                 }
             },
-            // tui_mode/theme/etc: rpi cannot back these yet.
-            else => return false,
         }
         if (cfg) |c| c.persistSettings(self.alloc, self.io) catch {};
         return true;
@@ -6537,10 +6584,7 @@ pub const TUI = struct {
                 } else if (self.bindings.matches(key, .menu_confirm)) {
                     // pi applies silently — the row's value already shows it.
                     if (self.settings_visible > 0) {
-                        const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
-                        if (!self.settingsApplyNext(def)) {
-                            self.note("{s}: not implemented yet", .{def.label});
-                        }
+                        _ = self.settingsApplyNext(SETTING_DEFS[self.settings_filtered[self.settings_sel]]);
                     }
                     self.redraw();
                     continue;
@@ -6548,10 +6592,7 @@ pub const TUI = struct {
                 // Space also cycles (pi Enter/Space to change).
                 if (key == .space) {
                     if (self.settings_visible > 0) {
-                        const def = SETTING_DEFS[self.settings_filtered[self.settings_sel]];
-                        if (!self.settingsApplyNext(def)) {
-                            self.note("{s}: not implemented yet", .{def.label});
-                        }
+                        _ = self.settingsApplyNext(SETTING_DEFS[self.settings_filtered[self.settings_sel]]);
                     }
                     self.redraw();
                     continue;
