@@ -5514,16 +5514,25 @@ pub const TUI = struct {
         }
         // Onboarding line preceded by a blank row (pi BuiltInHeader layout).
         w.appendSlice(self.alloc, "\n\x1b[2mzpi can explain its own features and look up its docs. Ask it how to use or extend zpi.\x1b[0m\n") catch return null;
-        // Model scope notice (pi getModelScopeNotice): dim list + cycle hint.
-        if (self.scoped_models) |sm| {
-            if (sm.items.len > 0) {
-                w.appendSlice(self.alloc, "\x1b[2mModel scope: ") catch return null;
-                for (sm.items, 0..) |m, i| {
+        // Model scope notice (pi getModelScopeNotice): the Ctrl+P cycle set —
+        // scoped models when /scoped-models is set, else every configured
+        // model id (pi shows sm.model.id) — dim + cycle hint.
+        const has_scope = self.scoped_models != null and self.scoped_models.?.items.len > 0;
+        const all_count = if (self.cfg) |c| c.models.items.len else 0;
+        if (has_scope or all_count > 0) {
+            w.appendSlice(self.alloc, "\x1b[2mModel scope: ") catch return null;
+            if (has_scope) {
+                for (self.scoped_models.?.items, 0..) |m, i| {
                     if (i > 0) w.appendSlice(self.alloc, ", ") catch return null;
                     w.appendSlice(self.alloc, m) catch return null;
                 }
-                w.appendSlice(self.alloc, " (ctrl+p to cycle)\x1b[0m\n") catch return null;
+            } else if (self.cfg) |c| {
+                for (c.models.items, 0..) |m, i| {
+                    if (i > 0) w.appendSlice(self.alloc, ", ") catch return null;
+                    w.appendSlice(self.alloc, m.id) catch return null;
+                }
             }
+            w.appendSlice(self.alloc, " (ctrl+p to cycle)\x1b[0m\n") catch return null;
         }
         // Loaded resources (pi showLoadedResources): [Skills] and [Prompts]
         // compact name lists; expanded adds each entry's path.
