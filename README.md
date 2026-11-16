@@ -1,16 +1,32 @@
-# zpi — pi 的 Zig 实现
+# zpi
 
-纯 Zig（仅 std，零第三方依赖）实现的终端编程智能体，行为对齐 [pi](https://pi.dev) 1.5.0。
+> 一个用纯 Zig 写的终端编程智能体 —— [pi](https://pi.dev) 1.5.0 的行为级重实现
+
+![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/tests-430%2B-brightgreen)
+
+**零第三方依赖 · 单二进制 · 与 pi 配置/会话双向兼容**
+
+zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP 工具生态、技能与提示模板、会话树与压缩 —— 用 Zig 标准库从零实现。没有 Node，没有运行时，编译产物就是一个可以扔进 `$PATH` 的可执行文件。
+
+## 为什么是 Zig
+
+- **零依赖**：仅 `std`，不引任何第三方包。所有协议解析（SSE / JSON / ANSI / MCP）均为手写实现
+- **单二进制**：`zig build` 产出一个静态倾向的可执行文件，拷贝即用
+- **性能**：ReleaseFast 构建 ~3MB；渲染路径为帧预算精确设计（增量 markdown 渲染、DECSTBM 原生滚动、差分帧）
 
 ## 特性
 
 **智能体内核**
 
 - OpenAI 兼容 SSE 流式协议（text / thinking / tool_calls 增量；逐行解析，包级到达即渲染）
+- 四种线路协议：openai-completions / anthropic-messages / openai-responses / google-generative-ai
 - 工具：shell、read、edit（diff 预览）、glob 匹配、选区截断
-- 会话持久化（jsonl）+ `-c`/`-r` 继续会话（模型上下文与 TUI 界面双恢复）
+- 会话持久化（jsonl，pi 同格式）+ `-c`/`-r` 继续会话（模型上下文与 TUI 界面双恢复）
 - 上下文压缩：手动 `/compact` + 阈值自动压缩，压缩摘要块入转写
 - 成本 / 缓存命中率 / token 统计（footer 实时显示）
+- MCP 客户端：stdio + HTTP 传输、OAuth 登录、工具注册与热重载、`zpi mcp add/remove/list` 全套管理
+- 技能（Skills）与提示模板（Prompts）：pi 同款发现机制与 `SKILL.md` 格式
+- 事件总线 + hooks.json 钩子（session_start / pre_tool_call / post_tool_call / compaction）
 
 **TUI**
 
@@ -18,122 +34,28 @@
 - 屏幕层合成：滚动条（auto 显隐 + 拖拽 + 点击）、`Jump to latest message` 提示、搜索浮层
 - 流式 Markdown **块级增量渲染**（段间拼接与全量渲染逐字节一致，帧成本与流长度解耦）
 - 工具块 / thinking 块：折叠展开、点击切换单块、耗时与错误着色
-- 补全菜单（`/` 命令、模型名）、转写内搜索（高亮 + 前后导航）
+- 补全菜单（`/` 命令、模型名、`!` bash）、转写内搜索（高亮 + 前后导航）
 - 滚动体验：follow-end 钉底、滚轮加速度计、到底惰性（no-op 拉拽零字节）
 - 鼠标：点击折叠块、拖拽选区、松开复制（OSC52）、水平滚轮过滤
-- 启动欢迎头为文档首块（对齐 pi：继续会话时视窗钉底不可见）
+- 启动欢迎头：半块像素 logo、双态键位提示（Ctrl+O 展开）、Model scope、技能/模板清单 —— 与 pi 逐行对齐
 
-## 快捷键
-
-| 键 | 功能 |
-|---|---|
-| Enter | 提交 |
-| esc | 中止运行中的回合 |
-| ctrl+c | 清空编辑器；空时退出 |
-| ctrl+d | 空编辑器时退出 |
-| ctrl+z | 挂起后台（fg 恢复） |
-| shift+tab | thinking 档位循环 off→low→…→max |
-| ctrl+t | 显示/隐藏 thinking 块 |
-| ctrl+p / shift+ctrl+p | 循环切换模型（下一个 / 上一个） |
-| ctrl+l | 显示模型列表 |
-| ctrl+o | 工具输出 折叠/展开 |
-| ctrl+x | 复制选区（无选区时复制最后回复） |
-| ctrl+g | 用 $EDITOR 编辑当前输入 |
-| ctrl+↑ / ctrl+↓ | 上一条 / 下一条用户消息 |
-| ctrl+home / ctrl+end | 转写顶部 / 回到最新 |
-| pageUp / pageDown | 上翻 / 下翻（保留 4 行上下文） |
-| ctrl+shift+f | 转写内搜索（enter / ctrl+g 前后导航，esc 关闭） |
-| shift+enter / ctrl+j | 编辑器内换行 |
-| `/help` | 全部命令 |
-
-## 功能对比矩阵（pi 1.5.0 全量 vs 当前）
-
-图例：✅ 已实现 · 🚧 部分实现 · ⏳ 暂缓
-
-### 斜杠命令
-
-| 命令 | pi | zpi | 说明 |
-|---|---|---|---|
-| /help /clear /exit /quit /hotkeys | ✅ | ✅ | |
-| /model [name] | ✅ | ✅ | 模糊匹配直接切换 |
-| /thinking [level] | ✅ | ✅ | zpi 命令名 `/think` |
-| /session /name /new /tree /fork /resume | ✅ | ✅ | |
-| /compact [hint] | ✅ | ✅ | 含阈值自动压缩 |
-| /copy | ✅ | ⏳ | 键位 ctrl+x 已覆盖主要场景 |
-| /export /share | ✅ | ⏳ | |
-| /themes /settings | ✅ | ⏳ | 依赖主题/设置选择器体系 |
-| /skills /trust /login /logout /mcp | ✅ | ⏳ | 依赖技能/扩展/信任体系 |
-| /changelog /import /clone /reload /bug /debug | ✅ | ⏳ | pi 专有发布/扩展流程 |
-
-### 全局键位
-
-| pi action | pi 默认键 | zpi | 状态 |
-|---|---|---|---|
-| app.interrupt（中止） | esc | ✅ | |
-| app.clear（清空/退出） | ctrl+c | ✅ | |
-| app.exit（空时退出） | ctrl+d | ✅ | |
-| app.suspend（挂起后台） | ctrl+z | ✅ | |
-| app.thinking.cycle（档位循环） | shift+tab | ✅ | |
-| app.thinking.toggle（块显隐） | ctrl+t | ✅ | |
-| app.thinking.save（保存档位） | ctrl+s | ⏳ | |
-| app.model.cycleForward/Backward | ctrl+p / shift+ctrl+p | ✅ | |
-| app.model.select（选择器） | ctrl+l | 🚧 | 列表展示；全屏 selector 暂缓 |
-| app.tools.expand（工具输出） | ctrl+o | ✅ | |
-| app.editor.external（$EDITOR） | ctrl+g | ✅ | |
-| app.message.copy（选区/最后回复） | ctrl+x | ✅ | |
-| app.message.followUp / dequeue（排队） | alt+enter / alt+up | ✅ | 运行中排队，回合结束自动续跑 |
-| app.clipboard.pasteImage（图片粘贴） | ctrl+v | ⏳ | 需图片输入管线 |
-| app.session.toggleNamedFilter | ctrl+n | ⏳ | |
-| tui.altScreen.search（转写搜索） | ctrl+shift+f | ✅ | |
-| prompt_previous / next（用户消息跳转） | ctrl+↑↓ | ✅ | |
-| altScreen 滚动（翻页/顶底/half/line 可配） | ✓ | ✅ | |
-| app.session.new / tree / fork / resume | 未绑定（用命令） | ✅ | 同 pi，走命令 |
-| editor：kill-ring / undo | ✓ | ⏳ | 多行、history 已实现 |
-
-### 交互与渲染
-
-| 功能 | pi | zpi | 状态 |
-|---|---|---|---|
-| 差分渲染 + DECSTBM 原生滚动 + 位移检测 | ✅ | ✅ | |
-| 滚动条（auto 显隐 / 拖拽 / 点击） | ✅ | ✅ | |
-| Jump to latest message 提示 | ✅ | ✅ | |
-| 流式 markdown 块级增量渲染 | ✅ | ✅ | |
-| thinking 块折叠（全局 + 单块点击） | ✅ | ✅ | |
-| 工具块折叠 / 耗时 / 错误着色 | ✅ | ✅ | |
-| 会话继续 + 历史界面回放 | ✅ | ✅ | `-c` / `-r` |
-| 上下文压缩（手动 + 自动） | ✅ | ✅ | |
-| 补全菜单（命令 / 模型） | ✅ | ✅ | |
-| 转写搜索（高亮 / 导航） | ✅ | ✅ | |
-| 鼠标：点击折叠 / 拖选复制 / 滚轮 | ✅ | ✅ | |
-| footer（token / cost / git 分支 / cwd / 模型） | ✅ | ✅ | |
-| steering（运行中改向）+ follow-up 排队 | ✅ | ✅ | Enter 运行中改向，alt+enter 排队，alt+up 恢复 |
-| 图片输入（粘贴 / 拖放） | ✅ | ⏳ | |
-| 会话分享 / 导出 | ✅ | ⏳ | |
-| 扩展 / 技能 / MCP 体系 | ✅ | ⏳ | 架构级 |
-| 主题体系 | ✅ | ⏳ | 单主题 |
-
-## 构建
+## 快速开始
 
 ```bash
-zig build          # Zig 0.17.0
-./zig-out/bin/zpi  # 运行（REPL / TUI）
-./zig-out/bin/zpi -c        # 继续当前目录最近会话
-./zig-out/bin/zpi -p "问题"  # 单条模式（输出到 stdout）
+# 构建（Zig 0.17.0）
+zig build
+
+# 运行
+./zig-out/bin/zpi            # 交互 TUI
+./zig-out/bin/zpi -c         # 继续当前目录最近会话
+./zig-out/bin/zpi -p "问题"   # 单条模式（输出到 stdout）
 ```
 
-## 测试与基准
-
-```bash
-zig test test_ui.zig              # 181 个 UI/逻辑测试
-zig test leak_g2.zig              # 153 个泄漏回归测试
-zig run bench_scroll.zig -O ReleaseFast   # 滚动帧基准
-zig run bench_stream.zig -O ReleaseFast   # 流式帧基准
-zig run bench_markdown.zig -O ReleaseFast # markdown 渲染基准
-```
+首次在某个目录使用会提示信任确认（pi 同款 trust 机制）。
 
 ## 配置
 
-智能体目录：环境变量 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`。
+智能体目录：环境变量 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`。**与 pi 完全共享** —— 如果你已经在用 pi，无需任何迁移，zpi 直接读取你的模型、凭据、技能、提示模板与会话历史。
 
 `models.json` — 自定义提供方/模型：
 
@@ -157,17 +79,93 @@ zig run bench_markdown.zig -O ReleaseFast # markdown 渲染基准
 { "defaultProvider": "my-provider", "defaultModel": "my-model" }
 ```
 
-apiKey 支持 字面量 / `$ENV_VAR` / `!command` 三种写法；凭据回退顺序：models.json apiKey → auth.json → 内置环境变量。内置提供方（如 zai-coding-cn）凭据来自 auth.json / 环境变量。
+apiKey 支持 字面量 / `$ENV_VAR` / `!command` 三种写法；凭据回退顺序：models.json apiKey → auth.json → 内置环境变量。内置提供方（zai-coding-cn 等）定价内置于 catalog。
+
+## 快捷键
+
+| 键 | 功能 |
+|---|---|
+| Enter | 提交 |
+| esc | 中止运行中的回合 |
+| ctrl+c | 清空编辑器；空时退出 |
+| ctrl+d | 空编辑器时退出 |
+| ctrl+z | 挂起后台（fg 恢复） |
+| shift+tab | thinking 档位循环 off→low→…→max |
+| ctrl+t | 显示/隐藏 thinking 块 |
+| ctrl+p / shift+ctrl+p | 循环切换模型（下一个 / 上一个） |
+| ctrl+l | 显示模型列表 |
+| ctrl+o | 工具输出 折叠/展开（同时切换启动头形态） |
+| ctrl+x | 复制选区（无选区时复制最后回复） |
+| ctrl+g | 用 $EDITOR 编辑当前输入 |
+| ctrl+↑ / ctrl+↓ | 上一条 / 下一条用户消息 |
+| ctrl+home / ctrl+end | 转写顶部 / 回到最新 |
+| pageUp / pageDown | 上翻 / 下翻（保留 4 行上下文） |
+| ctrl+shift+f | 转写内搜索（enter / ctrl+g 前后导航，esc 关闭） |
+| shift+enter / ctrl+j | 编辑器内换行 |
+| `!cmd` | 直接运行 bash（`!!cmd` 不入上下文） |
+| `/help` | 全部命令 |
+
+## 斜杠命令
+
+常用：`/help` `/model` `/think` `/compact` `/new` `/session` `/name` `/tree` `/fork` `/resume` `/settings` `/mcp` `/skills` `/trust` `/login` `/logout` `/copy` `/export` `/share` `/themes` `/reload` `/bug` `/debug` 等 24+ 个，与 pi 1.5.0 同名同义。
+
+亮点：
+
+- **`/settings`**：pi SettingsSelectorComponent 全对齐的 35 项设置选择器（边框内渲染 + type-to-search + Enter/Space 循环值 + 即时持久化）
+- **`/mcp`**：MCP 服务器管理器（状态/工具浏览、重连、全局/项目配置），`zpi mcp add|remove|list|login|logout` 命令行全套
+- **`/model`** `/scoped-models`：模型选择器与 Ctrl+P 循环范围管理
+- **`/tree` `/fork` `/resume`**：会话树、分支继承、跨目录恢复
 
 ## 架构
 
 ```
 src/
-├── main.zig            入口（REPL / 单条 -p 模式）
-├── core/               智能体循环、会话、配置、压缩、存储
-├── ai/openai.zig       OpenAI 兼容 SSE 客户端（逐行解析，包级到达即渲染）
-├── tools/              shell / read / edit / match / selection / truncate
-└── ui/                 TUI：差分渲染、markdown、滚动视图、编辑器、搜索、补全
+├── core/               智能体循环、会话、配置、压缩、存储、MCP、事件、hooks
+├── ai/                 四协议 SSE 客户端（openai / anthropic / responses / google）
+├── tools/              shell / read / edit / match / selection / truncate / tool_search
+└── ui/                 TUI 引擎：差分渲染、markdown、滚动视图、编辑器、搜索、补全
 ```
 
-设计决策与演进记录（含完整功能审计史）见 [PLAN.md](PLAN.md)。
+零依赖解析器均为手写：SSE 逐行解码、JSON 增量读取、ANSI 序列宽度计算、MCP stdio/HTTP 传输。
+
+设计决策与完整功能审计史见 [PLAN.md](PLAN.md)。
+
+## 测试
+
+```bash
+zig test test_ui.zig              # 216 个 UI/逻辑测试
+zig test leak_g2.zig              # 176 个泄漏回归测试（SafeAllocator 全路径）
+zig test test_mcp.zig             # MCP 客户端单测
+zig run bench_scroll.zig    # 滚动帧基准
+zig run bench_stream.zig    # 流式帧基准
+zig run bench_markdown.zig  # markdown 渲染基准
+```
+
+除单测外，开发流程使用 pty + 终端模拟器（pyte）驱动真实二进制的 E2E：mock SSE LLM + mock MCP stdio server + 原始 ANSI 字节流断言。
+
+## 与 pi 的兼容性
+
+| 维度 | 兼容方式 |
+|---|---|
+| 配置 | 直接共享 `~/.pi/agent`（models.json / settings.json / auth.json） |
+| 会话 | jsonl 格式互通，`zpi -c` 可继续 pi 开的会话，反之亦然 |
+| 技能/模板 | 同一发现机制与目录布局（`skills/` `prompts/`，user + project 两级） |
+| MCP | 同一 `mcp.json` 结构与工具命名（`mcp__server__tool`） |
+| 交互 | 键位、命令、启动头、footer 均按 pi 1.5.0 源码逐行对齐 |
+
+## Roadmap
+
+- [ ] 图片输入（粘贴 / 拖放）
+- [ ] 会话分享 / 导出
+- [ ] 主题体系（多主题选择器）
+- [ ] Windows 终端支持
+- [ ] skills 校验诊断（`[Skill warnings]` 启动节）
+
+## License
+
+[MIT](LICENSE)
+
+## 联系
+
+- 邮箱：84665381@qq.com
+- Issue：[github.com/pengkebao/zpi/issues](https://github.com/pengkebao/zpi/issues)
