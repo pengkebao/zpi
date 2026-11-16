@@ -429,6 +429,9 @@ pub const TUI = struct {
     jump_hint: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Tool output fully shown instead of pi's collapsed preview (Ctrl+O).
     tools_expanded: bool = false,
+    /// Startup header scrollback index (pi BuiltInHeader: Ctrl+O also flips
+    /// the header between compact and expanded key hints).
+    welcome_idx: ?usize = null,
     /// Thinking blocks hidden (Ctrl+T).
     thinking_hidden: bool = false,
     /// Tool calls of the transcript, re-renderable (see ToolEntry).
@@ -5410,14 +5413,200 @@ pub const TUI = struct {
     /// The transcript's first block: startup header (pi: headerContainer is
     /// a child of documentContainer — it scrolls WITH the document, so a
     /// continued session only shows it at the very top, never between the
-    /// history and the input). Content follows pi's compact header: bold
-    /// wordmark + dim version, muted key hints, dim onboarding line.
+    /// history and the input). Two states share one scrollback slot and
+    /// Ctrl+O flips them (pi BuiltInHeader.setExpanded(toolOutputExpanded)):
+    /// compact = logo + one hint line + onboarding + Model scope + resource
+    /// lists; expanded = the full keybindings list plus resource paths.
     pub fn addWelcomeHeader(self: *TUI) void {
-        const text = "\x1b[1mzpi\x1b[0m" ++ FG_MUTED ++ " v" ++ VERSION ++
-            "\x1b[0m  " ++ FG_MUTED ++
-            "esc interrupt · ctrl+c clear/exit · / commands · ctrl+o tools · ctrl+t thinking\x1b[0m\n" ++
-            FG_MUTED ++ "Ask zpi how to use or extend it — it can explain its own features.\x1b[0m";
+        const text = self.buildWelcomeHeader(false) orelse return;
+        defer self.alloc.free(text);
         self.addMessage(text);
+        self.welcome_idx = self.scrollback.items.len - 1;
+    }
+
+    /// Rebuild the header in place after a Ctrl+O toggle (pi re-renders the
+    /// BuiltInHeader from the same expanded flag that drives tool blocks).
+    fn refreshWelcomeHeader(self: *TUI) void {
+        const idx = self.welcome_idx orelse return;
+        const text = self.buildWelcomeHeader(self.tools_expanded) orelse return;
+        self.render_mutex.lock(self.io) catch {
+            self.alloc.free(text);
+            return;
+        };
+        defer self.render_mutex.unlock(self.io);
+        if (idx >= self.scrollback.items.len) {
+            self.alloc.free(text);
+            return;
+        }
+        const old = self.scrollback.items[idx];
+        self.scrollback.items[idx] = text;
+        self.alloc.free(old);
+        self.transcript_gen += 1;
+    }
+
+    /// pi's half-block logo: 4 cells × 2 rows, brand colors fixed across
+    /// themes (pi-logo.js: coral 228,138,122 / blue 79,142,179 /
+    /// yellow 234,182,93). Apple Terminal draws gaps between rows, so it
+    /// gets the text wordmark instead (pi supportsPiLogo).
+    const LOGO_CORAL = "\x1b[38;2;228;138;122m";
+    const LOGO_BLUE = "\x1b[38;2;79;142;179m";
+    const LOGO_BLUE_BG = "\x1b[48;2;79;142;179m";
+    const LOGO_YELLOW = "\x1b[38;2;234;182;93m";
+
+    fn buildWelcomeHeader(self: *TUI, expanded: bool) ?[]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        const w = &out;
+        defer out.deinit(self.alloc);
+        var apple = false;
+        if (std.c.getenv("TERM_PROGRAM")) |tp| {
+            apple = std.mem.eql(u8, std.mem.sliceTo(tp, 0), "Apple_Terminal");
+        }
+        // Logo lines (top carries the version, bottom the first hint line —
+        // pi withLogo(): hints start on the logo's second row).
+        const version_line = std.fmt.allocPrint(self.alloc, "{s} v{s}\x1b[0m", .{ FG_MUTED, VERSION }) catch return null;
+        defer self.alloc.free(version_line);
+        if (apple) {
+            const wm = std.fmt.allocPrint(self.alloc, "{s}z\x1b[0m{s}pi\x1b[0m {s}", .{ LOGO_CORAL, LOGO_YELLOW, version_line }) catch return null;
+            defer self.alloc.free(wm);
+            w.appendSlice(self.alloc, wm) catch return null;
+            w.appendSlice(self.alloc, "\n") catch return null;
+        } else {
+            const logo = std.fmt.allocPrint(self.alloc,
+                // top: bg blue fg coral ▀, then coral ▀█, padded to 4 cells
+                "{s}{s}\u{2580}\x1b[0m{s}\u{2580}\u{2588}\x1b[0m {s}\n" ++
+                // bottom: blue █▀, space, yellow █
+                "{s}\u{2588}\u{2580}\x1b[0m {s}\u{2588} {s}",
+                .{ LOGO_BLUE_BG, LOGO_CORAL, LOGO_CORAL, version_line, LOGO_BLUE, LOGO_BLUE, LOGO_YELLOW }) catch return null;
+            defer self.alloc.free(logo);
+            w.appendSlice(self.alloc, logo) catch return null;
+        }
+        // Hint lines: compact one-liner or the full keybindings list
+        // (pi compactInstructions/expandedInstructions, trimmed to what zpi
+        // actually binds).
+        if (!expanded) {
+            w.appendSlice(self.alloc, "\x1b[2mesc interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more\x1b[0m\n" ++
+                "\x1b[2mPress ctrl+o to show full startup help and loaded resources.\x1b[0m\n") catch return null;
+        } else {
+            const hints = [_][2][]const u8{
+                .{ "escape", "to interrupt" },
+                .{ "ctrl+c", "to clear" },
+                .{ "ctrl+c twice", "to exit" },
+                .{ "ctrl+d", "to exit (empty)" },
+                .{ "ctrl+z", "to suspend" },
+                .{ "ctrl+k", "to delete to end" },
+                .{ "shift+tab", "to cycle thinking level" },
+                .{ "ctrl+p/shift+ctrl+p", "to cycle models" },
+                .{ "ctrl+l", "to select model" },
+                .{ "ctrl+o", "to expand tools" },
+                .{ "ctrl+t", "to expand thinking" },
+                .{ "ctrl+g", "for external editor" },
+                .{ "/", "for commands" },
+                .{ "!", "to run bash" },
+                .{ "!!", "to run bash (no context)" },
+                .{ "alt+enter", "to queue follow-up" },
+            };
+            w.appendSlice(self.alloc, "\n") catch return null;
+            for (hints) |kv| {
+                const line = std.fmt.allocPrint(self.alloc, "\x1b[2m{s} {s}\x1b[0m\n", .{ kv[0], kv[1] }) catch return null;
+                defer self.alloc.free(line);
+                w.appendSlice(self.alloc, line) catch return null;
+            }
+        }
+        // Onboarding line preceded by a blank row (pi BuiltInHeader layout).
+        w.appendSlice(self.alloc, "\n\x1b[2mzpi can explain its own features and look up its docs. Ask it how to use or extend zpi.\x1b[0m\n") catch return null;
+        // Model scope notice (pi getModelScopeNotice): dim list + cycle hint.
+        if (self.scoped_models) |sm| {
+            if (sm.items.len > 0) {
+                w.appendSlice(self.alloc, "\x1b[2mModel scope: ") catch return null;
+                for (sm.items, 0..) |m, i| {
+                    if (i > 0) w.appendSlice(self.alloc, ", ") catch return null;
+                    w.appendSlice(self.alloc, m) catch return null;
+                }
+                w.appendSlice(self.alloc, " (ctrl+p to cycle)\x1b[0m\n") catch return null;
+            }
+        }
+        // Loaded resources (pi showLoadedResources): [Skills] and [Prompts]
+        // compact name lists; expanded adds each entry's path.
+        const accent = "\x1b[38;2;167;152;215m";
+        const agent_dir = self.agent_dir_for_templates();
+        const templates = ptmod.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.project_trusted);
+        defer ptmod.freeAll(self.alloc, templates);
+        if (templates.len > 0) {
+            const hdr = std.fmt.allocPrint(self.alloc, "{s}[Prompts]\x1b[0m\n", .{accent}) catch return null;
+            defer self.alloc.free(hdr);
+            w.appendSlice(self.alloc, hdr) catch return null;
+            if (!expanded) {
+                const tnames = self.alloc.alloc([]const u8, templates.len) catch return null;
+                defer self.alloc.free(tnames);
+                for (templates, 0..) |t, i| tnames[i] = t.name;
+                std.mem.sort([]const u8, tnames, {}, struct {
+                    fn lt(_: void, a: []const u8, b: []const u8) bool {
+                        return std.mem.order(u8, a, b) == .lt;
+                    }
+                }.lt);
+                w.appendSlice(self.alloc, "\x1b[2m  ") catch return null;
+                for (tnames, 0..) |tn, i| {
+                    if (i > 0) w.appendSlice(self.alloc, ", ") catch return null;
+                    w.append(self.alloc, '/') catch return null;
+                    w.appendSlice(self.alloc, tn) catch return null;
+                }
+                w.appendSlice(self.alloc, "\x1b[0m\n") catch return null;
+            } else {
+                for (templates) |t| {
+                    const line = std.fmt.allocPrint(self.alloc, "\x1b[2m  /{s} [{s}]\x1b[0m\n", .{ t.name, t.scope }) catch return null;
+                    defer self.alloc.free(line);
+                    w.appendSlice(self.alloc, line) catch return null;
+                }
+            }
+            w.appendSlice(self.alloc, "\n") catch return null;
+        }
+        const skills_list = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir, self.project_trusted) catch {
+            return out.toOwnedSlice(self.alloc) catch null;
+        };
+        defer skills.freeAll(self.alloc, skills_list);
+        if (skills_list.len > 0) {
+            const hdr = std.fmt.allocPrint(self.alloc, "{s}[Skills]\x1b[0m\n", .{accent}) catch return null;
+            defer self.alloc.free(hdr);
+            w.appendSlice(self.alloc, hdr) catch return null;
+            if (!expanded) {
+                // pi formatCompactList: sorted, dim, wrapped by the text
+                // component. Our plain blocks don't wrap, so fold by the
+                // measured width here (2-col indent kept on continuation).
+                const names = self.alloc.alloc([]const u8, skills_list.len) catch return null;
+                defer self.alloc.free(names);
+                for (skills_list, 0..) |sk, i| names[i] = sk.name;
+                std.mem.sort([]const u8, names, {}, struct {
+                    fn lt(_: void, a: []const u8, b: []const u8) bool {
+                        return std.mem.order(u8, a, b) == .lt;
+                    }
+                }.lt);
+                const avail: isize = @as(isize, @intCast(self.width)) - 6;
+                var col: isize = 0;
+                w.appendSlice(self.alloc, "\x1b[2m  ") catch return null;
+                for (names, 0..) |nm, i| {
+                    if (i > 0) {
+                        col += 2;
+                        if (col + @as(isize, @intCast(nm.len)) > avail) {
+                            w.appendSlice(self.alloc, "\x1b[0m\n\x1b[2m  ") catch return null;
+                            col = 0;
+                        } else {
+                            w.appendSlice(self.alloc, ", ") catch return null;
+                        }
+                    }
+                    w.appendSlice(self.alloc, nm) catch return null;
+                    col += @intCast(nm.len);
+                }
+                w.appendSlice(self.alloc, "\x1b[0m\n") catch return null;
+            } else {
+                for (skills_list) |sk| {
+                    const scope: []const u8 = if (std.mem.startsWith(u8, sk.base_dir, self.cwd_abs)) "project" else "user";
+                    const line = std.fmt.allocPrint(self.alloc, "\x1b[2m  {s} [{s}]\x1b[0m\n", .{ sk.name, scope }) catch return null;
+                    defer self.alloc.free(line);
+                    w.appendSlice(self.alloc, line) catch return null;
+                }
+            }
+        }
+        return out.toOwnedSlice(self.alloc) catch null;
     }
 
     /// Replay persisted branch messages into the transcript for
@@ -6193,6 +6382,9 @@ pub const TUI = struct {
         for (self.tool_calls.items) |*e| e.expanded = null;
         self.render_mutex.unlock(self.io);
         for (0..self.tool_calls.items.len) |i| self.renderToolBlockAt(i);
+        // pi: the same flag flips the BuiltInHeader between its compact and
+        // expanded content.
+        self.refreshWelcomeHeader();
     }
 
     /// (Re-)render tool call `i` into its scrollback slot.
