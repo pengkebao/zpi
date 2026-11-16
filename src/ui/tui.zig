@@ -213,7 +213,7 @@ pub const TUI = struct {
         assistant: []const u8,
         user: []const u8,
         thinking: []const u8,
-        compaction: u64,
+        compaction: ss.CompactionInfo,
         /// tool_calls index (the block is rebuilt from the entry).
         tool: usize,
 
@@ -304,6 +304,10 @@ pub const TUI = struct {
     scrollback: std.array_list.Managed([]const u8),
     /// Parallel to `scrollback`: how each block re-renders on a resize.
     scrollback_src: std.array_list.Managed(BlockSrc),
+    /// `scrollback` index of the "● Compacting…" line a manual /compact is
+    /// waiting on; replaced in place when the summary finishes. Null when
+    /// no compaction is pending.
+    compaction_pending_idx: ?usize = null,
     loader: spinner.Loader,
     model_name: []const u8,
     stream_text: std.array_list.Managed(u8),
@@ -5301,22 +5305,87 @@ pub const TUI = struct {
         }
     }
 
-    /// pi renders a compaction like a custom message: its own background, a
-    /// bold label, and how much was compacted.
-    pub fn addCompactionBlock(self: *TUI, tokens_before: u64) void {
+    /// pi renders a finished compaction as a transcript line: green dot,
+    /// scissors, and the summarization request's usage — "● ✂ Context
+    /// compacted (N input, M output tokens)." (older entries without usage
+    /// fall back to the token count).
+    pub fn addCompactionBlock(self: *TUI, info: ss.CompactionInfo) void {
         var block: std.ArrayListUnmanaged(u8) = .empty;
         defer block.deinit(self.alloc);
-        self.renderCompactionBlock(tokens_before, &block);
-        self.finishBlock(&block, .{ .compaction = tokens_before });
+        self.renderCompactionBlock(info, &block);
+        self.finishBlock(&block, .{ .compaction = info });
     }
 
-    fn renderCompactionBlock(self: *TUI, tokens_before: u64, block: *std.ArrayListUnmanaged(u8)) void {
-        var text_buf: [128]u8 = undefined;
-        const text = std.fmt.bufPrint(&text_buf, FG_MUTED ++ "Compacted from {d} tokens (ctrl+o to expand)", .{tokens_before}) catch return;
-        self.appendBgRow(block, "\x1b[1m" ++ ACCENT ++ "[compaction]\x1b[22m\x1b[39m", CUSTOM_MSG_BG);
-        self.appendBgRow(block, "", CUSTOM_MSG_BG);
-        self.appendBgRow(block, text, CUSTOM_MSG_BG);
-        self.appendBgRow(block, "", CUSTOM_MSG_BG);
+    fn renderCompactionBlock(self: *TUI, info: ss.CompactionInfo, block: *std.ArrayListUnmanaged(u8)) void {
+        var text_buf: [96]u8 = undefined;
+        const tail: []const u8 = if (info.usage) |u| blk: {
+            break :blk std.fmt.bufPrint(&text_buf, "({d} input, {d} output tokens).", .{ u.input, u.output }) catch return;
+        } else blk: {
+            break :blk std.fmt.bufPrint(&text_buf, "({d} tokens).", .{info.tokens_before}) catch return;
+        };
+        block.appendSlice(self.alloc, BORDER_BASH) catch return;
+        block.appendSlice(self.alloc, "● \x1b[0m\u{2702} Context compacted ") catch return;
+        block.appendSlice(self.alloc, FG_MUTED) catch return;
+        block.appendSlice(self.alloc, tail) catch return;
+        block.appendSlice(self.alloc, "\x1b[0m") catch return;
+    }
+
+    /// pi: "● Compacting…" shown while a manual /compact runs; replaced in
+    /// place by the final "✂ Context compacted" line when it finishes.
+    fn addCompactionPending(self: *TUI) void {
+        var block: std.ArrayListUnmanaged(u8) = .empty;
+        defer block.deinit(self.alloc);
+        block.appendSlice(self.alloc, BORDER_BASH) catch return;
+        block.appendSlice(self.alloc, "● Compacting…\x1b[0m") catch return;
+        const n_before = self.scrollback.items.len;
+        self.finishBlock(&block, .plain);
+        self.compaction_pending_idx = if (self.scrollback.items.len > n_before) self.scrollback.items.len - 1 else null;
+    }
+
+    /// Replace the pending "● Compacting…" line with the finished
+    /// compaction line (same in-place repaint pattern as tool results).
+    fn replaceCompactionPending(self: *TUI, info: ss.CompactionInfo) void {
+        var block: std.ArrayListUnmanaged(u8) = .empty;
+        defer block.deinit(self.alloc);
+        self.renderCompactionBlock(info, &block);
+        const rendered = block.toOwnedSlice(self.alloc) catch {
+            self.addCompactionBlock(info);
+            return;
+        };
+        self.render_mutex.lock(self.io) catch {
+            self.alloc.free(rendered);
+            self.addCompactionBlock(info);
+            return;
+        };
+        defer self.render_mutex.unlock(self.io);
+        if (self.compaction_pending_idx) |idx| {
+            if (idx < self.scrollback.items.len) {
+                const old = self.scrollback.items[idx];
+                self.scrollback.items[idx] = rendered;
+                self.alloc.free(old);
+                self.scrollback_src.items[idx] = .{ .compaction = info };
+            } else {
+                self.scrollback.append(rendered) catch {
+                    self.alloc.free(rendered);
+                    return;
+                };
+                self.scrollback_src.append(.{ .compaction = info }) catch {
+                    _ = self.scrollback.pop();
+                    return;
+                };
+            }
+        } else blk: {
+            self.scrollback.append(rendered) catch {
+                self.alloc.free(rendered);
+                break :blk;
+            };
+            self.scrollback_src.append(.{ .compaction = info }) catch {
+                _ = self.scrollback.pop();
+                break :blk;
+            };
+        }
+        self.transcript_gen += 1;
+        self.compaction_pending_idx = null;
     }
 
     /// One row of a background-colored block: the content in `bg`, padded to
@@ -5640,14 +5709,17 @@ pub const TUI = struct {
         const alloc = self.session.alloc;
         // Full transcript, NOT the compaction-filtered context: pi's UI keeps
         // every message after a compaction (compaction only shapes the LLM
-        // context). branchMessages here used to truncate the replay to the
-        // post-compaction window, so --session showed stale mid-history.
-        const branch = st.branchAllMessages(alloc) catch return;
+        // context), and the compaction markers themselves render inline
+        // ("✂ Context compacted …") at their position in the history.
+        const items = st.branchReplayItems(alloc) catch return;
         defer {
-            for (branch) |m| m.deinit();
-            alloc.free(branch);
+            for (items) |*it| it.deinit();
+            alloc.free(items);
         }
-        for (branch) |m| {
+        for (items) |it| {
+            switch (it) {
+                .compaction => |ci| self.addCompactionBlock(ci),
+                .message => |m| {
             switch (m.role) {
                 .system => {},
                 .user => {
@@ -5686,6 +5758,8 @@ pub const TUI = struct {
                         break :blk "";
                     } else "";
                     self.addBashBlock(cmd, out_text, m.bash_exit_code, m.bash_exclude);
+                },
+            }
                 },
             }
         }
@@ -6477,8 +6551,8 @@ pub const TUI = struct {
                     self.renderThinkingBlock(raw, &block);
                     break :blk if (block.items.len == 0) null else block.toOwnedSlice(self.alloc) catch null;
                 },
-                .compaction => |tokens| blk: {
-                    self.renderCompactionBlock(tokens, &block);
+                .compaction => |info| blk: {
+                    self.renderCompactionBlock(info, &block);
                     break :blk block.toOwnedSlice(self.alloc) catch null;
                 },
             };
@@ -6511,7 +6585,7 @@ pub const TUI = struct {
                 },
                 .tool_start => |s| self.addPendingTool(s),
                 .tool_result => |r| self.finishTool(r),
-                .compaction => |tokens| self.addCompactionBlock(tokens),
+                .compaction => |info| self.addCompactionBlock(info),
                 .note => |n| {
                     defer self.session.alloc.free(n);
                     self.note("\x1b[90m{s}\x1b[0m", .{n});
@@ -6555,6 +6629,7 @@ pub const TUI = struct {
         self.thinking_blocks.clearRetainingCapacity();
         self.user_blocks.clearRetainingCapacity();
         self.thinking_shut.clearRetainingCapacity();
+        self.compaction_pending_idx = null;
         self.transcript_gen += 1;
     }
 
@@ -6585,6 +6660,46 @@ pub const TUI = struct {
     }
 
     /// Split "/cmd arg" into the command word and the (trimmed) argument.
+    /// /compact [focus] — pi's manual compaction: show "● Compacting…",
+    /// summarize the context with the current model, record the compaction
+    /// entry, rebuild the context, and replace the pending line with
+    /// "● ✂ Context compacted (N input, M output tokens).". Runs
+    /// synchronously (the main loop is blocked, like a normal turn).
+    fn runCompactCommand(self: *TUI, arg: []const u8) void {
+        if (self.session.store == null) {
+            self.note("no session to compact", .{});
+            self.redraw();
+            return;
+        }
+        if (self.session.context.messages.items.len < 2) {
+            self.note("nothing to compact yet", .{});
+            self.redraw();
+            return;
+        }
+        self.addCompactionPending();
+        self.redraw();
+        // Optional focus text ("/compact what did we decide about X").
+        const custom = if (arg.len > 0) self.alloc.dupe(u8, arg) catch null else null;
+        defer if (custom) |c| self.alloc.free(c);
+        // The manual path renders the result itself; keep the turn-event
+        // queue clean so the next turn doesn't render it a second time.
+        const was_events = self.session.record_turn_events;
+        self.session.record_turn_events = false;
+        const res = self.session.runCompactionReasoned(custom, "manual") catch |e| {
+            self.session.record_turn_events = was_events;
+            self.note("compaction failed: {s}", .{@errorName(e)});
+            self.redraw();
+            return;
+        };
+        self.session.record_turn_events = was_events;
+        if (res) |info| {
+            self.replaceCompactionPending(info);
+        } else {
+            self.note("nothing to compact yet", .{});
+        }
+        self.redraw();
+    }
+
     fn parseCmd(cmd: []const u8) struct { word: []const u8, arg: []const u8 } {
         const trimmed = std.mem.trim(u8, cmd, " \t");
         if (trimmed.len == 0) return .{ .word = "", .arg = "" };
@@ -6670,6 +6785,7 @@ pub const TUI = struct {
                 ++ "  /resume <id>   resume a session by (partial) id\n"
                 ++ "  /export [path] export session to HTML (default: alongside)\n"
                 ++ "  /mcp           list MCP servers and their state\n"
+                ++ "  /compact [f]   compact the context now (optionally focused)\n"
                 ++ "  /copy          copy last assistant message to clipboard\n"
                 ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)");
             self.redraw();
@@ -7031,21 +7147,10 @@ pub const TUI = struct {
             return false;
         }
 
+        // /compact [focus] — pi's manual compaction ("● Compacting…" →
+        // "● ✂ Context compacted (N input, M output tokens).").
         if (std.mem.eql(u8, word, "/compact")) {
-            const custom = if (arg.len > 0) arg else null;
-            self.addMessage("\x1b[90m[compacting...]\x1b[0m");
-            self.redraw();
-            const before = self.session.runCompactionReasoned(custom, "manual") catch {
-                self.note("\x1b[91m[compact failed]\x1b[0m", .{});
-                self.redraw();
-                return false;
-            };
-            // The compaction block arrives as a turn event.
-            self.drainTurnEvents();
-            if (before == null) {
-                self.note("\x1b[90mnothing to compact (context small)\x1b[0m", .{});
-            }
-            self.redraw();
+            self.runCompactCommand(arg);
             return false;
         }
 

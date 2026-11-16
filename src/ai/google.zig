@@ -6,6 +6,7 @@
 const std = @import("std");
 const msg = @import("../core/message.zig");
 const config = @import("../core/config.zig");
+const json = @import("json.zig");
 const openai = @import("openai.zig");
 const sse = @import("sse.zig");
 
@@ -460,24 +461,5 @@ fn intIn(o: std.json.ObjectMap, key: []const u8) ?i64 {
 }
 
 fn writeJsonStr(body: *std.array_list.Managed(u8), s: []const u8) !void {
-    try body.append('"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try body.appendSlice("\\\""),
-            '\\' => try body.appendSlice("\\\\"),
-            '\n' => try body.appendSlice("\\n"),
-            '\r' => try body.appendSlice("\\r"),
-            '\t' => try body.appendSlice("\\t"),
-            else => {
-                if (c < 0x20) {
-                    var buf: [8]u8 = undefined;
-                    const w = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
-                    try body.appendSlice(w);
-                } else {
-                    try body.append(c);
-                }
-            },
-        }
-    }
-    try body.append('"');
+    return json.writeJsonStr(body, s);
 }

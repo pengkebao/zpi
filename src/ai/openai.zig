@@ -4,6 +4,13 @@
 const std = @import("std");
 const msg = @import("../core/message.zig");
 const config = @import("../core/config.zig");
+const json = @import("json.zig");
+
+/// Debug: when set (main.zig reads $ZPI_DEBUG_BODY), every outgoing
+/// chat-completions body is written to this path for inspection
+/// (a .1, .2, ... suffix distinguishes successive requests).
+pub var debug_body_path: ?[]const u8 = null;
+var debug_body_n: usize = 0;
 
 pub const StreamEvent = union(enum) {
     text_delta: []const u8,
@@ -165,6 +172,15 @@ pub const OpenAiProvider = struct {
         }) catch return .transport_error;
         defer request.deinit();
 
+        // Debug: dump the outgoing body for inspection (ZPI_DEBUG_BODY=path,
+        // wired from main.zig into `debug_body_path`).
+        if (debug_body_path) |base| {
+            debug_body_n += 1;
+            if (std.fmt.allocPrint(self.alloc, "{s}.{d}", .{ base, debug_body_n }) catch null) |path| {
+                defer self.alloc.free(path);
+                std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = body_items }) catch {};
+            }
+        }
         request.sendBodyComplete(@constCast(body_items)) catch return .transport_error;
         var response = request.receiveHead(&[_]u8{}) catch return .transport_error;
 
@@ -611,26 +627,7 @@ fn intIn(o: std.json.ObjectMap, key: []const u8) ?u64 {
 }
 
 fn writeJsonStr(body: *std.array_list.Managed(u8), s: []const u8) !void {
-    try body.append('"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try body.appendSlice("\\\""),
-            '\\' => try body.appendSlice("\\\\"),
-            '\n' => try body.appendSlice("\\n"),
-            '\r' => try body.appendSlice("\\r"),
-            '\t' => try body.appendSlice("\\t"),
-            else => {
-                if (c < 0x20) {
-                    const hex = std.fmt.allocPrint(body.allocator, "\\u{X:0>4}", .{c}) catch return error.OutOfMemory;
-                    try body.appendSlice(hex);
-                    body.allocator.free(hex);
-                } else {
-                    try body.append(c);
-                }
-            },
-        }
-    }
-    try body.append('"');
+    return json.writeJsonStr(body, s);
 }
 
 

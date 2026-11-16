@@ -34,7 +34,7 @@ test "TUI batch2 leak" {
 
     // Thinking (dim italic markdown) and a compaction block.
     t.addThinkingBlock("the user says hi; I should answer briefly with **markdown**");
-    t.addCompactionBlock(48344);
+    t.addCompactionBlock(.{ .tokens_before = 48344, .usage = null });
 
     // Tool call lifecycle. The events hand their strings to the TUI: a pending
     // box, its result repainted in place, then both Ctrl+O states.

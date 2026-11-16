@@ -691,6 +691,9 @@ pub fn main(init: std.process.Init) !void {
     // Home dir (user-level skill discovery ~/.agents/skills + trust checks).
     const home_dir_early = std.process.Environ.getPosix(init.minimal.environ, "HOME") orelse
         std.process.Environ.getPosix(init.minimal.environ, "USERPROFILE");
+    if (std.process.Environ.getPosix(init.minimal.environ, "ZPI_DEBUG_BODY")) |p| {
+        ai.debug_body_path = p;
+    }
     defer cfg.deinit(alloc);
 
     // Resolve cwd EARLY: the trust decision gates project settings (which
@@ -1394,7 +1397,20 @@ pub fn main(init: std.process.Init) !void {
                     const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ mc.provider, mc.model_id }) catch null;
                     if (full) |f| {
                         defer alloc.free(f);
-                        if (cfg.findModel(f)) |m| model = m.*;
+                        if (cfg.findModel(f)) |m| {
+                            // The provider was built from the DEFAULT model
+                            // above; a restored session model on another
+                            // provider must rebind it, or requests carry the
+                            // restored model id to the default provider's
+                            // gateway ("model not found").
+                            if (!std.mem.eql(u8, m.id, model.id) or
+                                !std.mem.eql(u8, m.provider, model.provider)) {
+                                model = m.*;
+                                provider.deinit();
+                                provider = try aiprovider.buildFromModel(alloc, io, m);
+                                session.provider = provider;
+                            }
+                        }
                     }
                 }
                 if (st.latestThinkingLevel(alloc)) |tl| {

@@ -53,8 +53,9 @@ pub const TurnEvent = union(enum) {
     tool_result: ToolEnd,
     /// A status line from the loop, such as an auto-compaction.
     note: []u8,
-    /// A compaction was recorded; the context had this many tokens before it.
-    compaction: u64,
+    /// A compaction was recorded (tokens before it + the summarization
+    /// request's usage) — the "✂ Context compacted" transcript line.
+    compaction: ss.CompactionInfo,
 
     pub const ToolStart = struct {
         id: []u8,
@@ -510,13 +511,14 @@ pub const Session = struct {
         return cut;
     }
 
-    /// Run (or force) a compaction. Returns the context size before it, or
-    /// null when nothing was compacted. `custom` optionally focuses the summary.
-    pub fn runCompaction(self: *Session, custom: ?[]const u8) !?u64 {
+    /// Run (or force) a compaction. Returns its display data (tokens before
+    /// it + the summarization usage), or null when nothing was compacted.
+    /// `custom` optionally focuses the summary.
+    pub fn runCompaction(self: *Session, custom: ?[]const u8) !?ss.CompactionInfo {
         return self.runCompactionReasoned(custom, "threshold");
     }
 
-    pub fn runCompactionReasoned(self: *Session, custom: ?[]const u8, reason: []const u8) !?u64 {
+    pub fn runCompactionReasoned(self: *Session, custom: ?[]const u8, reason: []const u8) !?ss.CompactionInfo {
         self.jsonEvent("{{\"type\":\"compaction_start\",\"reason\":\"{s}\"}}", .{reason});
         defer self.jsonEvent("{{\"type\":\"compaction_end\",\"reason\":\"{s}\"}}", .{reason});
         if (events.getGlobal()) |bus| bus.emit(.compaction);
@@ -573,8 +575,9 @@ pub const Session = struct {
 
         st.recordCompaction(summary_owned, first_kept_id, tokens_before, lists, summary.usage);
         try self.rebuildContextFromStore();
-        if (self.record_turn_events) self.pushTurnEvent(.{ .compaction = @intCast(tokens_before) });
-        return @intCast(tokens_before);
+        const info = ss.CompactionInfo{ .tokens_before = tokens_before, .usage = summary.usage };
+        if (self.record_turn_events) self.pushTurnEvent(.{ .compaction = info });
+        return info;
     }
 
     /// Auto-compact at a turn boundary if the context exceeds the budget.

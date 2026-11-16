@@ -612,6 +612,29 @@ const EntryRef = struct {
     line: []u8, // raw JSON line (owned)
 };
 
+/// One compaction entry's display data (pi's "✂ Context compacted
+/// (N input, M output tokens)." line).
+pub const CompactionInfo = struct {
+    tokens_before: u64 = 0,
+    usage: ?msg.Usage = null,
+};
+
+/// One item of the UI transcript replay: a message or a compaction
+/// marker, in the leaf path's conversation order (pi keeps the
+/// compaction markers inline in the transcript; they shape only the
+/// LLM context, never the view).
+pub const ReplayItem = union(enum) {
+    message: msg.Message,
+    compaction: CompactionInfo,
+
+    pub fn deinit(self: ReplayItem) void {
+        switch (self) {
+            .message => |*m| m.deinit(),
+            .compaction => {},
+        }
+    }
+};
+
 pub const SessionInfo = struct {
     path: []u8,
     id: []u8,
@@ -1361,6 +1384,52 @@ pub const Store = struct {
             if (e.kind == .compaction) n += 1;
         }
         return n;
+    }
+
+    /// Parse one compaction entry's raw line (null on error).
+    pub fn parseCompactionEntry(alloc: std.mem.Allocator, line: []const u8) ?CompactionInfo {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch return null;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |o| o,
+            else => return null,
+        };
+        var info = CompactionInfo{};
+        if (root.get("tokensBefore")) |tv| {
+            info.tokens_before = jsonU64(tv);
+        }
+        if (root.get("usage")) |uv| {
+            switch (uv) {
+                .object => |uo| info.usage = usageFromJson(uo),
+                else => {},
+            }
+        }
+        return info;
+    }
+
+    /// Messages + compaction markers of the leaf path in conversation order
+    /// (the UI transcript, NOT the compaction-aware LLM context). Caller
+    /// owns the returned items.
+    pub fn branchReplayItems(self: *Store, alloc: std.mem.Allocator) ![]ReplayItem {
+        var out = std.array_list.Managed(ReplayItem).init(alloc);
+        errdefer {
+            for (out.items) |*it| it.deinit();
+            out.deinit();
+        }
+        const path = try self.leafPath(alloc);
+        defer path.deinit();
+        for (path.items) |e| {
+            switch (e.kind) {
+                .message => {
+                    if (Store.parseMessageEntry(alloc, e.line)) |m| try out.append(.{ .message = m });
+                },
+                .compaction => {
+                    if (parseCompactionEntry(alloc, e.line)) |ci| try out.append(.{ .compaction = ci });
+                },
+                else => {},
+            }
+        }
+        return out.toOwnedSlice();
     }
 
     /// Fork: new session file (new id, parentSession set) containing this
