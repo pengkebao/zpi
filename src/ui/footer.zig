@@ -32,6 +32,9 @@ pub const Stats = struct {
     context_tokens: u64 = 0,
     context_window: u64 = 0,
     auto_compact: bool = true,
+    /// pi getContextUsage: set after a compaction until the next assistant
+    /// response — the context share renders as `?/window (auto)`.
+    context_unknown: bool = false,
 };
 
 /// The model shown on the right of the stats line.
@@ -78,17 +81,24 @@ pub fn statsLine(alloc: std.mem.Allocator, stats: Stats, model: Model, width: us
     }
     if (stats.cost > 0) try appendPart(alloc, &left, "$", std.fmt.bufPrint(&num, "{d:.3}", .{stats.cost}) catch "");
 
-    // The context share: `12.3%/200k (auto)`.
+    // The context share: `12.3%/200k (auto)` — or `?/200k (auto)` after a
+    // compaction, until the next assistant response (pi getContextUsage).
     const percent: f64 = if (stats.context_window > 0)
         @as(f64, @floatFromInt(stats.context_tokens)) * 100.0 / @as(f64, @floatFromInt(stats.context_window))
     else
         0;
     var ctx_buf: [64]u8 = undefined;
-    const ctx = std.fmt.bufPrint(&ctx_buf, "{d:.1}%/{s}{s}", .{
-        percent,
-        formatTokens(&num, stats.context_window),
-        if (stats.auto_compact) " (auto)" else "",
-    }) catch "";
+    const ctx = if (stats.context_unknown)
+        std.fmt.bufPrint(&ctx_buf, "?/{s}{s}", .{
+            formatTokens(&num, stats.context_window),
+            if (stats.auto_compact) " (auto)" else "",
+        }) catch ""
+    else
+        std.fmt.bufPrint(&ctx_buf, "{d:.1}%/{s}{s}", .{
+            percent,
+            formatTokens(&num, stats.context_window),
+            if (stats.auto_compact) " (auto)" else "",
+        }) catch "";
     const ctx_color: []const u8 = if (percent > 90) FG_ERROR else if (percent > 70) FG_WARNING else "";
 
     // The model, with the provider when there is room for it.
@@ -322,6 +332,12 @@ test "statsLine: a fresh session shows only the context share and the model" {
     const line = try statsLine(t.allocator, .{ .context_window = 128_000 }, .{ .id = "m" }, 30);
     defer t.allocator.free(line);
     try expectPlain("0.0%/128k (auto)             m", line);
+}
+
+test "statsLine: after a compaction the context share shows ?" {
+    const line = try statsLine(t.allocator, .{ .context_window = 200_000, .context_unknown = true }, .{ .id = "m" }, 30);
+    defer t.allocator.free(line);
+    try expectPlain("?/200k (auto)                m", line);
 }
 
 test "statsLine: every counter, right-aligned model with provider and level" {

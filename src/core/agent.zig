@@ -116,6 +116,11 @@ pub const Session = struct {
     json_out: ?std.Io.File = null,
     /// Cumulative usage over the whole session (A1).
     totals: msg.Usage = .{},
+    /// pi getContextUsage: after a compaction the last assistant usage
+    /// reflects the PRE-compaction context, so the context token count is
+    /// unknown (footer shows `?/window`) until the next assistant response
+    /// with usage arrives.
+    context_unknown: bool = false,
     /// Session persistence (B); null = --no-session.
     store: ?*ss.Store = null,
     /// Current thinking/reasoning effort (drives the border color + the
@@ -560,6 +565,7 @@ pub const Session = struct {
             null,
             custom,
             isAbortedGlobal,
+            self.model.max_tokens,
         ) catch |e| {
             if (e == error.Aborted) return null;
             return e;
@@ -575,6 +581,9 @@ pub const Session = struct {
 
         st.recordCompaction(summary_owned, first_kept_id, tokens_before, lists, summary.usage);
         try self.rebuildContextFromStore();
+        // pi getContextUsage: until the next assistant response, the context
+        // size is unknown (the footer shows `?/window`).
+        self.context_unknown = true;
         const info = ss.CompactionInfo{ .tokens_before = tokens_before, .usage = summary.usage };
         if (self.record_turn_events) self.pushTurnEvent(.{ .compaction = info });
         return info;
@@ -684,6 +693,7 @@ pub const Session = struct {
                     .reasoning = self.model.reasoning,
                     .supports_effort = self.model.supports_reasoning_effort,
                 },
+                self.model.max_tokens,
                 self,
             ) catch |e| {
                 if (e == error.Aborted) {
@@ -727,6 +737,8 @@ pub const Session = struct {
             if (self.stream_usage) |u| {
                 assistant_msg.usage = u;
                 self.totals.add(u);
+                // A real response arrived: the context size is known again.
+                self.context_unknown = false;
             }
             self.recordText(.thinking, thinking_buf.items);
             self.recordText(.text, text_buf.items);

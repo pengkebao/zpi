@@ -204,6 +204,14 @@ pub const TUI = struct {
         id_len: usize = 0,
     };
 
+    /// One message submitted while compaction runs (pi
+    /// compactionQueuedMessages): Enter queues a steer, alt+Enter a follow-up.
+    pub const CompactQueueMode = enum { steer, followUp };
+    const CompactQueueEntry = struct {
+        text: []u8,
+        mode: CompactQueueMode,
+    };
+
     /// How a scrollback block can be re-rendered (a terminal resize
     /// re-renders the whole transcript at the new width, like pi's per-frame
     /// component rendering). The markdown sources own their strings.
@@ -350,6 +358,18 @@ pub const TUI = struct {
     spinner_thread: std.Thread = undefined,
     spinner_thread_active: bool = false,
     spinner_stop: bool = true,
+    /// pi: /compact runs on a background thread (the editor stays active);
+    /// submissions queue until it finishes, then flush as a new turn.
+    compact_thread: std.Thread = undefined,
+    compact_thread_active: bool = false,
+    compacting: bool = false,
+    /// Set by the compact thread when it finishes (the main loop polls it).
+    compact_done: bool = false,
+    compact_res: ?ss.CompactionInfo = null,
+    compact_err: ?anyerror = null,
+    /// Messages submitted while compaction runs (pi compactionQueuedMessages):
+    /// "steer" = Enter, "followUp" = alt+Enter. Rendered above the editor.
+    compact_queue: std.array_list.Managed(CompactQueueEntry),
     /// Stateful input reader (batch reassembly + kitty release filtering).
     key_reader: keys.KeyReader = .{},
     /// Whether we enabled xterm modifyOtherKeys (kitty-unavailable fallback).
@@ -1949,6 +1969,7 @@ pub const TUI = struct {
                 null,
                 null,
                 null,
+                self.session.model.max_tokens,
             ) catch null;
             if (res) |r| {
                 defer self.alloc.free(r.text);
@@ -3215,6 +3236,13 @@ pub const TUI = struct {
             .spinner_frame = 0,
             .last_tick_ns = 0,
             .bash_mode = false,
+            .compact_thread = undefined,
+            .compact_thread_active = false,
+            .compacting = false,
+            .compact_done = false,
+            .compact_res = null,
+            .compact_err = null,
+            .compact_queue = std.array_list.Managed(CompactQueueEntry).init(alloc),
         };
     }
 
@@ -3231,6 +3259,10 @@ pub const TUI = struct {
         // middle of redrawLocked/renderLiveBlock allocations. Exiting without
         // joining makes the leak checker report in-flight allocations.
         self.stopSpinner();
+        // Exiting mid-compaction: abort so the worker returns promptly.
+        if (self.compacting) agent.requestAbort();
+        self.joinCompact();
+        self.freeCompactQueue();
         self.restoreTerminal();
         keys.restoreWinchHandler();
         self.watch_captured.deinit(self.alloc);
@@ -3449,6 +3481,7 @@ pub const TUI = struct {
             .context_tokens = compact.estimateContextTokens(messages),
             .context_window = self.session.model.context_window,
             .auto_compact = self.session.compaction.enabled,
+            .context_unknown = self.session.context_unknown,
         };
     }
 
@@ -3539,7 +3572,10 @@ pub const TUI = struct {
         const ms_h: usize = if (self.menu_mode == .model_selector) self.modelSelectorViewHeight() else 0;
         const ts_h: usize = if (self.menu_mode == .thinking_selector) self.thinkingSelectorViewHeight() else 0;
         const sc_h: usize = if (self.menu_mode == .scoped) self.scopedViewHeight() else 0;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h;
+        // pi updatePendingMessagesDisplay: messages queued during compaction
+        // render as dim rows between the transcript and the editor border.
+        const compact_q_h: usize = if (self.compacting) self.compact_queue.items.len else 0;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h + compact_q_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -3618,6 +3654,10 @@ pub const TUI = struct {
                 }
             }
         }
+
+        // 1.5 Queued-compaction rows (pi pendingMessagesContainer: between
+        // the document and the editor's top border).
+        if (self.compacting) self.renderCompactQueue(&frame);
 
         // 2. Top border (shows spinner + "Working" when busy).
         const top_border = self.topBorderLine() catch return;
@@ -3843,6 +3883,31 @@ pub const TUI = struct {
     /// the spinner in accent color and the label in muted (matches pi).
     fn topBorderLine(self: *TUI) ![]u8 {
         if (!self.working) return self.borderLine();
+        // pi CompactionStatusIndicator: "Compacting context... (esc to cancel)"
+        // rendered in the border while a manual /compact runs.
+        if (self.compacting) {
+            const frame = spinner.SPINNER_FRAMES[self.spinner_frame];
+            var abuf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer abuf.deinit(self.alloc);
+            const bc = self.borderColor();
+            abuf.appendSlice(self.alloc, bc) catch return error.OutOfMemory;
+            abuf.appendSlice(self.alloc, "\u{2500}\u{2500} ") catch return error.OutOfMemory;
+            abuf.appendSlice(self.alloc, ACCENT) catch return error.OutOfMemory;
+            abuf.appendSlice(self.alloc, frame) catch return error.OutOfMemory;
+            abuf.appendSlice(self.alloc, MUTED) catch return error.OutOfMemory;
+            abuf.appendSlice(self.alloc, " Compacting context... (esc to cancel)") catch return error.OutOfMemory;
+            abuf.appendSlice(self.alloc, bc) catch return error.OutOfMemory;
+            abuf.append(self.alloc, ' ') catch return error.OutOfMemory;
+            // Used so far: 3 (bc+──) + 1 (space) + 38 (text) + 1 (space) = 43.
+            // One extra ─ here overflows the width, wraps to the next screen
+            // row and pushes the bottom border off-screen.
+            var i: u32 = 3 + 1 + 38 + 1;
+            while (i < self.width) : (i += 1) {
+                abuf.appendSlice(self.alloc, "\u{2500}") catch return error.OutOfMemory;
+            }
+            abuf.appendSlice(self.alloc, "\x1b[0m") catch return error.OutOfMemory;
+            return abuf.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
+        }
         const frame = spinner.SPINNER_FRAMES[self.spinner_frame];
         var abuf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer abuf.deinit(self.alloc);
@@ -6660,12 +6725,19 @@ pub const TUI = struct {
     }
 
     /// Split "/cmd arg" into the command word and the (trimmed) argument.
-    /// /compact [focus] — pi's manual compaction: show "● Compacting…",
-    /// summarize the context with the current model, record the compaction
-    /// entry, rebuild the context, and replace the pending line with
-    /// "● ✂ Context compacted (N input, M output tokens).". Runs
-    /// synchronously (the main loop is blocked, like a normal turn).
+    /// /compact [focus] — pi's manual compaction: the summarization runs on a
+    /// BACKGROUND thread (pi: `void (async () => ...)`), the editor stays
+    /// active, and the top border shows the "Compacting context..." status.
+    /// Submissions while it runs queue (Enter = steer, alt+Enter = follow-up,
+    /// shown above the editor); when it finishes the main loop flushes the
+    /// queue as a new turn (pi flushCompactionQueue). ESC aborts (pi
+    /// abortCompaction).
     fn runCompactCommand(self: *TUI, arg: []const u8) void {
+        if (self.compacting) {
+            self.note("compaction already in progress", .{});
+            self.redraw();
+            return;
+        }
         if (self.session.store == null) {
             self.note("no session to compact", .{});
             self.redraw();
@@ -6676,28 +6748,167 @@ pub const TUI = struct {
             self.redraw();
             return;
         }
-        self.addCompactionPending();
-        self.redraw();
         // Optional focus text ("/compact what did we decide about X").
         const custom = if (arg.len > 0) self.alloc.dupe(u8, arg) catch null else null;
-        defer if (custom) |c| self.alloc.free(c);
         // The manual path renders the result itself; keep the turn-event
         // queue clean so the next turn doesn't render it a second time.
-        const was_events = self.session.record_turn_events;
         self.session.record_turn_events = false;
-        const res = self.session.runCompactionReasoned(custom, "manual") catch |e| {
-            self.session.record_turn_events = was_events;
-            self.note("compaction failed: {s}", .{@errorName(e)});
+        const spawned = std.Thread.spawn(.{}, compactThreadMain, .{ self, custom }) catch {
+            if (custom) |c| self.alloc.free(c);
+            self.note("failed to spawn compaction", .{});
             self.redraw();
             return;
         };
-        self.session.record_turn_events = was_events;
-        if (res) |info| {
-            self.replaceCompactionPending(info);
-        } else {
-            self.note("nothing to compact yet", .{});
+        self.render_mutex.lock(self.io) catch {};
+        self.compact_thread = spawned;
+        self.compact_thread_active = true;
+        self.compacting = true;
+        self.compact_done = false;
+        self.compact_res = null;
+        self.compact_err = null;
+        // Spinner animates the border; the MAIN loop (unblocked) keeps
+        // handling keys and polls compact_done. No watcher: it would fight
+        // the main loop for stdin.
+        self.working = true;
+        self.render_mutex.unlock(self.io);
+        self.startSpinner();
+        // The worker is already running (mutating session.context); cached path.
+        self.redrawCached();
+    }
+
+    /// Compaction worker (background thread, pi session.compact): summarize,
+    /// record the entry, rebuild the context. The TUI transcript is NOT
+    /// touched here — the main loop renders the result on its next poll.
+    fn compactThreadMain(t: *TUI, custom: ?[]u8) void {
+        defer if (custom) |c| t.alloc.free(c);
+        const res = t.session.runCompactionReasoned(custom, "manual") catch |e| {
+            t.compact_err = e;
+            t.compact_done = true;
+            return;
+        };
+        t.compact_res = res;
+        t.compact_done = true;
+    }
+
+    /// Called from deinit: wait for the worker (it only touches the session
+    /// and the done flag; the transcript is main-thread rendered).
+    fn joinCompact(self: *TUI) void {
+        if (self.compact_thread_active) {
+            self.compact_thread.join();
+            self.compact_thread_active = false;
         }
-        self.redraw();
+    }
+
+    /// Free queued compaction messages (deinit).
+    fn freeCompactQueue(self: *TUI) void {
+        for (self.compact_queue.items) |e| self.alloc.free(e.text);
+        self.compact_queue.deinit();
+    }
+
+    /// Queue a message submitted while compaction runs (pi
+    /// queueCompactionMessage): copy, clear the editor, show it above the
+    /// input.
+    fn queueCompactMessage(self: *TUI, text: []const u8, mode: CompactQueueMode) void {
+        const copy = self.alloc.dupe(u8, text) catch return;
+        self.compact_queue.append(.{ .text = copy, .mode = mode }) catch {
+            self.alloc.free(copy);
+            return;
+        };
+        self.editor.clear() catch {};
+        self.flash("Queued message for after compaction");
+        // The worker is mutating session.context; use the cached-stats path.
+        self.redrawCached();
+    }
+
+    /// pi flushCompactionQueue + compaction_end: called on the main loop when
+    /// the worker sets compact_done. Renders the result line (or the error /
+    /// cancellation note), then sends the queued messages: the first becomes
+    /// a new prompt, the rest join the agent's steering/follow-up queues and
+    /// are consumed by the turn loop that runPrompt starts.
+    fn finishCompaction(self: *TUI) void {
+        const res = self.compact_res;
+        const err = self.compact_err;
+        self.compact_res = null;
+        self.compact_err = null;
+        self.compacting = false;
+        self.stopSpinner();
+        if (res) |info| {
+            self.addCompactionBlock(info);
+        } else if (err) |e| {
+            if (e == error.Aborted or agent.isAbortedGlobal()) {
+                // pi: "Compaction cancelled" (ESC / exit during compaction).
+                agent.clearAbort();
+                self.note("compaction cancelled", .{});
+            } else {
+                self.note("compaction failed: {s}", .{@errorName(e)});
+            }
+        } else if (agent.isAbortedGlobal()) {
+            agent.clearAbort();
+            self.note("compaction cancelled", .{});
+        } else {
+            self.note("nothing to compact", .{});
+        }
+        // Flush the queue (pi flushCompactionQueue): first message prompts,
+        // the rest ride the new turn (steer before the next LLM request,
+        // follow-up after it ends).
+        var first: ?[]u8 = null;
+        for (self.compact_queue.items) |e| {
+            if (first == null) {
+                first = e.text;
+            } else {
+                switch (e.mode) {
+                    .steer => self.session.queueSteering(e.text),
+                    .followUp => self.session.queueFollowUp(e.text),
+                }
+            }
+        }
+        // Free the queued texts; `first` keeps its text (freed after the
+        // prompt, which owns it for the turn).
+        for (self.compact_queue.items) |e| {
+            if (first) |f| {
+                if (e.text.ptr != f.ptr) self.alloc.free(e.text);
+            } else self.alloc.free(e.text);
+        }
+        self.compact_queue.clearRetainingCapacity();
+        // The manual path rendered the result itself; turn events are on for
+        // the prompt that follows (the worker kept them off).
+        self.session.record_turn_events = true;
+        if (first) |text| {
+            self.addUserMessage(text);
+            self.render_mutex.lock(self.io) catch {};
+            self.sv.scrollToEnd(ss.nowMs(self.io));
+            self.render_mutex.unlock(self.io);
+            self.startSpinner();
+            self.startWatch();
+            self.redraw();
+            const run_err: ?anyerror = if (self.session.runPrompt(text)) |_| null else |e| e;
+            self.drainTurnEvents();
+            if (run_err) |e| {
+                var err_buf: [256]u8 = undefined;
+                const err_msg = std.fmt.bufPrint(&err_buf, "[error: {s}]", .{@errorName(e)}) catch "error";
+                self.addAssistantMessage(err_msg);
+            }
+            self.stopWatch();
+            self.stopSpinner();
+            self.alloc.free(text);
+        } else {
+            self.redraw();
+        }
+    }
+
+    /// pi updatePendingMessagesDisplay: the dim "Steering: ..." / "Follow-up:
+    /// ..." rows between the transcript and the editor border.
+    fn renderCompactQueue(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        for (self.compact_queue.items) |e| {
+            const label: []const u8 = switch (e.mode) {
+                .steer => "Steering: ",
+                .followUp => "Follow-up: ",
+            };
+            const line = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}{s}" ++ ansi.RESET, .{ label, e.text }) catch continue;
+            const truncated = truncateToWidth(self.alloc, line, self.width) catch line;
+            if (truncated.ptr != line.ptr) self.alloc.free(line);
+            frame.append(self.alloc, truncated) catch {};
+        }
     }
 
     fn parseCmd(cmd: []const u8) struct { word: []const u8, arg: []const u8 } {
@@ -7333,8 +7544,18 @@ pub const TUI = struct {
             // below ticks the deadline, so the scrollbar hides while idle
             // (pi: the hide timer schedules a re-render). While the spinner
             // runs its own redraws already tick it.
-            self.key_reader.poll = self.sv.hide_at_ms != null or self.flash_msg != null or self.wheel_frame_pending;
+            // While compaction runs the main loop must keep waking to poll
+            // compact_done (the worker sets it from its own thread).
+            self.key_reader.poll = self.sv.hide_at_ms != null or self.flash_msg != null or self.wheel_frame_pending or self.compacting;
             const key = self.key_reader.nextKey(0, self.io) catch break;
+            // Compaction finished on its worker thread: render the result and
+            // flush the queue (main thread only, like a normal turn end).
+            // Checked before the .unknown tick: with no key input the loop
+            // only sees ticks, and completion must not wait for a keypress.
+            if (self.compact_done) {
+                self.compact_done = false;
+                self.finishCompaction();
+            }
             // Modal dialogs swallow the global bindings (scroll, search,
             // ctrl+c/d exit, paste...) — only the dialog's own keys respond.
             const modal_open = self.menu_mode == .settings or self.menu_mode == .sessions or
@@ -8111,6 +8332,27 @@ pub const TUI = struct {
                 }
             }
 
+            // pi: while compaction runs, ESC aborts it (abortCompaction) and
+            // Enter/alt+Enter queue the message for after it finishes.
+            if (self.compacting) {
+                if (key == .escape) {
+                    // pi: ESC while compacting aborts the compaction.
+                    agent.requestAbort();
+                    continue;
+                }
+                const compact_alt_enter = key == .char and key.char.c == '\r' and key.char.alt;
+                if (self.bindings.matches(key, .submit) or compact_alt_enter) {
+                    const text = self.editor.getText() catch continue;
+                    if (text.len > 0) {
+                        self.editor.addToHistory(text);
+                        self.queueCompactMessage(text, if (compact_alt_enter) .followUp else .steer);
+                    }
+                    self.alloc.free(text);
+                    continue;
+                }
+                // Other keys edit the buffer normally (pi keeps the editor
+                // active during compaction).
+            }
             // Translate configured newline/submit keys into canonical editor
             // keys so the editor stays mapping-agnostic.
             // pi handleFollowUp (interactive-mode.js): idle Alt+Enter acts
@@ -8238,7 +8480,14 @@ pub const TUI = struct {
                 }
             }
             self.updateMenu();
-            self.redraw();
+            // While compaction runs the worker mutates session.context; the
+            // full redraw walks the session for the footer stats, so use the
+            // cached-stats path (like the watcher thread does).
+            if (self.compacting) {
+                self.redrawCached();
+            } else {
+                self.redraw();
+            }
         }
     }
 };

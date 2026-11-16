@@ -110,11 +110,12 @@ pub fn streamDispatch(
     supports_images: bool,
     thinking_level: config.ThinkingLevel,
     tinfo: openai.OpenAiProvider.ThinkingInfo,
+    max_tokens: usize,
     session: anytype,
 ) !void {
     switch (provider) {
         .openai_completions => |p| {
-            return p.streamChat(model_id, messages, tools_json, supports_images, thinking_level, tinfo, session);
+            return p.streamChat(model_id, messages, tools_json, supports_images, thinking_level, tinfo, max_tokens, session);
         },
         .anthropic_messages => |p| {
             return p.streamChat(model_id, messages, tools_json, supports_images, thinking_level, session);

@@ -63,8 +63,10 @@ pub const ThinkingLevel = enum {
 
 /// Provider-specific thinking parameter format (pi-ai compat.thinkingFormat):
 /// .default → `reasoning_effort`; .zai → `thinking:{type:enabled|disabled}`
-/// (GLM series); .qwen → `enable_thinking` (DashScope/Qwen).
-pub const ThinkingFormat = enum { default, zai, qwen };
+/// (GLM series); .qwen → `enable_thinking` (DashScope/Qwen);
+/// .qwen_chat_template → `chat_template_kwargs:{enable_thinking,
+/// preserve_thinking}` (local vLLM/SGLang Qwen endpoints).
+pub const ThinkingFormat = enum { default, zai, qwen, qwen_chat_template };
 
 /// Split a trailing `:level` thinking suffix (pi splitThinkingSuffix):
 /// `ovf/ovf-mini:high` → base "ovf/ovf-mini", level .high. Returns null
@@ -1007,9 +1009,17 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                     .reasoning = boolIn(mo, "reasoning", false),
                     .thinking_level = ThinkingLevel.defaultFor(boolIn(mo, "reasoning", false), strIn(mo, "thinkingLevel")),
                     .thinking_format = blk_tf: {
-                        const tf = strIn(mo, "thinkingFormat") orelse break :blk_tf .default;
+                        // pi models.json nests this under compat.thinkingFormat.
+                        const compat = if (mo.get("compat")) |c| blk_c: {
+                            switch (c) {
+                                .object => |o| break :blk_c o,
+                                else => break :blk_c null,
+                            }
+                        } else null;
+                        const tf = strIn(mo, "thinkingFormat") orelse (if (compat) |c| strIn(c, "thinkingFormat") else null) orelse break :blk_tf .default;
                         if (std.mem.eql(u8, tf, "zai")) break :blk_tf .zai;
                         if (std.mem.eql(u8, tf, "qwen")) break :blk_tf .qwen;
+                        if (std.mem.eql(u8, tf, "qwen-chat-template")) break :blk_tf .qwen_chat_template;
                         break :blk_tf .default;
                     },
                     .supports_reasoning_effort = triBoolIn(mo, "supportsReasoningEffort"),
@@ -1109,6 +1119,7 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                                         const tf = Catalog.str(mo, "tf") orelse break :blk_ctf .default;
                                         if (std.mem.eql(u8, tf, "zai")) break :blk_ctf .zai;
                                         if (std.mem.eql(u8, tf, "qwen")) break :blk_ctf .qwen;
+                                        if (std.mem.eql(u8, tf, "qwen-chat-template")) break :blk_ctf .qwen_chat_template;
                                         break :blk_ctf .default;
                                     },
                                     .supports_images = boolIn(mo, "images", true),

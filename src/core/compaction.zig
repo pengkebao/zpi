@@ -519,6 +519,7 @@ pub fn generateSummary(
     previous_summary: ?[]const u8,
     custom_instructions: ?[]const u8,
     abort_check: ?*const fn () bool,
+    max_tokens: usize,
 ) !SummaryResult {
     _ = io; // reserved for abort-aware sleeps; provider handles retries
     const convo = try serializeConversation(alloc, messages_to_summarize);
@@ -561,7 +562,7 @@ pub fn generateSummary(
     var sess = SummarySession.init(alloc, abort_check);
     defer sess.deinit();
     // Compaction is a cheap summarization call: no reasoning effort.
-    aiprovider.streamDispatch(provider, model_id, wire.items, "[]", true, config.ThinkingLevel.off, .{}, &sess) catch |e| {
+    aiprovider.streamDispatch(provider, model_id, wire.items, "[]", true, config.ThinkingLevel.off, .{}, max_tokens, &sess) catch |e| {
         if (e == error.Aborted) return e;
         return e;
     };
