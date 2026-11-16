@@ -1381,6 +1381,30 @@ pub fn main(init: std.process.Init) !void {
             }
             for (branch) |m| session.context.append(m) catch {};
             if (session_name) |n| st.recordSessionInfo(n);
+            // pi: restore the session's model and thinking level (last
+            // model_change / thinking_level_change on the leaf path), unless
+            // the CLI pinned one. Struct copies share cfg-owned strings, so
+            // swapping is pointer-free.
+            if (model_name == null and model_id == null) {
+                if (st.latestModelChange(alloc)) |mc| {
+                    defer {
+                        alloc.free(mc.provider);
+                        alloc.free(mc.model_id);
+                    }
+                    const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ mc.provider, mc.model_id }) catch null;
+                    if (full) |f| {
+                        defer alloc.free(f);
+                        if (cfg.findModel(f)) |m| model = m.*;
+                    }
+                }
+                if (st.latestThinkingLevel(alloc)) |tl| {
+                    defer alloc.free(tl);
+                    if (config.ThinkingLevel.fromStr(tl)) |lvl| {
+                        model.thinking_level = lvl;
+                        session.thinking_level = lvl;
+                    }
+                }
+            }
         }
     }
 

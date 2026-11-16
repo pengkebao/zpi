@@ -1140,13 +1140,11 @@ pub const Store = struct {
         errdefer st.deinit();
         st.path = try alloc.dupe(u8, path);
 
-        var buf: [8 << 20]u8 = undefined;
-        const file = if (std.fs.path.isAbsolute(path))
-            std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only }) catch return error.CannotRead
-        else
-            std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return error.CannotRead;
-        const nbytes = file.readPositionalAll(io, &buf, 0) catch return error.CannotRead;
-        const data = buf[0..nbytes];
+        // Full file, unbounded: long-lived sessions grow past any fixed
+        // stack buffer (the old 8MB read silently truncated 25MB session
+        // files, cutting the replay/leaf-path at the buffer edge).
+        const data = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch return error.CannotRead;
+        defer alloc.free(data);
         try st.file_buf.appendSlice(data);
 
         var lines = std.mem.splitScalar(u8, data, '\n');
@@ -1333,6 +1331,36 @@ pub const Store = struct {
             }
         }
         return out.toOwnedSlice();
+    }
+
+    /// Full leaf-path transcript with NO compaction filtering (pi UI replay:
+    /// the transcript keeps every message; compaction only shapes the LLM
+    /// context via branchMessages). Used by the TUI replay so `--session` /
+    /// `-c` shows the whole history, not just the post-compaction window.
+    pub fn branchAllMessages(self: *Store, alloc: std.mem.Allocator) ![]msg.Message {
+        var out = std.array_list.Managed(msg.Message).init(alloc);
+        errdefer {
+            for (out.items) |*m| m.deinit();
+            out.deinit();
+        }
+        const path = try self.leafPath(alloc);
+        defer path.deinit();
+        for (path.items) |e| {
+            if (e.kind != .message) continue;
+            if (Store.parseMessageEntry(alloc, e.line)) |m| try out.append(m);
+        }
+        return out.toOwnedSlice();
+    }
+
+    /// Compaction entries on the leaf path (pi "Session compacted N times").
+    pub fn compactionCount(self: *Store, alloc: std.mem.Allocator) usize {
+        const path = self.leafPath(alloc) catch return 0;
+        defer path.deinit();
+        var n: usize = 0;
+        for (path.items) |e| {
+            if (e.kind == .compaction) n += 1;
+        }
+        return n;
     }
 
     /// Fork: new session file (new id, parentSession set) containing this

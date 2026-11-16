@@ -5638,7 +5638,11 @@ pub const TUI = struct {
         self.addWelcomeHeader();
         const st = self.session.store orelse return;
         const alloc = self.session.alloc;
-        const branch = st.branchMessages(alloc) catch return;
+        // Full transcript, NOT the compaction-filtered context: pi's UI keeps
+        // every message after a compaction (compaction only shapes the LLM
+        // context). branchMessages here used to truncate the replay to the
+        // post-compaction window, so --session showed stale mid-history.
+        const branch = st.branchAllMessages(alloc) catch return;
         defer {
             for (branch) |m| m.deinit();
             alloc.free(branch);
@@ -5684,6 +5688,17 @@ pub const TUI = struct {
                     self.addBashBlock(cmd, out_text, m.bash_exit_code, m.bash_exclude);
                 },
             }
+        }
+        // pi: "Session compacted N times" startup note (dim, transcript tail).
+        const n_compactions = st.compactionCount(alloc);
+        if (n_compactions > 0) {
+            var note_buf: [96]u8 = undefined;
+            const note_text = std.fmt.bufPrint(
+                &note_buf,
+                "\x1b[2mSession compacted {d} time{s}\x1b[0m\n",
+                .{ n_compactions, if (n_compactions == 1) "" else "s" },
+            ) catch return;
+            self.addMessage(note_text);
         }
     }
 
