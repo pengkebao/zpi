@@ -2,7 +2,7 @@
 
 > 一个用纯 Zig 写的终端编程智能体 —— [pi](https://pi.dev) 1.5.0 的行为级重实现
 
-![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/tests-430%2B-brightgreen)
+![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/tests-600%2B-brightgreen))
 
 **零第三方依赖 · 单二进制 · 与 pi 配置/会话双向兼容**
 
@@ -24,6 +24,8 @@ zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP
 - 会话持久化（jsonl，pi 同格式）+ `-c`/`-r` 继续会话（模型上下文与 TUI 界面双恢复）
 - 上下文压缩：手动 `/compact` + 阈值自动压缩，压缩摘要块入转写
 - 成本 / 缓存命中率 / token 统计（footer 实时显示）
+- **运行中可干预**（pi 同款 steering / follow-up）：流式期间 Enter 排入 steering（下个 LLM 请求前注入上下文）、alt+Enter 排入 follow-up（本回合结束后跑新回合），编辑器上方实时显示 `Steering: …` / `Follow-up: …` pending 行；ESC 中断时全部排队消息恢复回编辑器（不丢失）；`steeringMode` / `followUpMode` 设置（all / one-at-a-time）从 settings.json 读取
+- **流式韧性**：SSE 断流（无 `[DONE]`/终止事件）判定为传输错误自动重试，不再把截断响应当作成功；空响应显式报错；工具轮次上限（默认 200）触顶时提示而非静默停止
 - MCP 客户端：stdio + HTTP 传输、OAuth 登录、工具注册与热重载、`zpi mcp add/remove/list` 全套管理
 - 技能（Skills）与提示模板（Prompts）：pi 同款发现机制与 `SKILL.md` 格式
 - 事件总线 + hooks.json 钩子（session_start / pre_tool_call / post_tool_call / compaction）
@@ -37,6 +39,8 @@ zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP
 - 补全菜单（`/` 命令、模型名、`!` bash）、转写内搜索（高亮 + 前后导航）
 - 滚动体验：follow-end 钉底、滚轮加速度计、到底惰性（no-op 拉拽零字节）
 - 鼠标：点击折叠块、拖拽选区、松开复制（OSC52）、水平滚轮过滤
+- 编辑器：鼠标拖拽选区 + 双击选词（CJK 逐字）+ 三击选行、滚轮滚动编辑区；粘贴走 bracketed paste（多行整体粘贴，不再逐行提交）
+- 剪贴板双通道：OSC 52（SSH/远程终端）+ 系统剪贴板（macOS pbcopy / Linux xclip·wl-copy / Windows PowerShell），覆盖 Terminal.app 忽略 OSC 52 的场景
 - 启动欢迎头：半块像素 logo、双态键位提示（Ctrl+O 展开）、Model scope、技能/模板清单 —— 与 pi 逐行对齐
 
 ## 快速开始
@@ -85,8 +89,10 @@ apiKey 支持 字面量 / `$ENV_VAR` / `!command` 三种写法；凭据回退顺
 
 | 键 | 功能 |
 |---|---|
-| Enter | 提交 |
-| esc | 中止运行中的回合 |
+| Enter | 提交（**运行中** = 排入 steering 队列） |
+| alt+Enter | 运行中排入 follow-up 队列（结束后作为新回合执行） |
+| alt+↑ | 恢复全部排队消息到编辑器（pi dequeue） |
+| esc | 中止运行中的回合（排队消息先恢复回编辑器） |
 | ctrl+c | 清空编辑器；空时退出 |
 | ctrl+d | 空编辑器时退出 |
 | ctrl+z | 挂起后台（fg 恢复） |
@@ -133,9 +139,13 @@ src/
 ## 测试
 
 ```bash
-zig test test_ui.zig              # 216 个 UI/逻辑测试
-zig test leak_g2.zig              # 176 个泄漏回归测试（SafeAllocator 全路径）
-zig test test_mcp.zig             # MCP 客户端单测
+zig test test_ui.zig              # 234 个 UI/逻辑测试
+zig test leak_g2.zig              # 184 个泄漏回归测试（SafeAllocator 全路径）
+zig test src/ui/keys.zig          # 按键/鼠标序列解析（18）
+zig test test_openai.zig          # SSE 协议解析（10）
+zig test test_mcp.zig             # MCP 客户端单测（9）
+zig test test_clip.zig            # 剪贴板（2）
+zig test test_pending.zig         # steering/follow-up 队列（含传递依赖共 153）
 zig run bench_scroll.zig    # 滚动帧基准
 zig run bench_stream.zig    # 流式帧基准
 zig run bench_markdown.zig  # markdown 渲染基准

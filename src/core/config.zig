@@ -104,6 +104,14 @@ pub const Config = struct {
     /// settings.json "defaultThinkingLevel": the · default marker in the
     /// thinking selector (pi defaultThinkingLevel).
     default_thinking_level: ?ThinkingLevel = null,
+    /// settings.json "steeringMode" (pi default "one-at-a-time"): "all"
+    /// delivers every queued steering message before the next LLM request,
+    /// "one-at-a-time" delivers one per round.
+    steering_mode_all: bool = false,
+    /// settings.json "followUpMode" (pi default "one-at-a-time"): "all"
+    /// drains follow-ups as one combined new turn, "one-at-a-time" starts
+    /// one follow-up turn per settled round.
+    follow_up_mode_all: bool = false,
     /// settings.json "enabledModels": patterns ("provider/id" or
     /// "provider/*") limiting the Ctrl+P model cycle. null = all enabled
     /// (pi enabledModels).
@@ -362,6 +370,13 @@ pub const Config = struct {
         if (strIn(root, "defaultModel")) |dm| {
             if (self.default_model) |old| alloc.free(old);
             self.default_model = alloc.dupe(u8, dm) catch null;
+        }
+        // pi steeringMode / followUpMode: "all" | "one-at-a-time".
+        if (strIn(root, "steeringMode")) |m| {
+            self.steering_mode_all = std.mem.eql(u8, m, "all");
+        }
+        if (strIn(root, "followUpMode")) |m| {
+            self.follow_up_mode_all = std.mem.eql(u8, m, "all");
         }
         // Fullscreen scrollbar: "auto" (pi default) | "always" | "hidden".
         if (strIn(root, "fullscreenScrollbar")) |sb| {

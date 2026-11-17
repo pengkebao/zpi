@@ -97,7 +97,7 @@ pub const Session = struct {
     provider: aiprovider.AnyProvider,
     context: msg.Context,
     exec_ctx: tools.ExecutionContext,
-    max_tool_rounds: usize = 50,
+    max_tool_rounds: usize = 200,
     compaction: compact.Settings = compact.DEFAULT_SETTINGS,
     /// Optional callback for streamed output. If set (TUI mode), all output
     /// kinds go to the callback; otherwise text goes to stdout and everything
@@ -202,6 +202,30 @@ pub const Session = struct {
         // cwd is a static string, no need to free
     }
 
+    /// pi restoreQueuedMessagesToEditor: take EVERY queued message
+    /// (steering first, then follow-up) and return them joined with "\n\n".
+    /// The TUI's ESC (while working) and alt+up restore the queues into the
+    /// editor instead of losing them.
+    pub fn restoreQueued(self: *Session) ?[]u8 {
+        self.queue_mutex.lock(self.io) catch return null;
+        defer self.queue_mutex.unlock(self.io);
+        var texts = std.ArrayListUnmanaged([]u8).empty;
+        defer texts.deinit(self.alloc);
+        for (self.steering_queue.items) |t| texts.append(self.alloc, t) catch return null;
+        for (self.followup_queue.items) |t| texts.append(self.alloc, t) catch return null;
+        const n = texts.items.len;
+        self.steering_queue.clearRetainingCapacity();
+        self.followup_queue.clearRetainingCapacity();
+        if (n == 0) return null;
+        var joined = std.ArrayListUnmanaged(u8).empty;
+        defer joined.deinit(self.alloc);
+        for (texts.items, 0..) |t, i| {
+            if (i > 0) joined.appendSlice(self.alloc, "\n\n") catch return null;
+            joined.appendSlice(self.alloc, t) catch return null;
+        }
+        return joined.toOwnedSlice(self.alloc) catch null;
+    }
+
     /// Queue `text` to steer the running turn (watcher thread; copies).
     pub fn queueSteering(self: *Session, text: []const u8) void {
         const copy = self.alloc.dupe(u8, text) catch return;
@@ -230,6 +254,38 @@ pub const Session = struct {
         };
     }
 
+    /// One queued message with its queue kind (pi pendingMessage display).
+    pub const QueuedMessage = struct {
+        text: []u8,
+        mode: enum { steer, followUp },
+    };
+
+    /// Peek at every queued message (steering first, then follow-up)
+    /// WITHOUT draining: the TUI renders the dim "Steering: ..." /
+    /// "Follow-up: ..." pending rows (pi updatePendingMessagesDisplay).
+    /// Caller owns every text and the slice.
+    pub fn queuedPeek(self: *Session) []QueuedMessage {
+        self.queue_mutex.lock(self.io) catch return &.{};
+        defer self.queue_mutex.unlock(self.io);
+        var out = std.ArrayListUnmanaged(QueuedMessage).empty;
+        defer out.deinit(self.alloc);
+        for (self.steering_queue.items) |t| {
+            out.append(self.alloc, .{ .text = self.alloc.dupe(u8, t) catch break, .mode = .steer }) catch break;
+        }
+        for (self.followup_queue.items) |t| {
+            out.append(self.alloc, .{ .text = self.alloc.dupe(u8, t) catch break, .mode = .followUp }) catch break;
+        }
+        return out.toOwnedSlice(self.alloc) catch &.{};
+    }
+
+    /// Total queued message count (steering + follow-up); the TUI reserves
+    /// a pending-row per message above the editor.
+    pub fn queuedPeekLen(self: *Session) usize {
+        self.queue_mutex.lock(self.io) catch return 0;
+        defer self.queue_mutex.unlock(self.io);
+        return self.steering_queue.items.len + self.followup_queue.items.len;
+    }
+
     /// Number of queued follow-up messages (steering drains invisibly).
     pub fn followUpCount(self: *Session) usize {
         self.queue_mutex.lock(self.io) catch return 0;
@@ -251,6 +307,21 @@ pub const Session = struct {
         defer self.queue_mutex.unlock(self.io);
         if (self.followup_queue.items.len == 0) return null;
         return self.followup_queue.orderedRemove(0);
+    }
+
+    /// All follow-up messages (mode "all") or just the oldest one
+    /// (mode "one-at-a-time" — the rest stay queued).
+    fn drainFollowUpAll(self: *Session) ![][]u8 {
+        self.queue_mutex.lock(self.io) catch return error.LockFailed;
+        defer self.queue_mutex.unlock(self.io);
+        if (self.follow_up_mode_all) {
+            return self.followup_queue.toOwnedSlice(self.alloc);
+        }
+        if (self.followup_queue.items.len == 0) return &.{};
+        const one = self.followup_queue.orderedRemove(0);
+        const out = try self.alloc.alloc([]u8, 1);
+        out[0] = one;
+        return out;
     }
 
     /// Append queued steering messages to the context as user messages
@@ -756,7 +827,12 @@ pub const Session = struct {
             tool_calls.deinit();
 
             const aborted = self.isAborted();
-            if (assistant_msg.blocks.items.len == 0) break;
+            if (assistant_msg.blocks.items.len == 0) {
+                // The provider "succeeded" but produced nothing (truncated
+                // stream, gateway hiccup). A silent break here made the turn
+                // die without a trace; fail loudly instead.
+                return error.EmptyResponse;
+            }
             const sr: []const u8 = if (n_tool_calls_pending(&assistant_msg) > 0) "toolUse" else "stop";
             assistant_msg.stop_reason = msg.Message.allocStr(self.alloc, sr);
             try self.appendAndRecord(&assistant_msg);
@@ -766,11 +842,32 @@ pub const Session = struct {
             const n_tool_calls: usize = n_tool_calls_pending(&assistant_msg);
 
             if (n_tool_calls == 0) {
-                // Turn complete. A queued follow-up message starts a new turn
-                // (pi: the outer loop continues with followUpQueue contents).
-                if (self.drainFollowUp()) |fu| {
+                // Turn complete. Queued follow-up messages start new turns
+                // (pi: the outer loop continues with followUpQueue.drain();
+                // mode "all" takes them all at once, "one-at-a-time" the
+                // oldest).
+                const fus = self.drainFollowUpAll() catch &.{};
+                defer {
+                    for (fus) |fu| self.alloc.free(fu);
+                    self.alloc.free(fus);
+                }
+                if (fus.len > 0) {
+                    // More than one (mode "all"): join like a steering drain.
+                    var prompt2: []u8 = fus[0];
+                    if (fus.len > 1) {
+                        var joined = std.ArrayListUnmanaged(u8).empty;
+                        for (fus, 0..) |fu, i| {
+                            if (i > 0) joined.appendSlice(self.alloc, "\n\n") catch break;
+                            joined.appendSlice(self.alloc, fu) catch break;
+                        }
+                        if (joined.items.len > 0) {
+                            prompt2 = joined.toOwnedSlice(self.alloc) catch prompt2;
+                        } else {
+                            joined.deinit(self.alloc);
+                        }
+                    }
                     self.alloc.free(current_prompt);
-                    current_prompt = fu;
+                    current_prompt = prompt2;
                     follow_up = true;
                     rounds = 0;
                 }
@@ -852,6 +949,17 @@ pub const Session = struct {
             }
 
             if (self.isAborted()) break;
+        }
+        // The loop exhausted its tool rounds without the model finishing:
+        // say so — a silent exit looked exactly like a random interruption.
+        if (rounds >= self.max_tool_rounds) {
+            const s = std.fmt.allocPrint(
+                self.alloc,
+                "\n[stopped: tool-round limit reached ({d} rounds). Send '继续' to resume the task.]\n",
+                .{self.max_tool_rounds},
+            ) catch "\n[stopped: tool-round limit reached]\n";
+            defer self.alloc.free(s);
+            self.emit(.tool_info, s);
         }
         }
     }

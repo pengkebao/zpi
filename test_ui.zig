@@ -255,7 +255,7 @@ test "selection: drag selects doc text, highlight reverses the range" {
     try std.testing.expect(t.transcript_h > 0);
 
     // Drag from 's' of 'selected' to the 'd' of 'middle'.
-    _ = t.handlePress(6, 0);
+    _ = t.handlePress(6, 0, 1);
     _ = t.handleDrag(21, 0);
     const text = t.selectionText().?;
     defer alloc.free(text);
@@ -373,7 +373,7 @@ test "thinking: click collapses streaming and finished thinking blocks" {
 
     // The live thinking rows sit right after the scrollback doc rows.
     const think_row: usize = t.doc_lines.items.len - t.sv.scroll_top;
-    _ = t.handlePress(5, think_row);
+    _ = t.handlePress(5, think_row, 1);
     _ = t.handleRelease(5, think_row);
     try std.testing.expect(t.thinking_collapsed);
     t.render_mutex.lock(t.io) catch {};
@@ -383,7 +383,7 @@ test "thinking: click collapses streaming and finished thinking blocks" {
     try std.testing.expect(std.mem.indexOf(u8, live[0], "Thinking…") != null);
 
     // Clicking the "Thinking…" line expands again.
-    _ = t.handlePress(5, think_row);
+    _ = t.handlePress(5, think_row, 1);
     _ = t.handleRelease(5, think_row);
     try std.testing.expect(!t.thinking_collapsed);
     t.render_mutex.lock(t.io) catch {};
@@ -399,13 +399,13 @@ test "thinking: click collapses streaming and finished thinking blocks" {
     const blk = t.scrollback.items[0];
     try std.testing.expect(std.mem.indexOf(u8, blk, "finished thought alpha") != null);
     // The block's first content row is doc row 0 (viewport row 0).
-    _ = t.handlePress(4, 0);
+    _ = t.handlePress(4, 0, 1);
     _ = t.handleRelease(4, 0);
     try std.testing.expectEqual(@as(usize, 1), t.thinking_shut.items.len);
     try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "finished thought alpha") == null);
     try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "Thinking…") != null);
     // Click again → back to the full markdown.
-    _ = t.handlePress(4, 0);
+    _ = t.handlePress(4, 0, 1);
     _ = t.handleRelease(4, 0);
     try std.testing.expectEqual(@as(usize, 0), t.thinking_shut.items.len);
     try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "finished thought alpha") != null);
@@ -458,14 +458,14 @@ test "selection: clicking a tool block toggles its expansion" {
 
     // Click the block (press + release on the same cell) → expanded.
     const before = t.scrollback.items[idx];
-    _ = t.handlePress(3, 1);
+    _ = t.handlePress(3, 1, 1);
     _ = t.handleRelease(3, 1);
     try std.testing.expect(t.tool_calls.items[0].expanded == true);
     try std.testing.expect(!std.mem.eql(u8, before, t.scrollback.items[idx]));
     try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[idx], "out line 5") != null);
 
     // Click again → back to the collapsed preview (the global default).
-    _ = t.handlePress(3, 1);
+    _ = t.handlePress(3, 1, 1);
     _ = t.handleRelease(3, 1);
     try std.testing.expect(t.tool_calls.items[0].expanded == false);
     try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[idx], "out line 5") == null);
@@ -797,4 +797,238 @@ test "session: leafChain previews + branchAt/forkAt + thinking entries" {
     try std.testing.expectEqual(@as(usize, 2), cnt3);
     try std.testing.expect(chain3[1].kind == .branch_summary);
     try std.testing.expectEqualStrings("abandoned path summary", chain3[1].preview[0..chain3[1].preview_len]);
+}
+
+// ---- Editor mouse selection ----
+
+test "editor selection: drag selects, selectionText extracts, insert replaces" {
+    const alloc = std.heap.page_allocator;
+    var e = editor.Editor.init(alloc);
+    defer e.deinit();
+    e.setText("hello world\nsecond line") catch unreachable;
+
+    // No selection → nothing.
+    try std.testing.expect(e.selBounds() == null);
+    try std.testing.expect(e.selectionText() == null);
+
+    // Select "world" on line 0: logical (0,6) to (0,11).
+    e.sel_anchor = .{ .line = 0, .col = 6 };
+    e.sel_focus = .{ .line = 0, .col = 11 };
+    const b = e.selBounds().?;
+    try std.testing.expectEqual(@as(usize, 0), b.start.line);
+    try std.testing.expectEqual(@as(usize, 6), b.start.col);
+    try std.testing.expectEqual(@as(usize, 11), b.end.col);
+    const text = e.selectionText().?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("world", text);
+
+    // Typing replaces the selection.
+    e.insertBytes("z") catch unreachable;
+    e.clearSelection();
+    const full = try e.getText();
+    defer alloc.free(full);
+    try std.testing.expectEqualStrings("hello z\nsecond line", full);
+
+    // Multi-line selection: "z\nsecond" (line 0 byte 6 → line 1 byte 6).
+    e.sel_anchor = .{ .line = 0, .col = 6 };
+    e.sel_focus = .{ .line = 1, .col = 6 };
+    const text2 = e.selectionText().?;
+    defer alloc.free(text2);
+    try std.testing.expectEqualStrings("z\nsecond", text2);
+
+    // Backward drag: anchor after focus → bounds still ordered.
+    e.sel_anchor = .{ .line = 1, .col = 6 };
+    e.sel_focus = .{ .line = 0, .col = 6 };
+    const bb = e.selBounds().?;
+    try std.testing.expectEqual(@as(usize, 0), bb.start.line);
+    try std.testing.expectEqual(@as(usize, 1), bb.end.line);
+
+    // placeCursor maps a visual point (rendered at width) to the logical
+    // cursor. No wrapping at width 80: visual row == logical line.
+    e.clearSelection();
+    e.placeCursor(1, 4, 80);
+    try std.testing.expectEqual(@as(usize, 1), e.cursor_line);
+    try std.testing.expectEqual(@as(usize, 4), e.cursor_col);
+    e.placeCursor(5, 0, 80); // past the end → last line's end
+    try std.testing.expectEqual(@as(usize, 1), e.cursor_line);
+    try std.testing.expectEqual(@as(usize, 11), e.cursor_col);
+}
+
+test "editor selection: wrapping is visual-column aware" {
+    const alloc = std.heap.page_allocator;
+    var e = editor.Editor.init(alloc);
+    defer e.deinit();
+    // 36-char line wraps at width 10:
+    // "abcdefghij" / " klmnopqrs" / " tuvwx " / "yz012345"
+    e.setText("abcdefghij klmnopqrs tuvwx yz012345") catch unreachable;
+    // Visual row 1 " klmnopqrs" starts at byte 10.
+    e.placeCursor(1, 0, 10);
+    try std.testing.expectEqual(@as(usize, 0), e.cursor_line);
+    try std.testing.expectEqual(@as(usize, 10), e.cursor_col);
+    // Visual col 5 on row 1 → byte 15.
+    e.placeCursor(1, 5, 10);
+    try std.testing.expectEqual(@as(usize, 15), e.cursor_col);
+    // Select visual row 1 entirely: bytes 10..20.
+    e.sel_anchor = e.visualToLogical(1, 0, 10);
+    e.sel_focus = e.visualToLogical(1, 10, 10);
+    const text = e.selectionText().?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(" klmnopqrs", text);
+}
+
+test "editor selection: CJK visual columns map to byte offsets" {
+    const alloc = std.heap.page_allocator;
+    var e = editor.Editor.init(alloc);
+    defer e.deinit();
+    // "ab中文": a=1 b=1 中=2 文=2 → visual cols 0,1,2,4,6
+    e.setText("ab中文") catch unreachable;
+    // Visual col 4 = start of 文 (byte 5).
+    const p = e.visualToLogical(0, 4, 80);
+    try std.testing.expectEqual(@as(usize, 5), p.col);
+    // Select 中文: logical bytes 2..8.
+    e.sel_anchor = .{ .line = 0, .col = 2 };
+    e.sel_focus = .{ .line = 0, .col = 8 };
+    const text = e.selectionText().?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("中文", text);
+}
+
+test "editor selection: highlightSelection inverts the selected range" {
+    const alloc = std.heap.page_allocator;
+    var e = editor.Editor.init(alloc);
+    defer e.deinit();
+    e.setText("hello world") catch unreachable;
+    e.sel_anchor = .{ .line = 0, .col = 6 };
+    e.sel_focus = .{ .line = 0, .col = 11 };
+    var frame: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (frame.items) |l| alloc.free(l);
+        frame.deinit(alloc);
+    }
+    const row = try alloc.dupe(u8, "hello world");
+    try frame.append(alloc, row);
+    e.highlightSelection(&frame, 0, 1, 0, 80, alloc);
+    // The selected range is wrapped in reverse-video escapes.
+    try std.testing.expect(std.mem.indexOf(u8, frame.items[0], "\x1b[7mworld\x1b[27m") != null);
+}
+
+test "editor selection: highlight respects the visible window" {
+    const alloc = std.heap.page_allocator;
+    var e = editor.Editor.init(alloc);
+    defer e.deinit();
+    e.setText("line one\nline two\nline three") catch unreachable;
+    // Select all of logical line 1.
+    e.sel_anchor = .{ .line = 1, .col = 0 };
+    e.sel_focus = .{ .line = 1, .col = 8 };
+    var frame: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (frame.items) |l| alloc.free(l);
+        frame.deinit(alloc);
+    }
+    // Rendered window: only visual rows 1..2 visible (vis_top=1, count=2).
+    const r1 = try alloc.dupe(u8, "line two");
+    const r2 = try alloc.dupe(u8, "line three");
+    try frame.append(alloc, r1);
+    try frame.append(alloc, r2);
+    e.highlightSelection(&frame, 0, 2, 1, 80, alloc);
+    try std.testing.expect(std.mem.indexOf(u8, frame.items[0], "\x1b[7mline two\x1b[27m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame.items[1], "\x1b[7m") == null);
+}
+
+test "editor selection: typing replaces, arrows keep, backspace deletes, escape clears" {
+    const alloc = std.heap.page_allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var e = editor.Editor.init(alloc);
+    defer e.deinit();
+    e.setText("hello world") catch unreachable;
+    e.sel_anchor = .{ .line = 0, .col = 6 };
+    e.sel_focus = .{ .line = 0, .col = 11 };
+
+    // Plain cursor moves keep the selection (no surprise reset mid-drag).
+    _ = e.handleKey(.{ .left = {} }, io) catch unreachable;
+    try std.testing.expect(e.selBounds() != null);
+    _ = e.handleKey(.{ .right = {} }, io) catch unreachable;
+    try std.testing.expect(e.selBounds() != null);
+
+    // Typing replaces the selection (insertBytes path).
+    _ = e.handleKey(.{ .char = .{ .c = 'X', .ctrl = false, .alt = false } }, io) catch unreachable;
+    try std.testing.expect(e.selBounds() == null);
+    const full = try e.getText();
+    defer alloc.free(full);
+    try std.testing.expectEqualStrings("hello X", full);
+
+    // Select + backspace deletes the whole selection.
+    e.sel_anchor = .{ .line = 0, .col = 6 };
+    e.sel_focus = .{ .line = 0, .col = 7 };
+    _ = e.handleKey(.{ .backspace = {} }, io) catch unreachable;
+    const full2 = try e.getText();
+    defer alloc.free(full2);
+    try std.testing.expectEqualStrings("hello ", full2);
+
+    // ESC clears an existing selection.
+    e.sel_anchor = .{ .line = 0, .col = 0 };
+    e.sel_focus = .{ .line = 0, .col = 3 };
+    _ = e.handleKey(.escape, io) catch unreachable;
+    try std.testing.expect(e.selBounds() == null);
+    try std.testing.expectEqualStrings("hello ", try e.getText());
+}
+
+test "editor selection: multi-line selection replace keeps the tail" {
+    const alloc = std.heap.page_allocator;
+    var e = editor.Editor.init(alloc);
+    defer e.deinit();
+    e.setText("alpha one\nbeta two\ngamma three") catch unreachable;
+    // Select from line 0 "one" through line 2 "three": replace with "X".
+    e.sel_anchor = .{ .line = 0, .col = 6 };
+    e.sel_focus = .{ .line = 2, .col = 5 };
+    e.insertBytes("X") catch unreachable;
+    const full = try e.getText();
+    defer alloc.free(full);
+    try std.testing.expectEqualStrings("alpha X three", full);
+    try std.testing.expectEqual(@as(usize, 0), e.cursor_line);
+    try std.testing.expectEqual(@as(usize, 7), e.cursor_col);
+}
+
+test "editor pasteText: multi-line splits, CRLF trimmed, selection replaced" {
+    const alloc = std.heap.page_allocator;
+    var e = editor.Editor.init(alloc);
+    defer e.deinit();
+
+    // Multi-line paste at the cursor.
+    e.setText("ab") catch unreachable;
+    e.placeCursor(0, 1, 80); // between 'a' and 'b'
+    e.pasteText("x\r\ny\n") catch unreachable;
+    const t1 = try e.getText();
+    defer alloc.free(t1);
+    try std.testing.expectEqualStrings("ax\nyb", t1);
+    try std.testing.expectEqual(@as(usize, 1), e.cursor_line);
+
+    // Paste over a multi-line selection replaces it.
+    e.setText("alpha one\nbeta two\ngamma three") catch unreachable;
+    e.sel_anchor = .{ .line = 0, .col = 6 };
+    e.sel_focus = .{ .line = 2, .col = 5 };
+    e.pasteText("P1\nP2\nP3") catch unreachable;
+    const t2 = try e.getText();
+    defer alloc.free(t2);
+    try std.testing.expectEqualStrings("alpha P1\nP2\nP3 three", t2);
+    try std.testing.expectEqual(@as(usize, 2), e.cursor_line);
+    try std.testing.expectEqual(@as(usize, 2), e.cursor_col);
+}
+
+test "editor visualToLogical maps every visual row of wrapped lines" {
+    const alloc = std.heap.page_allocator;
+    var e = editor.Editor.init(alloc);
+    defer e.deinit();
+    // Width 10: three logical lines, "aaaa|bbbb" splits into 2 rows.
+    e.setText("aaaaaaaaaabbbbbbbbbb\ncc") catch unreachable;
+    const p0 = e.visualToLogical(0, 0, 10);
+    try std.testing.expectEqual(@as(usize, 0), p0.line);
+    try std.testing.expectEqual(@as(usize, 0), p0.col);
+    const p1 = e.visualToLogical(1, 2, 10);
+    try std.testing.expectEqual(@as(usize, 0), p1.line);
+    try std.testing.expectEqual(@as(usize, 12), p1.col);
+    const p2 = e.visualToLogical(2, 1, 10);
+    try std.testing.expectEqual(@as(usize, 1), p2.line);
+    try std.testing.expectEqual(@as(usize, 1), p2.col);
+    try std.testing.expectEqual(@as(usize, 3), e.visualLineCount(10));
 }

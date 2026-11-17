@@ -436,6 +436,27 @@ pub const TUI = struct {
     sel_focus: ?SelPoint = null,
     sel_press: ?MousePoint = null,
     sel_dragged: bool = false,
+    /// The active press/drag targets the editor (its anchor/focus live in
+    /// self.editor) rather than the transcript (self.sel_anchor/focus).
+    sel_in_editor: bool = false,
+    /// Frame row of the editor's first visible visual line, plus the editor
+    /// window offset/height from the last render (mouse hit-testing).
+    editor_frame_row: usize = 0,
+    editor_vis_top: usize = 0,
+    editor_visible_rows: usize = 0,
+    /// The width the editor was rendered (wrapped) at — the visual→logical
+    /// mapping for mouse events must use the same width as the render.
+    editor_render_width: usize = 0,
+    /// Double/triple-click detection fallback (time + same-cell): terminals
+    /// that do not encode click counts still produce word/line selection.
+    last_click_ms: i64 = 0,
+    last_click_cell: keys.MouseCell = .{ .col = 0xFFFF, .row = 0xFFFF },
+    click_streak: u8 = 0,
+    /// Selection auto-scroll (pi: trackpad scrollSelection): when a drag
+    /// pins at the editor window's top/bottom row, the editor window
+    /// scrolls 1 visual line per event in that direction until the
+    /// pointer moves or the button is released.
+    editor_autoscroll: isize = 0,
     /// Transient feedback ("Copied!"): shown on the cwd row's right until
     /// the deadline (pi: the flash stack).
     flash_msg: ?[]u8 = null,
@@ -509,6 +530,10 @@ pub const TUI = struct {
     /// Set by modal open/close paths: the next redraw hard-clears instead of
     /// diffing (large view-height swings leave stale rows behind otherwise).
     force_full_repaint: bool = false,
+    /// Set by the watcher thread when /exit is typed while the agent runs;
+    /// the main loop breaks on its next iteration (pi: extension commands
+    /// run immediately, even mid-stream).
+    cmd_exit_requested: bool = false,
     /// Backed settings fields (see settingsApply).
     skill_commands: bool = true,
     steering_mode_all: bool = true,
@@ -1684,8 +1709,14 @@ pub const TUI = struct {
             },
             .skill_commands => self.skill_commands = std.mem.eql(u8, next, "true"),
             .autocomplete_max => self.autocomplete_max = std.fmt.parseInt(usize, next, 10) catch 5,
-            .steering_mode => self.steering_mode_all = std.mem.eql(u8, next, "all"),
-            .follow_up_mode => self.follow_up_mode_all = std.mem.eql(u8, next, "all"),
+            .steering_mode => {
+                self.steering_mode_all = std.mem.eql(u8, next, "all");
+                self.session.steering_mode_all = self.steering_mode_all;
+            },
+            .follow_up_mode => {
+                self.follow_up_mode_all = std.mem.eql(u8, next, "all");
+                self.session.follow_up_mode_all = self.follow_up_mode_all;
+            },
             .hide_thinking => self.thinking_hidden = std.mem.eql(u8, next, "true"),
             .default_project_trust => {
                 if (cfg) |c| {
@@ -2758,6 +2789,15 @@ pub const TUI = struct {
             self.redraw();
             return;
         }
+        // An editor selection wins over the last-reply fallback (ctrl+x
+        // with text selected in the input box copies that text).
+        if (self.editor.selectionText()) |text| {
+            defer self.alloc.free(text);
+            self.copyToClipboard(text);
+            self.flash("Copied!");
+            self.redraw();
+            return;
+        }
         const msgs = self.session.context.messages.items;
         var i = msgs.len;
         while (i > 0) {
@@ -2916,6 +2956,7 @@ pub const TUI = struct {
                 // ESC aborts, an incomplete fragment is dropped.
                 if (pend_len > 0) {
                     if (pend_len == 1 and pend[0] == 0x1b) {
+                        _ = self.restoreQueuedToEditor();
                         agent.requestAbort();
                         return;
                     }
@@ -2937,23 +2978,31 @@ pub const TUI = struct {
                 const seq = pend[pos .. pos + len];
                 pos += len;
                 if (seq.len == 1 and seq[0] == 0x1b) {
-                    // A lone ESC aborts the running turn (pi: Escape).
+                    // pi onEscape while streaming: restoreQueuedMessagesTo
+                    // Editor({abort:true}) — every queued message (steering
+                    // + follow-up) goes back into the editor, THEN abort.
+                    _ = self.restoreQueuedToEditor();
                     agent.requestAbort();
-                    return;
+                    // Keep the watcher alive: the user may type more after
+                    // the interrupt (the old `return` killed the thread and
+                    // the UI went deaf until the turn ended).
+                    continue;
                 }
                 // Ctrl+C also aborts a running turn (ISIG is off, so 0x03
                 // arrives as a byte).
                 if (seq.len == 1 and seq[0] == 0x03) {
+                    _ = self.restoreQueuedToEditor();
                     agent.requestAbort();
-                    return;
+                    continue;
                 }
                 if (std.mem.startsWith(u8, seq, "\x1b[27") and seq[seq.len - 1] == 'u') {
                     // Kitty CSI-u Escape press; releases (`:3`) do not abort.
                     const body = seq[3 .. seq.len - 1];
                     const is_release = std.mem.indexOfScalar(u8, body, ':') != null;
                     if (!is_release) {
+                        _ = self.restoreQueuedToEditor();
                         agent.requestAbort();
-                        return;
+                        continue;
                     }
                     continue;
                 }
@@ -2990,7 +3039,7 @@ pub const TUI = struct {
                             else => {},
                         }
                     } else if (m.button & 3 == 0) {
-                        acted = self.handlePress(m.col, m.row);
+                        acted = self.handlePress(m.col, m.row, 1);
                     }
                     continue;
                 }
@@ -3074,20 +3123,34 @@ pub const TUI = struct {
                     if (steering_key) {
                         if (k == .enter) {
                             // Enter while running: steer the current turn.
+                            // (Lock discipline: the lock covers only the
+                            // editor read/clear; handleCommand and the
+                            // steering queue run OUTSIDE it — they render.)
                             self.render_mutex.lockUncancelable(self.io);
                             const text = self.editor.getText() catch "";
                             defer self.alloc.free(@constCast(text));
                             const has_text = text.len > 0;
-                            if (has_text) {
-                                self.session.queueSteering(text);
-                                self.editor.clear() catch {};
-                            }
+                            const is_cmd = has_text and text[0] == '/';
+                            if (has_text) self.editor.clear() catch {};
                             self.render_mutex.unlock(self.io);
                             if (has_text) {
-                                self.addUserMessage(text);
-                                self.render_mutex.lock(self.io) catch {};
-                                self.sv.scrollToEnd(ss.nowMs(self.io));
-                                self.render_mutex.unlock(self.io);
+                                if (is_cmd) {
+                                    // pi: extension commands execute
+                                    // immediately, even while streaming —
+                                    // they never enter the steering queue
+                                    // (the model would see the raw "/cmd"
+                                    // text).
+                                    if (self.handleCommand(text)) {
+                                        self.cmd_exit_requested = true;
+                                        agent.requestAbort();
+                                    }
+                                } else {
+                                    self.session.queueSteering(text);
+                                    self.addUserMessage(text);
+                                    self.render_mutex.lock(self.io) catch {};
+                                    self.sv.scrollToEnd(ss.nowMs(self.io));
+                                    self.render_mutex.unlock(self.io);
+                                }
                                 self.redrawCached();
                             }
                             acted = true;
@@ -3099,14 +3162,11 @@ pub const TUI = struct {
                         acted = true;
                         continue;
                     }
-                    if (k == .char and k.char.alt and k.char.c == 'v') {
-                        // alt+v (windows pi binding) / alt+up both restore a
-                        // queued follow-up into the editor.
-                        if (self.session.drainFollowUp()) |text| {
-                            defer self.alloc.free(text);
-                            self.render_mutex.lockUncancelable(self.io);
-                            self.editor.setText(text) catch {};
-                            self.render_mutex.unlock(self.io);
+                    if (k == .alt_up or (k == .char and k.char.alt and k.char.c == 'v')) {
+                        // pi app.message.dequeue (alt+up / windows alt+v):
+                        // restore EVERY queued message (steering + follow-up)
+                        // into the editor.
+                        if (self.restoreQueuedToEditor() > 0) {
                             acted = true;
                             continue;
                         }
@@ -3204,7 +3264,7 @@ pub const TUI = struct {
             };
             if (c.fullscreen_wheel_lines) |n| wheel.lines = .{ .fixed = n };
         }
-        return .{
+                var t: TUI = .{
             .io = io,
             .alloc = alloc,
             .session = session,
@@ -3244,6 +3304,15 @@ pub const TUI = struct {
             .compact_err = null,
             .compact_queue = std.array_list.Managed(CompactQueueEntry).init(alloc),
         };
+        // pi: steeringMode / followUpMode come from settings (agent-session
+        // bind). The TUI's own copy is for the settings selector only.
+        if (cfg) |c| {
+            t.session.steering_mode_all = c.steering_mode_all;
+            t.session.follow_up_mode_all = c.follow_up_mode_all;
+            t.steering_mode_all = c.steering_mode_all;
+            t.follow_up_mode_all = c.follow_up_mode_all;
+        }
+        return t;
     }
 
     /// Late init for the parts that need the struct built (pi creates the
@@ -3348,6 +3417,10 @@ pub const TUI = struct {
         } else {
             self.writeRaw("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h");
         }
+        // Bracketed paste (pi: it is always enabled): multi-line terminal
+        // pastes arrive as one ESC[200~ ... ESC[201~ chunk instead of Enter
+        // presses that would submit the buffer line by line.
+        self.writeRaw("\x1b[?2004h");
         // Kitty keyboard protocol negotiation (pi-exact): push flags=7
         // (disambiguate + event types + alternate keys), query the resulting
         // flags, and DA1 as the no-support sentinel. The replies are consumed
@@ -3370,6 +3443,7 @@ pub const TUI = struct {
             stdout.writeStreamingAll(self.io, "\x1b[>4;0m") catch {};
             self.modify_other_keys = false;
         }
+        stdout.writeStreamingAll(self.io, "\x1b[?2004l") catch {}; // disable bracketed paste
         stdout.writeStreamingAll(self.io, "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l") catch {}; // disable mouse
         stdout.writeStreamingAll(self.io, "\x1b[<u") catch {}; // disable Kitty keyboard protocol
         stdout.writeStreamingAll(self.io, "\x1b[?1049l") catch {}; // exit alt-screen
@@ -3572,10 +3646,12 @@ pub const TUI = struct {
         const ms_h: usize = if (self.menu_mode == .model_selector) self.modelSelectorViewHeight() else 0;
         const ts_h: usize = if (self.menu_mode == .thinking_selector) self.thinkingSelectorViewHeight() else 0;
         const sc_h: usize = if (self.menu_mode == .scoped) self.scopedViewHeight() else 0;
-        // pi updatePendingMessagesDisplay: messages queued during compaction
-        // render as dim rows between the transcript and the editor border.
+        // pi updatePendingMessagesDisplay: messages queued while the agent
+        // works (steering / follow-up) or while compaction runs render as
+        // dim rows between the transcript and the editor border.
+        const live_q_h: usize = if (self.working and !self.compacting) self.session.queuedPeekLen() else 0;
         const compact_q_h: usize = if (self.compacting) self.compact_queue.items.len else 0;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h + compact_q_h;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h + compact_q_h + live_q_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -3655,9 +3731,11 @@ pub const TUI = struct {
             }
         }
 
-        // 1.5 Queued-compaction rows (pi pendingMessagesContainer: between
-        // the document and the editor's top border).
+        // 1.5 Queued-message rows (pi pendingMessagesContainer: between the
+        // document and the editor's top border) — live steering/follow-up
+        // while the agent works, the compaction queue while it compacts.
         if (self.compacting) self.renderCompactQueue(&frame);
+        if (self.working and !self.compacting) self.renderLiveQueue(&frame);
 
         // 2. Top border (shows spinner + "Working" when busy).
         const top_border = self.topBorderLine() catch return;
@@ -3692,6 +3770,19 @@ pub const TUI = struct {
         for (ed.items[end..]) |line| self.alloc.free(line);
         ed.deinit(self.alloc);
         ed_consumed = true;
+        // Mouse hit-testing geometry: the editor window's first row in the
+        // frame (transcript + compact-queue rows + top border) and its
+        // visible height. screenToEditor maps screen cells into it.
+        self.editor_frame_row = transcript_h + compact_q_h + 1;
+        self.editor_vis_top = vis_top;
+        self.editor_visible_rows = end - vis_top;
+        self.editor_render_width = ed_width;
+        // Invert-video the editor's mouse selection (editor lines are plain
+        // text, so the highlight splices are safe here).
+        if (!mcp_modal) {
+            const base = transcript_h + compact_q_h + 1;
+            self.editor.highlightSelection(&frame, base, end - vis_top, vis_top, ed_width, self.alloc);
+        }
         while (frame.items.len < transcript_h + 1 + editor_h) {
             const blank = self.alloc.dupe(u8, "") catch return;
             frame.append(self.alloc, blank) catch return;
@@ -4070,12 +4161,53 @@ pub const TUI = struct {
 
     // ---- Text selection (pi: handleSelectionMouseEvent) ----
 
+    /// Scroll the editor's visible window by `delta` visual lines without
+    /// moving the cursor (pi: editor scroll). The next render derives
+    /// vis_top from the cursor, so the offset is expressed AS a cursor
+    /// position: the focus point is placed at the window's opposite edge.
+    /// The selection survives; the highlight window follows. Caller holds
+    /// render_mutex. Returns true when the window moved.
+    fn editorScrollLocked(self: *TUI, delta: isize) bool {
+        if (self.menu_mode != .hidden) return false;
+        const width = self.editor_render_width;
+        if (width == 0) return false;
+        const vt = self.editor_vis_top;
+        const vh = self.editor_visible_rows;
+        if (vh == 0) return false;
+        const new_top: isize = @as(isize, @intCast(vt)) + delta;
+        if (new_top < 0) return false;
+        const total = self.editor.visualLineCount(width);
+        const new_top_u: usize = @min(@as(usize, @intCast(new_top)), total -| 1);
+        if (new_top_u == vt) return false;
+        if (delta < 0) {
+            // Scrolling up: park the focus at the window's TOP row.
+            self.editor.placeCursor(new_top_u, 0, width);
+        } else {
+            // Scrolling down: park the focus at the window's BOTTOM row.
+            self.editor.placeCursor(new_top_u + vh - 1, @intCast(width -| 1), width);
+        }
+        return true;
+    }
+
     /// Screen cell → document coordinates. Null outside the transcript.
     fn screenToDoc(self: *TUI, col: usize, row: usize) ?SelPoint {
         if (row >= self.transcript_h) return null;
         const doc_row = @min(self.sv.scroll_top + row, self.doc_len -| 1);
         const c = @min(col, self.width -| 1);
         return .{ .row = doc_row, .col = c };
+    }
+
+    /// Screen cell → editor VISUAL coordinates (row relative to the editor
+    /// window, col relative to the text start). Null outside the editor
+    /// text area (borders, menus, modals, the prompt-prefix columns).
+    fn screenToEditor(self: *const TUI, col: usize, row: usize) ?struct { vrow: usize, vcol: u32 } {
+        if (self.menu_mode != .hidden) return null;
+        if (self.search != null) return null;
+        if (row < self.editor_frame_row or row >= self.editor_frame_row + self.editor_visible_rows) return null;
+        const vrow = row - self.editor_frame_row;
+        if (col == 0 or col >= self.width) return null; // border columns
+        const c: u32 = @intCast(col - 1);
+        return .{ .vrow = vrow, .vcol = c };
     }
 
     /// The ordered selection bounds, or null when empty (pi:
@@ -4145,12 +4277,146 @@ pub const TUI = struct {
         return out.toOwnedSlice(self.alloc) catch null;
     }
 
+    /// Word selection over a transcript row: the doc line is ANSI-stripped
+    /// first, the clicked visual column maps into the plain text, and the
+    /// word run around it ([A-Za-z0-9_] + CJK) becomes the selection.
+    fn selectDocWord(self: *TUI, p: SelPoint) void {
+        const line: []const u8 = blk: {
+            if (p.row < self.doc_lines.items.len) break :blk self.doc_lines.items[p.row];
+            if (p.row < self.doc_len) {
+                if (self.live_cache) |c| {
+                    if (p.row - self.doc_lines.items.len < c.len) break :blk c[p.row - self.doc_lines.items.len];
+                }
+            }
+            return;
+        };
+        const plain = overlay.stripSequences(self.alloc, line) catch return;
+        defer self.alloc.free(plain);
+        // Visual column → plain-text index (cells; CJK counts 2).
+        var idx: usize = 0;
+        var w: usize = 0;
+        while (idx < plain.len and w < p.col) {
+            const cw = wmod.visualWidth(plain[idx..wmod.nextCharEnd(plain, idx)]);
+            if (w + cw > p.col) break;
+            w += cw;
+            idx = wmod.nextCharEnd(plain, idx);
+        }
+        if (idx >= plain.len) {
+            self.sel_anchor = .{ .row = p.row, .col = 0 };
+            self.sel_focus = .{ .row = p.row, .col = self.width -| 2 };
+            return;
+        }
+        const is_word = struct {
+            fn f(bytes: []const u8) bool {
+                if (bytes.len == 0) return false;
+                if (bytes.len > 1) return true; // multibyte (CJK etc.) = word char
+                const c = bytes[0];
+                return std.ascii.isAlphanumeric(c) or c == '_';
+            }
+        }.f;
+        var s0 = idx;
+        while (s0 > 0) {
+            const prev = wmod.prevCharStart(plain, s0);
+            if (!is_word(plain[prev..s0])) break;
+            s0 = prev;
+        }
+        var e0 = idx;
+        while (e0 < plain.len) {
+            const nxt = wmod.nextCharEnd(plain, e0);
+            if (!is_word(plain[e0..nxt])) break;
+            e0 = nxt;
+        }
+        if (e0 <= s0) return;
+        // The selection spans cells [s0_cell, e0_cell); end col is inclusive
+        // in SelPoint terms (applySelection uses end.col + 1), so -1.
+        const start_cell = wmod.visualWidth(plain[0..s0]);
+        const end_cell = wmod.visualWidth(plain[0..e0]);
+        self.sel_anchor = .{ .row = p.row, .col = start_cell };
+        self.sel_focus = .{ .row = p.row, .col = end_cell -| 1 };
+    }
+
+    /// A drag gesture whose release was lost (the pointer left the terminal
+    /// window — common when dragging out of the small input box at the
+    /// screen bottom): the terminal never delivers mouse-up outside, so the
+    /// NEXT mouse event finalizes the gesture as a copy (pi copyOnSelect
+    /// semantics; without this the selection highlights but never copies).
+    fn abandonStaleDrag(self: *TUI) void {
+        if (self.sel_press == null) return;
+        self.sel_press = null;
+        const in_editor = self.sel_in_editor;
+        self.sel_in_editor = false;
+        self.editor_autoscroll = 0;
+        self.render_mutex.lock(self.io) catch return;
+        var text: ?[]u8 = null;
+        if (in_editor) {
+            text = self.editor.selectionText();
+        } else if (self.selBounds() != null) {
+            text = self.selectionText();
+            self.sel_anchor = null;
+            self.sel_focus = null;
+        }
+        self.render_mutex.unlock(self.io);
+        if (text) |t| {
+            defer self.alloc.free(t);
+            self.copyToClipboard(t);
+            self.flash("Copied!");
+            self.redraw();
+        }
+    }
+
     /// Left-button press: interactive elements first (search box buttons,
     /// jump label, scrollbar — pi: overlay/indicator/scrollbar dispatch),
     /// then a component click target (a tool block toggles on release),
     /// otherwise a text selection gesture starts. Returns true when the
     /// screen must redraw.
-    pub fn handlePress(self: *TUI, col: usize, row: usize) bool {
+    pub fn handlePress(self: *TUI, col: usize, row: usize, clicks: u8) bool {
+        if (clicks >= 2) {
+            // Double/triple click: word/line selection (pi: onMouseDown
+            // double-click). Works over the transcript AND the editor.
+            self.render_mutex.lock(self.io) catch return true;
+            defer self.render_mutex.unlock(self.io);
+            self.sel_press = null;
+            self.sel_dragged = true; // a following release must not click through
+            self.sel_in_editor = false;
+            self.sel_anchor = null;
+            self.sel_focus = null;
+            var have_sel = false;
+            if (self.screenToEditor(col, row)) |p| {
+                self.sel_in_editor = true;
+                self.editor.selectWordOrLine(p.vrow + self.editor_vis_top, p.vcol, self.editor_render_width, clicks >= 3);
+                have_sel = self.editor.selBounds() != null;
+            } else if (self.screenToDoc(col, row)) |p| {
+                if (clicks >= 3) {
+                    self.sel_anchor = .{ .row = p.row, .col = 0 };
+                    self.sel_focus = .{ .row = p.row, .col = self.width -| 2 };
+                } else {
+                    self.selectDocWord(p);
+                }
+                have_sel = self.selBounds() != null;
+            } else {
+                self.editor.clearSelection();
+            }
+            // The word/line selection is complete at press time: copy right
+            // away (the mouse-up may land outside the window and never
+            // arrive — browsers copy double-clicks this way too).
+            if (have_sel) {
+                var text: ?[]u8 = null;
+                if (self.sel_in_editor) {
+                    text = self.editor.selectionText();
+                } else if (self.selectionText()) |t| {
+                    text = t;
+                }
+                self.render_mutex.unlock(self.io);
+                if (text) |t| {
+                    defer self.alloc.free(t);
+                    self.copyToClipboard(t);
+                    self.flash("Copied!");
+                }
+                return true;
+            }
+            self.render_mutex.unlock(self.io);
+            return true;
+        }
         if (self.handleClick(col, row)) {
             // A press that hits something cancels the selection (pi:
             // clearTextSelection when the press is dispatched to a component).
@@ -4159,6 +4425,7 @@ pub const TUI = struct {
             self.sel_anchor = null;
             self.sel_focus = null;
             self.sel_press = null;
+            self.editor.clearSelection();
             return true;
         }
         // GestureDetector: remember the press; the release decides between
@@ -4167,6 +4434,20 @@ pub const TUI = struct {
         defer self.render_mutex.unlock(self.io);
         self.sel_press = .{ .col = col, .row = row };
         self.sel_dragged = false;
+        self.editor_autoscroll = 0;
+        if (self.screenToEditor(col, row)) |p| {
+            // The press lands in the editor: selection gestures target its
+            // buffer (visual coords, window offset included).
+            self.sel_in_editor = true;
+            const vp = self.editor.visualToLogical(p.vrow + self.editor_vis_top, p.vcol, self.editor_render_width);
+            self.editor.sel_anchor = vp;
+            self.editor.sel_focus = vp;
+            self.sel_anchor = null;
+            self.sel_focus = null;
+            return true;
+        }
+        self.sel_in_editor = false;
+        self.editor.clearSelection();
         if (self.screenToDoc(col, row)) |p| {
             self.sel_anchor = p;
             self.sel_focus = p;
@@ -4175,13 +4456,37 @@ pub const TUI = struct {
     }
 
     /// Drag with the left button held: the scrollbar wins; otherwise the
-    /// selection focus follows the pointer. Returns true to redraw.
+    /// selection focus follows the pointer. Dragging past the editor
+    /// window's edge clamps the focus to the first/last visible column of
+    /// that edge row (standard terminal selection) AND pins a direction
+    /// that the wheel handler uses to auto-scroll the editor window until
+    /// the pointer moves again (pi: trackpad scrollSelection). Returns
+    /// true to redraw.
     pub fn handleDrag(self: *TUI, col: usize, row: usize) bool {
         if (self.scrollbar_drag != null) return self.scrollbarDrag(col, row);
         self.render_mutex.lock(self.io) catch return false;
         defer self.render_mutex.unlock(self.io);
         if (self.sel_press == null) return false;
         self.sel_dragged = true;
+        if (self.sel_in_editor) {
+            var target_row = row;
+            self.editor_autoscroll = 0;
+            if (row < self.editor_frame_row) {
+                target_row = self.editor_frame_row;
+                self.editor_autoscroll = -1;
+            } else if (row >= self.editor_frame_row + self.editor_visible_rows) {
+                target_row = self.editor_frame_row + self.editor_visible_rows - 1;
+                self.editor_autoscroll = 1;
+            }
+            // Clamp the column into the text area so the focus always
+            // follows the pointer, even outside the window (pi clamps to
+            // the first/last cell of the row).
+            const cc = if (col < 1) 1 else @min(col, self.width -| 2);
+            if (self.screenToEditor(cc, target_row)) |p| {
+                self.editor.sel_focus = self.editor.visualToLogical(p.vrow + self.editor_vis_top, p.vcol, self.editor_render_width);
+            }
+            return true;
+        }
         if (self.screenToDoc(col, row)) |p| self.sel_focus = p;
         return true;
     }
@@ -4193,8 +4498,31 @@ pub const TUI = struct {
         if (self.scrollbarRelease()) return true;
         const press = self.sel_press orelse return false;
         self.sel_press = null;
+        const in_editor = self.sel_in_editor;
+        self.sel_in_editor = false;
         const is_click = !self.sel_dragged and press.col == col and press.row == row;
         self.render_mutex.lock(self.io) catch return false;
+        self.editor_autoscroll = 0;
+        if (in_editor) {
+            // Editor gesture: a click places the cursor (clearing any
+            // selection); a drag copies the selected editor text on
+            // release (pi copyOnSelect — the highlight now tracks the
+            // drag live, so the user always sees what will be copied).
+            if (is_click) {
+                if (self.screenToEditor(col, row)) |p| {
+                    self.editor.placeCursor(p.vrow + self.editor_vis_top, p.vcol, self.editor_render_width);
+                }
+                self.editor.clearSelection();
+            } else if (self.editor.selectionText()) |text| {
+                defer self.alloc.free(text);
+                self.render_mutex.unlock(self.io);
+                self.copyToClipboard(text);
+                self.flash("Copied!");
+                return true;
+            }
+            self.render_mutex.unlock(self.io);
+            return true;
+        }
         if (is_click) {
             // pi: the click event is dispatched to the component under the
             // pointer — a tool block toggles its own expansion, a thinking
@@ -5638,6 +5966,7 @@ pub const TUI = struct {
                 .{ "!", "to run bash" },
                 .{ "!!", "to run bash (no context)" },
                 .{ "alt+enter", "to queue follow-up" },
+                .{ "alt+up", "to edit all queued messages" },
             };
             w.appendSlice(self.alloc, "\n") catch return null;
             for (hints) |kv| {
@@ -6445,7 +6774,12 @@ pub const TUI = struct {
         self.startWatch();
         self.redraw();
         const run_err: ?anyerror = if (self.session.runPrompt(text)) |_| null else |e| e;
-        _ = run_err;
+        self.drainTurnEvents();
+        if (run_err) |e| {
+            var err_buf: [256]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "[error: {s}]", .{@errorName(e)}) catch "error";
+            self.addAssistantMessage(err_msg);
+        }
         // Same post-turn ceremony as the editor path.
         self.drainTurnEvents();
         self.stopWatch();
@@ -6472,7 +6806,7 @@ pub const TUI = struct {
         }
         if (clipboard.readClipboardText(alloc, self.io, self.environ)) |text| {
             defer alloc.free(text);
-            self.editor.insertBytes(text) catch {};
+            self.editor.pasteText(text) catch {};
             self.redraw();
             return;
         }
@@ -6893,6 +7227,50 @@ pub const TUI = struct {
             self.alloc.free(text);
         } else {
             self.redraw();
+        }
+    }
+
+    /// pi restoreQueuedMessagesToEditor: pull EVERY queued message (steering
+    /// first, then follow-up) out of the session queues and combine them
+    /// with the editor's current text (queued first, "\n\n"-joined).
+    /// Takes render_mutex itself and redraws after releasing it — safe from
+    /// the main loop AND the watcher (the watcher's key dispatch does NOT
+    /// hold the lock while this runs; never call it while locked).
+    fn restoreQueuedToEditor(self: *TUI) usize {
+        const text = self.session.restoreQueued() orelse return 0;
+        defer self.alloc.free(text);
+        self.render_mutex.lock(self.io) catch return 0;
+        const cur = self.editor.getText() catch "";
+        defer self.alloc.free(@constCast(cur));
+        const combined: []const u8 = if (cur.len == 0) text else blk: {
+            const c = std.mem.concat(self.alloc, u8, &.{ text, "\n\n", cur }) catch text;
+            break :blk c;
+        };
+        self.editor.setText(combined) catch {};
+        if (combined.ptr != text.ptr and combined.ptr != cur.ptr) self.alloc.free(@constCast(combined));
+        self.render_mutex.unlock(self.io);
+        self.redrawCached();
+        return 1;
+    }
+
+    /// pi updatePendingMessagesDisplay: the dim "Steering: ..." / "Follow-up:
+    /// ..." rows for messages queued while the agent is WORKING (live peek
+    /// of the session queues; they drain invisibly mid-run).
+    pub fn renderLiveQueue(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        const queued = self.session.queuedPeek();
+        defer {
+            for (queued) |q| self.alloc.free(q.text);
+            self.alloc.free(queued);
+        }
+        for (queued) |q| {
+            const label: []const u8 = switch (q.mode) {
+                .steer => "Steering: ",
+                .followUp => "Follow-up: ",
+            };
+            const line = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}{s}" ++ ansi.RESET, .{ label, q.text }) catch continue;
+            const truncated = truncateToWidth(self.alloc, line, self.width) catch line;
+            if (truncated.ptr != line.ptr) self.alloc.free(line);
+            frame.append(self.alloc, truncated) catch {};
         }
     }
 
@@ -7456,6 +7834,7 @@ pub const TUI = struct {
     fn copyToClipboard(self: *TUI, text: []const u8) void {
         self.render_mutex.lock(self.io) catch return;
         defer self.render_mutex.unlock(self.io);
+        // OSC 52 (works in Ghostty/kitty/iTerm2/WezTerm…)…
         const size = std.base64.standard.Encoder.calcSize(text.len);
         const buf = self.alloc.alloc(u8, size) catch return;
         defer self.alloc.free(buf);
@@ -7463,6 +7842,13 @@ pub const TUI = struct {
         const out = std.fmt.allocPrint(self.alloc, "\x1b]52;c;{s}\x1b\\", .{encoded}) catch return;
         defer self.alloc.free(out);
         self.writeRaw(out);
+        // …plus the system clipboard as the authoritative fallback: some
+        // terminals (macOS Terminal.app) ignore OSC 52 entirely, which made
+        // "Copied!" a lie there. Also cover ssh/multiplexer splits.
+        if (!clipboard.writeClipboardText(self.alloc, self.io, self.environ, text)) {
+            // No system tool either: the OSC 52 escape stays the only copy
+            // path (capable terminals still honor it).
+        }
     }
 
     /// Start the background spinner thread (animates the "Working" border while
@@ -7539,6 +7925,13 @@ pub const TUI = struct {
         self.session.record_turn_events = true;
 
         while (true) {
+            // The watcher thread ran /exit while a turn was streaming: the
+            // turn has now ended (the loop only gets here after runPrompt
+            // returns), so leave through the normal exit path.
+            if (self.cmd_exit_requested) {
+                self.cmd_exit_requested = false;
+                break;
+            }
             // While the auto scrollbar's hide deadline is pending, the read
             // becomes a 100 ms poll: nextKey returns .unknown and the redraw
             // below ticks the deadline, so the scrollbar hides while idle
@@ -7546,6 +7939,7 @@ pub const TUI = struct {
             // runs its own redraws already tick it.
             // While compaction runs the main loop must keep waking to poll
             // compact_done (the worker sets it from its own thread).
+            self.key_reader.paste_alloc = self.alloc;
             self.key_reader.poll = self.sv.hide_at_ms != null or self.flash_msg != null or self.wheel_frame_pending or self.compacting;
             const key = self.key_reader.nextKey(0, self.io) catch break;
             // Compaction finished on its worker thread: render the result and
@@ -7642,10 +8036,36 @@ pub const TUI = struct {
             // copyOnSelect).
             switch (key) {
                 .wheel => |w| {
+                    self.abandonStaleDrag();
                     const now = ss.nowMs(self.io);
                     const lines = self.wheel.next(if (w.down) 1 else -1, @as(f64, @floatFromInt(now)));
                     if (lines > 0) {
                         const delta: isize = if (w.down) @intCast(lines) else -@as(isize, @intCast(lines));
+                        // The editor claims the wheel when the pointer sits
+                        // on its rows (pi: editor onScroll; the transcript
+                        // only scrolls via the wheel when it is the target).
+                        const editor_hit = w.row >= self.editor_frame_row and
+                            w.row < self.editor_frame_row + self.editor_visible_rows;
+                        if (editor_hit or (self.sel_in_editor and self.editor_autoscroll != 0)) {
+                            var moved = false;
+                            self.render_mutex.lock(self.io) catch continue;
+                            if (self.sel_in_editor and self.editor_autoscroll != 0 and !editor_hit) {
+                                // Drag auto-scroll: the pinned direction
+                                // wins over the wheel direction (pi keeps
+                                // scrolling toward the selection edge).
+                                moved = self.editorScrollLocked(self.editor_autoscroll);
+                            } else {
+                                moved = self.editorScrollLocked(delta);
+                                if (moved) self.editor_autoscroll = 0;
+                            }
+                            self.render_mutex.unlock(self.io);
+                            if (moved) {
+                                self.redraw();
+                                continue;
+                            }
+                            // At its scroll end the editor lets the event
+                            // fall through to the transcript below.
+                        }
                         self.scrollBy(delta);
                         // Pace frames like the watcher: a frame per wheel
                         // event costs one terminal round trip per line —
@@ -7664,12 +8084,29 @@ pub const TUI = struct {
                     }
                     continue;
                 },
-                .mouse_click => |cell| {
-                    _ = self.handlePress(cell.col, cell.row);
+                .mouse_click => |click| {
+                    self.abandonStaleDrag();
+                    // Multi-click fallback: same cell within 500 ms bumps
+                    // the streak (the encoded click count, when the
+                    // terminal provides one, always wins).
+                    const now = ss.nowMs(self.io);
+                    const same = click.cell.col == self.last_click_cell.col and click.cell.row == self.last_click_cell.row;
+                    if (same and now - self.last_click_ms <= 500 and self.click_streak < 3) {
+                        self.click_streak += 1;
+                    } else {
+                        self.click_streak = 1;
+                    }
+                    self.last_click_ms = now;
+                    self.last_click_cell = click.cell;
+                    const clicks = @max(click.clicks, self.click_streak);
+                    _ = self.handlePress(click.cell.col, click.cell.row, clicks);
                     self.redraw();
                     continue;
                 },
                 .mouse_move => |cell| {
+                    // Buttonless motion while a drag is pending = the
+                    // release happened outside the window: finalize.
+                    self.abandonStaleDrag();
                     self.handleHover(cell.col, cell.row);
                     self.redraw();
                     continue;
@@ -7786,6 +8223,17 @@ pub const TUI = struct {
             }
             if (self.bindings.matches(key, .copy_message)) {
                 self.copyLastMessage();
+                continue;
+            }
+            // A terminal bracketed paste (Cmd+V): the whole chunk lands in
+            // the editor in one step — no per-line submits (pi: the editor
+            // paste event carries the full text).
+            if (key == .paste) {
+                const p = key.paste;
+                const text = p.bytes[0..p.len];
+                self.editor.pasteText(text) catch {};
+                self.alloc.free(text);
+                self.redraw();
                 continue;
             }
             if (!modal_open and self.bindings.matches(key, .paste_clipboard)) {
@@ -8332,6 +8780,44 @@ pub const TUI = struct {
                 }
             }
 
+            // ESC while an editor drag is in progress cancels the gesture
+            // (standard editor behavior: escape clears the selection).
+            if (!modal_open and key == .escape) {
+                var cancelled = false;
+                self.render_mutex.lock(self.io) catch continue;
+                if (self.sel_press != null and self.sel_in_editor) {
+                    cancelled = true;
+                } else if (self.sel_press == null and self.editor.selBounds() != null) {
+                    cancelled = true;
+                }
+                if (cancelled) {
+                    self.sel_press = null;
+                    self.sel_dragged = false;
+                    self.sel_in_editor = false;
+                    self.editor_autoscroll = 0;
+                    self.editor.clearSelection();
+                }
+                self.render_mutex.unlock(self.io);
+                if (cancelled) {
+                    self.redraw();
+                    continue;
+                }
+            }
+
+            // pi restoreQueuedMessagesToEditor({abort:true}): ESC while the
+            // agent works restores every queued message (steering +
+            // follow-up) into the editor, THEN aborts — nothing is lost.
+            if (key == .escape and self.working and !self.compacting) {
+                _ = self.restoreQueuedToEditor();
+                agent.requestAbort();
+                continue;
+            }
+            // pi app.message.dequeue (alt+up / windows alt+v): restore the
+            // queued messages to the editor without aborting.
+            if (key == .alt_up and self.working and !self.compacting) {
+                _ = self.restoreQueuedToEditor();
+                continue;
+            }
             // pi: while compaction runs, ESC aborts it (abortCompaction) and
             // Enter/alt+Enter queue the message for after it finishes.
             if (self.compacting) {

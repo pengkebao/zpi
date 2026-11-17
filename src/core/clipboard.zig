@@ -157,6 +157,79 @@ pub fn readClipboardImage(alloc: std.mem.Allocator, io: std.Io, environ: std.pro
     return null;
 }
 
+/// Write plain text to the system clipboard (macOS pbcopy; Windows
+/// Set-Clipboard; Linux xclip/wl-copy). OSC 52 is terminal-dependent —
+/// Terminal.app ignores it entirely — so callers use this as the reliable
+/// fallback (pi: the provider layer, run copied through the same helpers).
+/// Returns false when no tool is available.
+pub fn writeClipboardText(alloc: std.mem.Allocator, io: std.Io, environ: std.process.Environ, text: []const u8) bool {
+    var ok = false;
+    switch (@import("builtin").os.tag) {
+        .macos => ok = runWrite(alloc, io, "pbcopy", text),
+        .windows => {
+            // PowerShell reads the payload from stdin (bypasses the
+            // command-line length cap and escaping entirely).
+            ok = runPowerShellStdin(alloc, io, "powershell", "Set-Clipboard", text);
+        },
+        .linux => {
+            if (isWsl(environ)) ok = runPowerShellStdin(alloc, io, "powershell.exe", "Set-Clipboard", text);
+            if (!ok) ok = runWrite(alloc, io, "xclip -selection clipboard -in", text);
+            if (!ok) ok = runWrite(alloc, io, "wl-copy", text);
+        },
+        else => {},
+    }
+    return ok;
+}
+
+/// Pipe `text` into a /bin/sh -c command line's stdin (pbcopy/xclip/wl-copy
+/// style tools read stdin when given no file argument).
+fn runWrite(alloc: std.mem.Allocator, io: std.Io, cmd_line: []const u8, text: []const u8) bool {
+    _ = alloc;
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", cmd_line },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    const stdin_file = child.stdin orelse {
+        child.kill(io);
+        _ = child.wait(io) catch {};
+        return false;
+    };
+    stdin_file.writeStreamingAll(io, text) catch {};
+    // EOF for the reader; wait() would close the already-closed fd again
+    // (panic), so detach it first.
+    stdin_file.close(io);
+    child.stdin = null;
+    _ = child.wait(io) catch return false;
+    return true;
+}
+
+/// Pipe `text` into PowerShell's stdin (`-Command -` reads the script from
+/// stdin; Set-Clipboard with no argument takes the pipeline input).
+fn runPowerShellStdin(alloc: std.mem.Allocator, io: std.Io, shell_name: []const u8, cmdlet: []const u8, text: []const u8) bool {
+    // Feed the payload on stdin (no escaping/length limits) and let the
+    // cmdlet take the pipeline... via a variable read from stdin.
+    const script = std.fmt.allocPrint(alloc, "$t = [Console]::In.ReadToEnd(); {s} -Value $t", .{cmdlet}) catch return false;
+    defer alloc.free(script);
+    var child = std.process.spawn(io, .{
+        .argv = &.{ shell_name, "-NoProfile", "-NonInteractive", "-Command", script },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    const stdin_file = child.stdin orelse {
+        child.kill(io);
+        _ = child.wait(io) catch {};
+        return false;
+    };
+    stdin_file.writeStreamingAll(io, text) catch {};
+    stdin_file.close(io);
+    child.stdin = null; // wait() must not double-close the detached fd
+    _ = child.wait(io) catch return false;
+    return true;
+}
+
 /// Read plain text from the system clipboard (macOS pbpaste; Windows/WSL
 /// PowerShell Get-Clipboard; Linux xclip). Returns null when
 /// empty/unavailable. Owned by alloc.

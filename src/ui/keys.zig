@@ -20,6 +20,14 @@ pub const MouseCell = struct {
     row: u16,
 };
 
+/// A press with a click count: 1 = single (cursor/click), 2 = double
+/// (select word), 3 = triple (select line) — terminal-emulator encoded.
+pub const MouseClick = struct {
+    cell: MouseCell,
+    clicks: u8 = 1,
+};
+
+
 // ---- SIGWINCH (terminal resize) ----
 
 /// Set by the signal handler (one atomic store: async-signal-safe),
@@ -92,13 +100,23 @@ pub const Key = union(enum) {
     f12,
     /// Terminal mouse wheel (SGR encoding, button bit 64; low bits 0=up,
     /// 1=down). `alt` scrolls faster (pi: ALT_WHEEL_SCROLL_MULTIPLIER).
+    /// `col`/`row` are the 0-based cell under the wheel so the editor can
+    /// claim events landing on its own rows.
     wheel: struct {
         down: bool,
         alt: bool,
+        col: u16,
+        row: u16,
+    },
+    /// A bracketed paste chunk: up to 16 KiB of literal clipboard bytes.
+    /// Owned by the key_reader's paste allocator — the consumer frees.
+    paste: struct {
+        bytes: [*]const u8,
+        len: u16,
     },
     /// A left-button mouse press at a 0-based screen cell (SGR encoding):
     /// the "Jump to latest message" label, the scrollbar, the search buttons.
-    mouse_click: MouseCell,
+    mouse_click: MouseClick,
     /// Pointer motion with the left button held (scrollbar dragging).
     mouse_drag: MouseCell,
     /// Pointer motion with no button held (hover; needs all-motion tracking).
@@ -188,6 +206,9 @@ pub const SgrMouse = struct {
     col: u16,
     row: u16,
     release: bool,
+    /// 1 = single, 2 = double, 3 = triple click (terminal emulators encode
+    /// quick successive presses this way; everything else stays 1).
+    clicks: u8 = 1,
 };
 
 /// Parse one complete SGR mouse sequence. Returns null for anything that is
@@ -196,7 +217,23 @@ pub fn parseSgrMouse(data: []const u8) ?SgrMouse {
     if (data.len < 9 or !std.mem.startsWith(u8, data, "\x1b[<")) return null;
     const last = data[data.len - 1];
     if (last != 'M' and last != 'm') return null;
-    const body = data[3 .. data.len - 1];
+    var body = data[3 .. data.len - 1];
+    // Multi-click suffix (xterm): ";32;32" appended for double, ";3;3" for
+    // triple. Strip it before the standard fields are parsed.
+    var clicks: u8 = 1;
+    // The multi-click suffix adds a 4th+5th field, so it can only be
+    // present when the body has four semicolons — coordinates never
+    // collide with it.
+    const semis = std.mem.count(u8, body, ";");
+    if (semis == 4) {
+        if (std.mem.endsWith(u8, body, ";32;32")) {
+            body = body[0 .. body.len - ";32;32".len];
+            clicks = 2;
+        } else if (std.mem.endsWith(u8, body, ";3;3")) {
+            body = body[0 .. body.len - ";3;3".len];
+            clicks = 3;
+        }
+    }
     var it = std.mem.splitScalar(u8, body, ';');
     const button = std.fmt.parseInt(usize, it.next() orelse "", 10) catch return null;
     const col = std.fmt.parseInt(u16, it.next() orelse "", 10) catch return null;
@@ -207,6 +244,7 @@ pub fn parseSgrMouse(data: []const u8) ?SgrMouse {
         .col = col -| 1,
         .row = row -| 1,
         .release = last == 'm',
+        .clicks = clicks,
     };
 }
 
@@ -236,8 +274,8 @@ pub fn parseKey(data: []const u8) ?Key {
             // Wheel: the low bits give the direction (0=up, 1=down).
             const alt = m.button & 8 != 0;
             return switch (m.button & 3) {
-                0 => .{ .wheel = .{ .down = false, .alt = alt } },
-                1 => .{ .wheel = .{ .down = true, .alt = alt } },
+                0 => .{ .wheel = .{ .down = false, .alt = alt, .col = cell.col, .row = cell.row } },
+                1 => .{ .wheel = .{ .down = true, .alt = alt, .col = cell.col, .row = cell.row } },
                 else => null,
             };
         }
@@ -251,7 +289,7 @@ pub fn parseKey(data: []const u8) ?Key {
             return null;
         }
         if (button != 0) return null; // middle/right buttons are not used
-        return .{ .mouse_click = cell };
+        return .{ .mouse_click = .{ .cell = cell, .clicks = m.clicks } };
     }
     if (data.len == 1) return .escape;
     const b1 = data[1];
@@ -543,6 +581,9 @@ pub fn seqLenAt(buf: []const u8) ?usize {
     const b1 = buf[1];
     if (b1 == 'O') return if (buf.len >= 3) 3 else null; // SS3
     if (b1 == '[') {
+        // Bracketed paste markers: complete only with their final '~'.
+        if (buf.len >= 5 and std.mem.eql(u8, buf[0..5], "\x1b[200")) return if (buf.len >= 6) 6 else null;
+        if (buf.len >= 5 and std.mem.eql(u8, buf[0..5], "\x1b[201")) return if (buf.len >= 6) 6 else null;
         // CSI: scan for the final byte (0x40..0x7E); params are all < 0x40.
         var i: usize = 2;
         while (i < buf.len) : (i += 1) {
@@ -619,8 +660,11 @@ pub fn parseSequence(seq: []const u8, kitty_active: bool) ?Key {
 pub const KeyReader = struct {
     // Large pending: mouse-wheel floods (trackpad inertia) arrive faster than
     // the UI can redraw; overflow would tear sequences mid-stream.
-    pending: [4096]u8 = undefined,
+    pending: [16384]u8 = undefined,
     pending_len: usize = 0,
+    /// Allocator for paste chunks (set at construction; falls back to the
+    /// page allocator for default-initialized readers).
+    paste_alloc: std.mem.Allocator = std.heap.page_allocator,
     /// Whether the Kitty protocol is known-active (flags reply != 0). Legacy
     /// mappings (`\n`, `ESC CR`) depend on this.
     kitty_active: bool = false,
@@ -639,6 +683,11 @@ pub const KeyReader = struct {
     /// pending; otherwise the loop polls at 100 ms anyway to catch the
     /// SIGWINCH flag (a resize must not wait for a keypress).
     poll: bool = false,
+    /// While a bracketed paste (ESC[200~ ... ESC[201~) is being collected,
+    /// the paste body accumulated so far; null otherwise. The chunk is
+    /// delivered as one `.paste` key once the terminator arrives (or the
+    /// stream stalls — a lost terminator must not wedge the input).
+    paste_buf: ?std.ArrayListUnmanaged(u8) = null,
 
     // 33 ms: poll is also the wakeup for timer-ish work (the scrollbar's
     // hide deadline, throttled wheel-render flushes), so the tail frame of a
@@ -668,8 +717,14 @@ pub const KeyReader = struct {
                     .timeout => {
                         if (self.pending_len == 1 and self.pending[0] == 27) {
                             self.pending_len = 0;
+                            if (self.paste_buf != null) {
+                                // Lone ESC inside a stalled paste: literal.
+                                self.appendPaste(&[_]u8{27});
+                                continue;
+                            }
                             return .escape; // standalone Escape
                         }
+                        if (self.paste_buf != null) return self.flushPaste();
                         self.pending_len = 0; // corrupt fragment: drop
                         return .unknown;
                     },
@@ -677,10 +732,11 @@ pub const KeyReader = struct {
                     .signal => return .resize,
                 }
             }
-            switch (self.fill(fd, self.poll)) {
+            switch (self.fill(fd, if (self.paste_buf != null) true else self.poll)) {
                 .data => {},
                 .eof => return error.EndOfStream,
                 .timeout => {
+                    if (self.paste_buf != null) return self.flushPaste();
                     // Only surface timeouts when the caller wants to run
                     // timers; otherwise keep waiting (the SIGWINCH flag is
                     // checked inside fill).
@@ -713,7 +769,54 @@ pub const KeyReader = struct {
             return null;
         }
         if (isReleaseSeq(data)) return null;
+        // Bracketed paste: collect the body across reads, return the whole
+        // chunk as one key.
+        if (data.len >= 6 and std.mem.eql(u8, data[0..6], "\x1b[200~")) {
+            if (self.paste_buf == null) self.paste_buf = .empty;
+            self.appendPaste(data[6..]);
+            return null;
+        }
+        if (std.mem.eql(u8, data, "\x1b[201~")) {
+            // Terminator: deliver whatever was collected (empty → skip).
+            if (self.paste_buf) |*pb| {
+                const text = pb.toOwnedSlice(self.paste_alloc) catch {
+                    pb.deinit(self.paste_alloc);
+                    self.paste_buf = null;
+                    return null;
+                };
+                self.paste_buf = null;
+                return .{ .paste = .{ .bytes = text.ptr, .len = @intCast(text.len) } };
+            }
+            return null;
+        }
+        // Inside a paste, EVERYTHING is literal payload (ESC sequences from
+        // the clipboard too — the terminal only brackets, never escapes).
+        if (self.paste_buf != null) {
+            self.appendPaste(data);
+            return null;
+        }
         return parseSequence(data, self.kitty_active) orelse .unknown;
+    }
+
+    fn appendPaste(self: *KeyReader, bytes: []const u8) void {
+        const pb = &(self.paste_buf orelse return);
+        pb.appendSlice(self.paste_alloc, bytes) catch {};
+    }
+
+    /// A bracketed paste stalled without its terminator (sandboxed clients,
+    /// lost bytes): flush what arrived instead of wedging input forever.
+    fn flushPaste(self: *KeyReader) Key {
+        if (self.paste_buf) |*pb| {
+            const text = pb.toOwnedSlice(self.paste_alloc) catch {
+                pb.deinit(self.paste_alloc);
+                self.paste_buf = null;
+                return .unknown;
+            };
+            self.paste_buf = null;
+            if (text.len == 0) return .unknown;
+            return .{ .paste = .{ .bytes = text.ptr, .len = @intCast(text.len) } };
+        }
+        return .unknown;
     }
 
     /// Wait for input on `fd`, never blocking longer than FILL_POLL_MS. The
@@ -809,15 +912,45 @@ test "parseKey alt combinations" {
     try expectKey(parseKey("\x1b\r"), alt_enter);
 }
 
+test "bracketed paste chunk is one key; stall flushes" {
+    // Simulated pipes for stdin/stdout of the reader under test are overkill
+    // here; exercise seqLenAt + take() through a reader with injected bytes.
+    var kr: KeyReader = .{};
+    defer if (kr.paste_buf) |*pb| pb.deinit(std.heap.page_allocator);
+    const payload = "\x1b[200~hi\nthere\x1b[201~";
+    @memcpy(kr.pending[0..payload.len], payload);
+    kr.pending_len = payload.len;
+    var got: ?Key = null;
+    var spins: usize = 0;
+    while (spins < 100) : (spins += 1) {
+        const len = seqLenAt(kr.pending[0..kr.pending_len]) orelse break;
+        if (kr.take(len)) |k| {
+            got = k;
+            break;
+        }
+    }
+    const k = got orelse return error.TestUnexpectedResult;
+    try std.testing.expect(k == .paste);
+    const text = k.paste.bytes[0..k.paste.len];
+    defer std.heap.page_allocator.free(text);
+    try std.testing.expectEqualStrings("hi\nthere", text);
+}
+
+test "parseKey SGR multi-click suffix" {
+    try expectKey(parseKey("\x1b[<0;10;5;32;32M"), .{ .mouse_click = .{ .cell = .{ .col = 9, .row = 4 }, .clicks = 2 } });
+    try expectKey(parseKey("\x1b[<0;10;5;3;3M"), .{ .mouse_click = .{ .cell = .{ .col = 9, .row = 4 }, .clicks = 3 } });
+    try expectKey(parseKey("\x1b[<0;10;5M"), .{ .mouse_click = .{ .cell = .{ .col = 9, .row = 4 }, .clicks = 1 } });
+}
+
 test "parseKey SGR mouse wheel and buttons" {
     // Wheel: bit 64, low bits 0 (up) / 1 (down); bit 8 is the Alt modifier.
-    try expectKey(parseKey("\x1b[<64;10;5M"), .{ .wheel = .{ .down = false, .alt = false } });
-    try expectKey(parseKey("\x1b[<65;1;1M"), .{ .wheel = .{ .down = true, .alt = false } });
-    try expectKey(parseKey("\x1b[<72;3;3M"), .{ .wheel = .{ .down = false, .alt = true } });
-    try expectKey(parseKey("\x1b[<68;3;3M"), .{ .wheel = .{ .down = false, .alt = false } }); // shift+wheel
+    try expectKey(parseKey("\x1b[<64;10;5M"), .{ .wheel = .{ .down = false, .alt = false, .col = 9, .row = 4 } });
+    try expectKey(parseKey("\x1b[<65;1;1M"), .{ .wheel = .{ .down = true, .alt = false, .col = 0, .row = 0 } });
+    try expectKey(parseKey("\x1b[<72;3;3M"), .{ .wheel = .{ .down = false, .alt = true, .col = 2, .row = 2 } });
+    try expectKey(parseKey("\x1b[<68;3;3M"), .{ .wheel = .{ .down = false, .alt = false, .col = 2, .row = 2 } }); // shift+wheel
     try std.testing.expect(parseKey("\x1b[<66;3;3M") == null); // horizontal wheel
     // Left-button press → click with 0-based coordinates.
-    try expectKey(parseKey("\x1b[<0;32;12M"), .{ .mouse_click = .{ .col = 31, .row = 11 } });
+    try expectKey(parseKey("\x1b[<0;32;12M"), .{ .mouse_click = .{ .cell = .{ .col = 31, .row = 11 } } });
     // Its release, a drag (motion with the button held), a hover (no button).
     try expectKey(parseKey("\x1b[<0;32;12m"), .{ .mouse_release = .{ .col = 31, .row = 11 } });
     try expectKey(parseKey("\x1b[<32;40;9M"), .{ .mouse_drag = .{ .col = 39, .row = 8 } });
@@ -828,7 +961,7 @@ test "parseKey SGR mouse wheel and buttons" {
     try std.testing.expect(parseKey("\x1b[<34;32;12M") == null);
     try std.testing.expect(parseKey("\x1b[<2;32;12m") == null);
     // Coordinates clamp at the origin instead of wrapping.
-    try expectKey(parseKey("\x1b[<0;1;1M"), .{ .mouse_click = .{ .col = 0, .row = 0 } });
+    try expectKey(parseKey("\x1b[<0;1;1M"), .{ .mouse_click = .{ .cell = .{ .col = 0, .row = 0 } } });
 }
 
 test "parseKey ctrl+shift letters and ctrl arrows" {

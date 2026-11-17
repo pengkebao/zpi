@@ -23,6 +23,9 @@ pub const AnthropicProvider = struct {
     client: std.http.Client,
     last_error_buf: [2048]u8 = undefined,
     last_error_len: usize = 0,
+    /// Set by the terminal SSE event (message_stop / done). sse.postSse
+    /// checks it to tell a clean stream end from a dropped connection.
+    stream_done: bool = false,
 
     pub fn lastErrorText(self: *const AnthropicProvider) []const u8 {
         return self.last_error_buf[0..self.last_error_len];
@@ -73,6 +76,7 @@ pub const AnthropicProvider = struct {
         while (true) {
             attempt += 1;
             const had_output = self.hasStreamedOutput(session);
+            self.stream_done = false;
             const outcome = sse.postSse(
                 &self.client,
                 self.alloc,
@@ -329,6 +333,7 @@ pub const AnthropicProvider = struct {
 
     /// SSE event handler (called by sse.postSse for each data line).
     pub fn parseSseData(self: *AnthropicProvider, data: []const u8, session: anytype) !void {
+        self.stream_done = false;
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, data, .{}) catch return;
         defer parsed.deinit();
         const obj = switch (parsed.value) {
@@ -337,6 +342,7 @@ pub const AnthropicProvider = struct {
         };
 
         const etype = strOf(obj, "type") orelse return;
+        if (std.mem.eql(u8, etype, "message_stop")) self.stream_done = true;
         if (std.mem.eql(u8, etype, "error")) {
             return error.StreamError;
         }

@@ -397,6 +397,23 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
   - **正确性**：新单测“逐 chunk 增量渲染 == 全前缀全量渲染”（17B 步长刻意对不齐切块，覆盖段落/表格/代码围栏/列表/CJK）+ `stableBlockBoundary` 边界/fence 钉扎 4 例；pty+pyte E2E（40 段中文 markdown 流式 + 期间滚轮上滚 6 步回滚到底）：段落 39 落底、表格框完整、围栏内容可见、hint 恒 1 行、无 stale 行，全过
   - **顺手修**：基准脚本 `buildTui` 把 model/provider/registry 放在函数作用域 → Session 持栈指针悬垂（ReleaseFast 才崩，lldb 定位）；提升为堆上 Fixture；新增 `bench_scroll.zig`（markdown vs plain 滚动帧）、`bench_stream.zig`(流式帧 vs 流长度)、`bench_markdown.zig`（单块渲染成本）三个性能工具
 
+- **SSE 流韧性 + 静默中断修复**（用户反馈"整个任务没完成就中断了"；会话 jsonl 分析定位三个无声失败点）：
+  - **SSE 断流被当作成功（主因）**：`sse.zig`/`openai.zig` 的流读取循环里 `EndOfStream`/`ReadFailed`（网络抖动/代理断连）直接 `break` → `return .ok`——没收到 `[DONE]` 也算成功；agent 层收到空 assistant 消息后 `blocks.len==0` 静默 `break`，turn 无声死亡（会话日志末条正是"assistant toolUse 后无 toolResult"）。修复：断流 → `.transport_error`（自动重试 3 次退避，已流出内容按 provider 层 had_output 语义处理）；"干净结束"按协议判定——OpenAI 看 `[DONE]`，Anthropic 看 `message_stop`，Google 看 `finishReason`，Responses 看 `response.completed`（provider 结构体 `stream_done` 标志，`sse.postSse` 用 `@hasDecl` 鸭子类型查询）；空响应 → `error.EmptyResponse`，TUI 显示 `[error: EmptyResponse]`（三处 runPrompt 调用点原先两处吞错一处显示，补齐）
+  - **工具轮次上限静默退出**：`max_tool_rounds` 50 触顶时循环无声跳出（长任务 40+ 轮很常见）→ 上限提到 200，触顶时 emit 提示行 `[stopped: tool-round limit reached (200 rounds). Send '继续' to resume]`
+  - 验证：全套件过（test_ui 234 / leak_g2 184 / openai 10 / mcp 9 / pt 4 / clip 2 / keys 18）
+- **steering/follow-up 与 pi 深度对齐**（用户要求对照原版 working/compacting 时输入新任务的回车逻辑）：对照 pi 1.5.0 `interactive-mode.js`/`agent-session.js`/`PendingMessageQueue` 逐项核查，原有实现已覆盖 Enter=steer / alt+Enter=follow-up / compaction 入队 / ESC 取消压缩，补齐 4 个差距：
+  - **ESC 中断恢复队列**（pi `restoreQueuedMessagesToEditor({abort:true})`）：ESC/Ctrl+C（kitty 含 CSI-u）中断时把**全部**排队消息（steering 在前 + follow-up，`\n\n` 拼接）放回编辑器并前置到当前文本，再 abort——原先直接 abort 队列留在原地用户以为丢了。`Session.restoreQueued()` 排空两队列返回拼接文本；顺带修 watcher ESC 后 `return` 杀掉 watcher 线程的问题（改 `continue`，中断后 UI 存活）
+  - **alt+up dequeue 语义**（pi `app.message.dequeue`）：恢复**全部**排队消息到编辑器（原先只有 alt+v 且只恢复一条 follow-up、覆盖当前文本）；hint 行补 `alt+up to edit all queued messages`
+  - **`/` 命令运行中立即执行**（pi extension commands 永不进 steering 队列）：watcher Enter 分支 `/` 开头直接 `handleCommand`（`/exit` 置 `cmd_exit_requested` + abort，主循环 turn 结束后 break）。修死锁：`handleCommand` 原在持 render_mutex 期间执行，内部 addMessage 再锁同一把不可重入 mutex 永不返回——锁内只读/清编辑器，锁外执行命令与入队
+  - **steeringMode/followUpMode 接线**（pi 默认均 one-at-a-time）：TUI 的两个设置项原先从未传给 Session；现 settings.json `steeringMode`/`followUpMode` 解析进 config → init 时传 Session，设置选择器改动即时同步；turn 结束取 follow-up 按 mode（`all` 全部取出合并为一个新 turn，`one-at-a-time` 只取最旧一条）。新增 working 期间 **pending 行实时渲染**（pi `updatePendingMessagesDisplay`：编辑器上方 dim 的 `Steering: …`/`Follow-up: …`，`queuedPeek`/`queuedPeekLen`）
+  - 验证：pty 端到端（真实模型流式中）——Enter 入队显示 `Steering:` 行、alt+Enter 显示 `Follow-up:` 行、ESC 1.1s 内 abort 且两条消息拼接恢复回编辑器、`/help` 运行中立即执行不进队列；`test_pending.zig` 2 个新单测（pending 行渲染 + restoreQueued 拼接语义）
+- **编辑器鼠标选区/粘贴/复制**（用户反馈批次：选区响应、多行粘贴、Terminal.app 剪贴板）：
+  - **选区响应性**：editor.handleKey 去掉全量 `clearSelection()`（只有改文本的键清选区，ESC 清选区）；`insertChar` 替换选区；修 `replaceSelection` 多行截断 bug（`shrinkRetainingCapacity(removed)` 误删后续行 → 精确释放 `(start.line, end.line]` + 左移）
+  - **wrap 缓存**（editor.zig）：`wrap_cache/wrap_gen` 等字段 + `invalidateWrapCache()`/`wrappedView()`/`firstVisualRow()`（二分）/`visualRowLine()`/`countLogicalLines()`/`visualLineCount()`——render/highlightSelection/visualToLogical/cursorVisualPos 共享，选区高亮不再逐帧全量 wrap
+  - **bracketed paste**（`ESC[?2004h`）：KeyReader 把 `ESC[200~...ESC[201~` 块收为单个 `.paste` Key（16KiB 缓冲、330ms stall flush），TUI 路由 `editor.pasteText`（多行拆分、CRLF trim、替换选区）——修复多行粘贴逐行提交
+  - **多击**：keys.zig 解析 5 字段 SGR multi-click 后缀 + TUI 500ms 时间/位置连击兜底；双击选词（CJK 逐字）、三击选行（editor + transcript，`selectWordOrLine`/`selectDocWord`）
+  - **剪贴板双通道**：`clipboard.writeClipboardText`（macOS pbcopy / Windows·WSL PowerShell / Linux xclip·wl-copy）+ OSC52 同时发送——Terminal.app 忽略 OSC 52 的场景（"Copied!" 显示但剪贴板为空）修复；`copyToClipboard` 两路并发。Zig 0.17 坑：`Child.wait()` 前必须 `stdin.close()` 且置 `child.stdin = null`（否则 double-close）
+  - 验证：pty E2E（SGR 鼠标序列注入 → 断言 OSC52 字节 + `pbpaste` 内容一致）；test_ui 234 / keys 18 / clip 2 全过
 ### Phase H — 资源系统（~1.5k 行）
 - [x] H1 Skills：`skills.zig` 发现/解析/校验/去重 + 系统提示广告 + `/skill:name` + `/skill:<tab>` + 6 单测 + E2E（`15ade5a`）
 - [x] H2 Prompt templates：Phase D 完成（发现/$1/$@/默认值/未识别 slash 回退）
@@ -533,7 +550,7 @@ fs_wheel_lines。
 | app.tools.expand | ctrl+o | ✓ | 已实现 |
 | app.editor.external | ctrl+g | ✓ | 已实现（$EDITOR） |
 | app.message.copy | ctrl+x | ✓ | 本轮实现（选区优先，否则最后回复） |
-| app.message.followUp / dequeue | alt+enter / alt+up | — | 暂缓（agent 层消息排队） |
+| app.message.followUp / dequeue | alt+enter / alt+up | ✓ | 已实现（follow-up 队列 + 全量恢复回编辑器） |
 | app.clipboard.pasteImage | ctrl+v | — | 暂缓（图片输入管线） |
 | app.session.toggleNamedFilter | ctrl+n | — | 暂缓（session selector 过滤） |
 | tui.altScreen.search / nextPrompt / previousPrompt | ctrl+shift+f 等 | ✓ | 已实现（搜索框 + 高亮 + 导航） |
@@ -559,6 +576,6 @@ fs_wheel_lines。
 | 搜索（转写内查找/高亮/导航） | ✓ | ✓ | 已实现 |
 | 鼠标：点击折叠、拖拽选区、松开复制、滚轮 | ✓ | ✓ | 已实现（含水平滚轮过滤 pi parity） |
 | footer（token/cost/git 分支/cwd/模型） | ✓ | ✓ | 已实现 |
-| steering（运行中改向）+ follow-up 排队 | ✓ | — | 暂缓（需 agent 层队列） |
+| steering（运行中改向）+ follow-up 排队 | ✓ | ✓ | 已实现（Enter/alt+Enter 排队 + pending 行 + ESC 恢复 + mode 设置） |
 | 会话分享/导出（share/export） | ✓ | — | 暂缓 |
 | 扩展/技能/MCP 体系 | ✓ | — | 暂缓（架构级） |

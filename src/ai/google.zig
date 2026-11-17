@@ -24,6 +24,8 @@ pub const GoogleProvider = struct {
     client: std.http.Client,
     last_error_buf: [2048]u8 = undefined,
     last_error_len: usize = 0,
+    /// Terminal SSE event marker (see anthropic.stream_done).
+    stream_done: bool = false,
     /// tool_call id → function name (needed for functionResponse parts,
     /// which reference the function name rather than a call id).
     id_names: std.array_list.Managed(IdName),
@@ -108,6 +110,7 @@ pub const GoogleProvider = struct {
         while (true) {
             attempt += 1;
             const had_output = self.hasStreamedOutput(session);
+            self.stream_done = false;
             const outcome = sse.postSse(
                 &self.client,
                 self.alloc,
@@ -337,6 +340,7 @@ pub const GoogleProvider = struct {
     /// {candidates:[{content:{parts:[{text}|{functionCall}]},finishReason}],
     ///  usageMetadata:{promptTokenCount,candidatesTokenCount,thoughtsTokenCount}}
     pub fn parseSseData(self: *GoogleProvider, data: []const u8, session: anytype) !void {
+        self.stream_done = false;
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, data, .{}) catch return;
         defer parsed.deinit();
         const obj = switch (parsed.value) {
@@ -424,6 +428,7 @@ pub const GoogleProvider = struct {
                                     .content_filter
                                 else
                                     .stop;
+                                self.stream_done = true;
                                 session.onStreamEvent(.{ .done = reason });
                             },
                             else => {},

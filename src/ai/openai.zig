@@ -223,8 +223,13 @@ pub const OpenAiProvider = struct {
         while (!done) {
             if (session.isAborted()) return .ok;
             const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
-                error.EndOfStream => break,
-                error.ReadFailed => break,
+                // Socket died mid-stream: a TRANSPORT error, not success.
+                // Returning .ok here made truncated responses look complete
+                // and the agent turn silently died mid-task.
+                error.EndOfStream, error.ReadFailed => {
+                    std.debug.print("error: SSE stream ended without [DONE]\n", .{});
+                    return .transport_error;
+                },
                 error.StreamTooLong => {
                     // Pathological over-long line: drop the buffered bytes
                     // and resync at the next newline; the garbage tail of the

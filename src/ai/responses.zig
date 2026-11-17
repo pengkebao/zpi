@@ -23,6 +23,8 @@ pub const ResponsesProvider = struct {
     client: std.http.Client,
     last_error_buf: [2048]u8 = undefined,
     last_error_len: usize = 0,
+    /// Terminal SSE event marker (see anthropic.stream_done).
+    stream_done: bool = false,
     /// Contiguous tool-call index across chunks (agent accumulates by index).
     next_call_index: usize = 0,
 
@@ -76,6 +78,7 @@ pub const ResponsesProvider = struct {
         while (true) {
             attempt += 1;
             const had_output = self.hasStreamedOutput(session);
+            self.stream_done = false;
             const outcome = sse.postSse(
                 &self.client,
                 self.alloc,
@@ -287,6 +290,7 @@ pub const ResponsesProvider = struct {
     }
 
     pub fn parseSseData(self: *ResponsesProvider, data: []const u8, session: anytype) !void {
+        self.stream_done = false;
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, data, .{}) catch return;
         defer parsed.deinit();
         const obj = switch (parsed.value) {
@@ -362,6 +366,7 @@ pub const ResponsesProvider = struct {
         }
 
         if (std.mem.eql(u8, etype, "response.completed") or std.mem.eql(u8, etype, "response.incomplete")) {
+            self.stream_done = true;
             if (obj.get("response")) |rv| {
                 switch (rv) {
                     .object => |ro| {

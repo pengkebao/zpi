@@ -63,11 +63,15 @@ pub fn postSse(
 
     var rbuf: [16384]u8 = undefined;
     var reader = response.reader(&rbuf);
-    while (true) {
+    // A clean end is [DONE] / a terminal SSE event; a connection that just
+    // drops (EndOfStream/ReadFailed without either) is a TRANSPORT error —
+    // returning .ok here made truncated responses look like success and the
+    // agent turn silently died mid-task.
+    var done_cleanly = false;
+    while (!done_cleanly) {
         if (session.isAborted()) return .ok;
         const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.ReadFailed => break,
+            error.EndOfStream, error.ReadFailed => break,
             error.StreamTooLong => {
                 reader.toss(reader.end - reader.seek);
                 continue;
@@ -77,7 +81,22 @@ pub fn postSse(
         if (trimmed.len == 0) continue;
         if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
         const data = std.mem.trim(u8, trimmed["data:".len..], " \r\n");
+        if (std.mem.eql(u8, data, "[DONE]")) {
+            done_cleanly = true;
+            break;
+        }
         ctx.parseSseData(data, session) catch continue;
+    }
+    if (!done_cleanly) {
+        // Protocols without [DONE] (anthropic/google/responses) signal the
+        // clean end via a terminal event the parser records on the provider.
+        const CT = @typeInfo(@TypeOf(ctx)).pointer.child;
+        if (@hasDecl(CT, "stream_done") and ctx.stream_done) return .ok;
+        // Content streamed then the socket died (retryable continues a
+        // partial answer — the provider layer declines when output already
+        // streamed) vs nothing at all arrived.
+        std.debug.print("error: SSE stream ended without a completion marker\n", .{});
+        return .transport_error;
     }
     return .ok;
 }

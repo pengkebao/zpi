@@ -12,10 +12,21 @@
 //! hardware cursor at `cursorPos()`.
 
 const std = @import("std");
+const overlay = @import("overlay.zig");
 const keys = @import("keys.zig");
 const wmod = @import("width.zig");
 
 pub const EditorAction = enum { none, submit };
+
+/// A LOGICAL point in the editor: line = logical line index, col = byte
+/// offset within that line. Selections are stored in logical coordinates so
+/// they stay correct regardless of the wrap width used for rendering; the
+/// visual↔logical mapping happens only at input (visualToLogical) and
+/// render (highlightSelection) time, with the actual render width.
+pub const EditorSelPt = struct { line: usize, col: usize };
+
+/// Ordered selection bounds in logical coordinates.
+pub const EditorSelBounds = struct { start: EditorSelPt, end: EditorSelPt };
 
 pub const Editor = struct {
     alloc: std.mem.Allocator,
@@ -29,6 +40,83 @@ pub const Editor = struct {
     draft_cursor_col: usize = 0,
     draft_valid: bool = false,
 
+    // Mouse text selection (logical coordinates). Anchor/focus set by TUI
+    // drag gestures; empty (null anchor) = no selection.
+    sel_anchor: ?EditorSelPt = null,
+    sel_focus: ?EditorSelPt = null,
+
+    // Wrapped-visual-line cache (pi: editor cache). Keyed by (buffer
+    // generation, render width): highlightSelection, cursorVisualPos and
+    // visualToLogical all wrap the same buffer at the same width, so wrap
+    // once per generation instead of per mouse-move frame.
+    wrap_cache: ?[]const []u8 = null,
+    wrap_cache_rows: ?[]const u32 = null, // visual rows per logical line
+    wrap_cache_width: usize = 0,
+    wrap_cache_gen: u64 = 0,
+    wrap_gen: u64 = 0,
+
+    /// Clear any active mouse selection.
+    pub fn clearSelection(self: *Editor) void {
+        self.sel_anchor = null;
+        self.sel_focus = null;
+    }
+
+    /// Drop the wrap cache (call after any buffer mutation and on width
+    /// change; render() bumps the generation itself).
+    fn invalidateWrapCache(self: *Editor) void {
+        self.wrap_gen += 1;
+        if (self.wrap_cache) |c| {
+            for (c) |vl| self.alloc.free(vl);
+            self.alloc.free(c);
+            self.wrap_cache = null;
+        }
+        if (self.wrap_cache_rows) |r| {
+            self.alloc.free(r);
+            self.wrap_cache_rows = null;
+        }
+    }
+
+    /// The buffer wrapped at `width`, from the cache when possible.
+    fn wrappedView(self: *Editor, width: usize) ![]const []u8 {
+        if (self.wrap_cache) |c| {
+            if (self.wrap_cache_width == width and self.wrap_cache_gen == self.wrap_gen) return c;
+            for (c) |vl| self.alloc.free(vl);
+            self.alloc.free(c);
+            self.wrap_cache = null;
+        }
+        if (self.wrap_cache_rows) |r| {
+            self.alloc.free(r);
+            self.wrap_cache_rows = null;
+        }
+        var out: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (out.items) |l| self.alloc.free(l);
+            out.deinit(self.alloc);
+        }
+        var counts: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer counts.deinit(self.alloc);
+        const w: u32 = @intCast(width);
+        for (self.lines.items) |line| {
+            const wrapped = try wrapLine(self.alloc, line, w);
+            counts.append(self.alloc, @intCast(wrapped.len)) catch {
+                for (wrapped) |vl| self.alloc.free(vl);
+                return error.OutOfMemory;
+            };
+            for (wrapped) |vl| out.append(self.alloc, vl) catch {
+                self.alloc.free(vl);
+                return error.OutOfMemory;
+            };
+            self.alloc.free(wrapped);
+        }
+        const owned_rows = try counts.toOwnedSlice(self.alloc);
+        const owned = try out.toOwnedSlice(self.alloc);
+        self.wrap_cache = owned;
+        self.wrap_cache_rows = owned_rows;
+        self.wrap_cache_width = width;
+        self.wrap_cache_gen = self.wrap_gen;
+        return owned;
+    }
+
     pub fn init(alloc: std.mem.Allocator) Editor {
         var e: Editor = .{
             .alloc = alloc,
@@ -41,6 +129,7 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        self.invalidateWrapCache();
         self.freeLines(&self.lines);
         self.lines.deinit();
         for (self.history.items) |h| self.alloc.free(h);
@@ -85,6 +174,7 @@ pub const Editor = struct {
 
     /// Reset the editor to a single empty line (and exit history browsing).
     pub fn clear(self: *Editor) !void {
+        self.invalidateWrapCache();
         self.freeLines(&self.lines);
         self.lines.clearRetainingCapacity();
         const empty = self.alloc.dupe(u8, "") catch return error.OutOfMemory;
@@ -92,6 +182,7 @@ pub const Editor = struct {
         self.cursor_line = 0;
         self.cursor_col = 0;
         self.history_index = -1;
+        self.clearSelection();
     }
 
     /// Visual cursor position within the editor (0-based line and column).
@@ -110,6 +201,7 @@ pub const Editor = struct {
     /// Replace range [start, end) of the cursor's line with `insertion`
     /// and park the cursor after it (file-completion application).
     pub fn replaceRange(self: *Editor, start: usize, end: usize, insertion: []const u8) !void {
+        self.invalidateWrapCache();
         const line = self.lines.items[self.cursor_line];
         if (end > line.len or start > end) return error.BadRange;
         const new_line = try std.fmt.allocPrint(self.lines.allocator, "{s}{s}{s}", .{ line[0..start], insertion, line[end..] });
@@ -131,62 +223,241 @@ pub const Editor = struct {
         return self.lines.items.len;
     }
 
-    /// Render the editor as wrapped visual lines (each ≤ `width` visual columns).
-    /// Owned: every returned line must be freed by the caller.
-    pub fn render(self: *const Editor, width: usize) !std.ArrayListUnmanaged([]u8) {
+    /// Render the editor as wrapped visual lines (each ≤ `width` visual
+    /// columns). Owned: every returned line must be freed by the caller.
+    /// Populates the wrap cache (render runs before every mouse gesture,
+    /// so the gesture handlers hit the warm cache).
+    pub fn render(self: *Editor, width: usize) !std.ArrayListUnmanaged([]u8) {
         var out: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
             for (out.items) |l| self.alloc.free(l);
             out.deinit(self.alloc);
         }
-        const w: u32 = @intCast(width);
-        for (self.lines.items) |line| {
-            const wrapped = wrapLine(self.alloc, line, w) catch return error.OutOfMemory;
-            for (wrapped) |vl| out.append(self.alloc, vl) catch return error.OutOfMemory;
-            self.alloc.free(wrapped);
+        const view = try self.wrappedView(width);
+        for (view) |vl| {
+            const copy = try self.alloc.dupe(u8, vl);
+            out.append(self.alloc, copy) catch {
+                self.alloc.free(copy);
+                return error.OutOfMemory;
+            };
         }
         return out;
     }
 
+    /// The ordered selection bounds in logical coordinates, or null when
+    /// empty.
+    pub fn selBounds(self: *const Editor) ?EditorSelBounds {
+        const a = self.sel_anchor orelse return null;
+        const f = self.sel_focus orelse return null;
+        if (a.line == f.line and a.col == f.col) return null;
+        const a_first = a.line < f.line or (a.line == f.line and a.col < f.col);
+        return if (a_first) .{ .start = a, .end = f } else .{ .start = f, .end = a };
+    }
+
+    /// Map a visual column (within a plain text slice) to a byte offset.
+    /// vcol is a position BETWEEN characters (0 = before the first, the
+    /// total width = after the last); a CJK char spans two visual columns.
+    /// When vcol lands exactly on a character's right edge (w+cw == vcol) we
+    /// advance past it, so the cursor sits AFTER that character.
+    fn visualColToByte(line: []const u8, vcol: u32) usize {
+        var w: u32 = 0;
+        var i: usize = 0;
+        while (i < line.len) {
+            const ce = wmod.nextCharEnd(line, i);
+            const cw = wmod.visualWidth(line[i..ce]);
+            if (w + cw > vcol) return i;
+            w += cw;
+            i = ce;
+        }
+        return line.len;
+    }
+
+    /// Map a (visual row, visual col) point — as rendered at `width` — to a
+    /// logical (line, byte col), clamped into the buffer. Used by mouse
+    /// placement/selection; `width` MUST match the width the TUI rendered
+    /// the editor at (the wrap boundary depends on it).
+    pub fn visualToLogical(self: *Editor, vrow: usize, vcol: u32, width: usize) EditorSelPt {
+        const wrapped = self.wrappedView(width) catch return .{ .line = 0, .col = 0 };
+        if (vrow >= wrapped.len) {
+            // Past the last visual line: park at the last line's end.
+            const last = self.lines.items.len -| 1;
+            return .{ .line = last, .col = self.lines.items[last].len };
+        }
+        const rows = self.wrap_cache_rows orelse return .{ .line = 0, .col = 0 };
+        // The logical line owning visual row `vrow`: walk the per-line
+        // visual row counts.
+        var acc: usize = 0;
+        var l: usize = rows.len - 1;
+        var first: usize = 0;
+        for (rows, 0..) |n, li| {
+            if (vrow < acc + n) {
+                l = li;
+                first = acc;
+                break;
+            }
+            acc += n;
+        }
+        // Byte offset of this visual line within the logical line
+        // (wrapped lines tile the line exactly).
+        const wr = vrow - first;
+        var off: usize = 0;
+        for (wrapped[first..first + wr]) |vl| off += vl.len;
+        const seg = wrapped[first + wr];
+        const seg_w = wmod.visualWidth(seg);
+        const c = if (vcol <= seg_w) visualColToByte(seg, vcol) else seg.len;
+        return .{ .line = l, .col = off + c };
+    }
+
+    /// Double/triple click on a visual point: select the word (or whole
+    /// logical line) under the pointer. Word = [A-Za-z0-9_] run, or any
+    /// multi-byte (CJK etc.) character run. `line` = true for triple click.
+    pub fn selectWordOrLine(self: *Editor, vrow: usize, vcol: u32, width: usize, line: bool) void {
+        const p = self.visualToLogical(vrow, vcol, width);
+        if (p.line >= self.lines.items.len) return;
+        if (line) {
+            self.sel_anchor = .{ .line = p.line, .col = 0 };
+            self.sel_focus = .{ .line = p.line, .col = self.lines.items[p.line].len };
+            return;
+        }
+        const text = self.lines.items[p.line];
+        if (p.col >= text.len) {
+            // Clicked past the last char: select the whole line.
+            self.sel_anchor = .{ .line = p.line, .col = 0 };
+            self.sel_focus = .{ .line = p.line, .col = text.len };
+            return;
+        }
+        const isWord = struct {
+            fn f(bytes: []const u8) bool {
+                if (bytes.len == 0) return false;
+                if (bytes.len > 1) return true; // multibyte (CJK etc.) = word char
+                const c = bytes[0];
+                return std.ascii.isAlphanumeric(c) or c == '_';
+            }
+        }.f;
+        var s0 = p.col;
+        while (s0 > 0) {
+            const prev = wmod.prevCharStart(text, s0);
+            if (!isWord(text[prev..s0])) break;
+            s0 = prev;
+        }
+        var e0 = p.col;
+        while (e0 < text.len) {
+            const nxt = wmod.nextCharEnd(text, e0);
+            if (!isWord(text[e0..nxt])) break;
+            e0 = nxt;
+        }
+        if (e0 <= s0) return;
+        self.sel_anchor = .{ .line = p.line, .col = s0 };
+        self.sel_focus = .{ .line = p.line, .col = e0 };
+    }
+
+    /// Total wrapped visual line count at `width` (cache warm-up).
+    pub fn visualLineCount(self: *Editor, width: usize) usize {
+        const view = self.wrappedView(width) catch return 1;
+        return @max(view.len, 1);
+    }
+
+    /// Place the cursor at a visual point (see visualToLogical).
+    pub fn placeCursor(self: *Editor, vrow: usize, vcol: u32, width: usize) void {
+        const p = self.visualToLogical(vrow, vcol, width);
+        self.cursor_line = p.line;
+        self.cursor_col = p.col;
+    }
+
+    /// Plain text of the current selection (logical lines joined with \n),
+    /// or null when empty. Owned.
+    pub fn selectionText(self: *const Editor) ?[]u8 {
+        const b = self.selBounds() orelse return null;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.alloc);
+        var l: usize = b.start.line;
+        while (true) : (l += 1) {
+            if (l > b.end.line) break;
+            if (l >= self.lines.items.len) break;
+            const line = self.lines.items[l];
+            const start = if (l == b.start.line) b.start.col else 0;
+            const end = if (l == b.end.line) @min(b.end.col, line.len) else line.len;
+            if (end > start) {
+                if (out.items.len > 0) out.append(self.alloc, '\n') catch return null;
+                out.appendSlice(self.alloc, line[start..end]) catch return null;
+            }
+        }
+        if (out.items.len == 0) return null;
+        return out.toOwnedSlice(self.alloc) catch null;
+    }
+
+    /// Reverse-video the selected ranges into the rendered editor window
+    /// (`frame` is the whole frame, `base` the first visible editor row,
+    /// `count` the visible rows, `vis_top` the first visible VISUAL line,
+    /// `width` the render width). Editor lines are plain text, so a simple
+    /// per-row splice is safe.
+    /// Index of the first visual row of logical line `l`, from the cached
+    /// per-line visual row counts.
+    fn firstVisualRow(rows: []const u32, l: usize) usize {
+        var v: usize = 0;
+        for (rows[0..@min(l, rows.len)]) |n| v += n;
+        return v;
+    }
+
+    pub fn highlightSelection(self: *Editor, frame: *std.ArrayListUnmanaged([]u8), base: usize, count: usize, vis_top: usize, width: usize, alloc: std.mem.Allocator) void {
+        const b = self.selBounds() orelse return;
+        const wrapped = self.wrappedView(width) catch return;
+        const rows = self.wrap_cache_rows orelse return;
+        var l: usize = b.start.line;
+        while (l <= b.end.line) : (l += 1) {
+            if (l >= rows.len) break;
+            const first = firstVisualRow(rows, l);
+            const last = if (l + 1 < rows.len) firstVisualRow(rows, l + 1) else wrapped.len;
+            for (wrapped[first..last], 0..) |seg, wr| {
+                const av = first + wr; // absolute visual row
+                if (av < vis_top or av >= vis_top + count) continue;
+                const fr = av - vis_top;
+                var off: usize = 0;
+                for (wrapped[first..first + wr]) |vl| off += vl.len;
+                const s = if (l == b.start.line) @max(b.start.col, off) else off;
+                const e = if (l == b.end.line) @min(b.end.col, off + seg.len) else off + seg.len;
+                if (e <= s) continue;
+                const col = wmod.visualWidth(seg[0..(s - off)]);
+                const width_sel = wmod.visualWidth(seg[(s - off)..(e - off)]);
+                // applySelectionHighlight takes (start_col, END col).
+                const hl = overlay.applySelectionHighlight(alloc, frame.items[base + fr], col, col + width_sel) catch continue;
+                alloc.free(frame.items[base + fr]);
+                frame.items[base + fr] = hl;
+            }
+        }
+    }
+
     /// The cursor's position in VISUAL (wrapped) coordinates: (row, col).
     /// row = the visual line the cursor is on; col = visual column within it.
-    pub fn cursorVisualPos(self: *const Editor, width: usize) struct { row: u32, col: u32 } {
-        const w: u32 = @intCast(width);
-        // Visual lines before the cursor's logical line.
-        var row: u32 = 0;
-        var i: usize = 0;
-        while (i < self.cursor_line) : (i += 1) {
-            const wrapped = wrapLine(self.alloc, self.lines.items[i], w) catch return .{ .row = 0, .col = 0 };
-            row += @intCast(wrapped.len);
-            for (wrapped) |vl| self.alloc.free(vl);
-            self.alloc.free(wrapped);
-        }
-        // Wrap the cursor's line and locate the cursor byte within it.
-        const line = self.lines.items[self.cursor_line];
-        const wrapped = wrapLine(self.alloc, line, w) catch return .{ .row = 0, .col = 0 };
-        defer {
-            for (wrapped) |vl| self.alloc.free(vl);
-            self.alloc.free(wrapped);
-        }
+    pub fn cursorVisualPos(self: *Editor, width: usize) struct { row: u32, col: u32 } {
+        const wrapped = self.wrappedView(width) catch return .{ .row = 0, .col = 0 };
+        const rows = self.wrap_cache_rows orelse return .{ .row = 0, .col = 0 };
+        if (self.cursor_line >= rows.len) return .{ .row = 0, .col = 0 };
+        const first = firstVisualRow(rows, self.cursor_line);
+        const last = if (self.cursor_line + 1 < rows.len) firstVisualRow(rows, self.cursor_line + 1) else wrapped.len;
         var byte_offset: usize = 0;
-        var vline: u32 = 0;
-        while (vline < wrapped.len) : (vline += 1) {
+        var vline: usize = first;
+        while (vline < last) : (vline += 1) {
             const vl = wrapped[vline];
             if (self.cursor_col <= byte_offset + vl.len) {
                 const col_in_vl = self.cursor_col - byte_offset;
                 const col = wmod.visualWidth(vl[0..col_in_vl]);
-                return .{ .row = row + vline, .col = col };
+                return .{ .row = @intCast(vline), .col = col };
             }
             byte_offset += vl.len;
         }
-        // Cursor at the very end; place at the end of the last visual line.
-        const last = wrapped[wrapped.len - 1];
-        return .{ .row = row + @as(u32, @intCast(wrapped.len - 1)), .col = wmod.visualWidth(last) };
+        // Cursor at the very end: last visual line, its full width.
+        const vl = wrapped[last - 1];
+        return .{ .row = @intCast(last - 1), .col = wmod.visualWidth(vl) };
     }
 
     /// Handle a key. Returns `.submit` if the user pressed Enter to submit.
     pub fn handleKey(self: *Editor, key: keys.Key, io: std.Io) !EditorAction {
         _ = io; // file completion lives in the TUI's file menu now
+        // NB: no blanket clearSelection() here — only TEXT-CHANGING actions
+        // drop the selection (standard editor behavior: typing/backspace
+        // replaces it; plain cursor moves keep it). `insertBytes` replaces
+        // the selection when one exists.
         switch (key) {
             .char => |c| {
                 if (c.ctrl and !c.alt) {
@@ -224,6 +495,7 @@ pub const Editor = struct {
                 }
             },
             .shift_enter => self.newLine() catch return .none,
+            .escape => self.clearSelection(),
             // Tab is handled by the TUI layer (file menu trigger/application).
             .up => {
                 if (self.isSingleLine() and (self.isEmpty() or self.history_index > -1 or self.cursor_col == 0)) {
@@ -281,6 +553,7 @@ pub const Editor = struct {
             self.saveDraft() catch return error.OutOfMemory;
         }
         self.history_index = new_index;
+        self.invalidateWrapCache();
         if (self.history_index == -1) {
             self.restoreDraft() catch return error.OutOfMemory;
         } else {
@@ -321,7 +594,13 @@ pub const Editor = struct {
         }
     }
 
+    pub fn clearSelectionAndSetText(self: *Editor, text: []const u8) !void {
+        self.clearSelection();
+        return self.setText(text);
+    }
+
     pub fn setText(self: *Editor, text: []const u8) !void {
+        self.invalidateWrapCache();
         self.freeLines(&self.lines);
         self.lines.clearRetainingCapacity();
         var it = std.mem.splitScalar(u8, text, '\n');
@@ -334,10 +613,18 @@ pub const Editor = struct {
     }
 
     pub fn insertChar(self: *Editor, c: u8) !void {
+        self.invalidateWrapCache();
         // Defensive: never let control characters (ESC, CSI fragments from torn
         // mouse sequences, etc.) into the buffer.
         if (c < 0x20 and c != '\n') return;
         if (c == 0x7f) return;
+        // Typing over a selection replaces it (standard editor behavior).
+        if (self.selBounds() != null) {
+            const bytes = [1]u8{c};
+            self.replaceSelection(&bytes) catch return;
+            self.clearSelection();
+            return;
+        }
         const line = self.lines.items[self.cursor_line];
         var nl: std.ArrayListUnmanaged(u8) = .empty;
         errdefer nl.deinit(self.alloc);
@@ -356,6 +643,14 @@ pub const Editor = struct {
             if (b < 0x20 and b != '\n') return;
             if (b == 0x7f) return;
         }
+        // A mouse selection is replaced by the inserted text (standard
+        // editor behavior); otherwise insert at the cursor.
+        if (self.selBounds() != null) {
+            self.replaceSelection(bytes) catch return;
+            self.clearSelection();
+            return;
+        }
+        self.invalidateWrapCache();
         const line = self.lines.items[self.cursor_line];
         var nl: std.ArrayListUnmanaged(u8) = .empty;
         errdefer nl.deinit(self.alloc);
@@ -368,7 +663,176 @@ pub const Editor = struct {
         self.cursor_col += bytes.len;
     }
 
+    /// Paste (possibly multi-line) clipboard text: a selection is replaced,
+    /// single-line text inserts at the cursor, multi-line text is split on
+    /// \n and spliced into the buffer. Trailing \r (CRLF paste) is dropped.
+    pub fn pasteText(self: *Editor, text: []const u8) !void {
+        self.invalidateWrapCache();
+        const body = if (std.mem.endsWith(u8, text, "\n") and text.len > 0) text[0 .. text.len - 1] else text;
+        var count: usize = 1;
+        for (body) |ch| {
+            if (ch == '\n') count += 1;
+        }
+        if (count == 1) {
+            if (self.selBounds() != null) {
+                self.replaceSelection(body) catch return;
+            } else {
+                try self.insertBytes(body);
+            }
+            return;
+        }
+        const b = self.selBounds();
+        var anchor_line: usize = 0;
+        var anchor_col: usize = 0;
+        if (b) |sb| {
+            anchor_line = sb.start.line;
+            anchor_col = @min(sb.start.col, self.lines.items[sb.start.line].len);
+        } else {
+            anchor_line = self.cursor_line;
+            anchor_col = self.cursor_col;
+        }
+        // Split into owned parts; \r is stripped (CRLF paste).
+        var parts: std.ArrayListUnmanaged([]u8) = .empty;
+        defer parts.deinit(self.alloc);
+        errdefer for (parts.items) |p| self.alloc.free(p);
+        var it = std.mem.splitScalar(u8, body, '\n');
+        while (it.next()) |seg0| {
+            const seg = if (seg0.len > 0 and seg0[seg0.len - 1] == '\r') seg0[0 .. seg0.len - 1] else seg0;
+            const owned = try self.alloc.dupe(u8, seg);
+            parts.append(self.alloc, owned) catch {
+                self.alloc.free(owned);
+                return error.OutOfMemory;
+            };
+        }
+        const first = self.lines.items[anchor_line];
+        if (b != null and anchor_line != b.?.end.line) {
+            // Multi-line paste over a multi-line selection: the first line
+            // keeps [0, start) and gains parts[0]; the last part merges
+            // with the tail of the selection's last line; everything
+            // between dies.
+            const end_line = b.?.end.line;
+            const last_line = self.lines.items[end_line];
+            const end_b = @min(b.?.end.col, last_line.len);
+            var head: std.ArrayListUnmanaged(u8) = .empty;
+            defer head.deinit(self.alloc);
+            head.appendSlice(self.alloc, first[0..anchor_col]) catch return error.OutOfMemory;
+            head.appendSlice(self.alloc, parts.items[0]) catch return error.OutOfMemory;
+            const head_owned = head.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
+            var joined: std.ArrayListUnmanaged(u8) = .empty;
+            defer joined.deinit(self.alloc);
+            joined.appendSlice(self.alloc, parts.items[parts.items.len - 1]) catch return error.OutOfMemory;
+            joined.appendSlice(self.alloc, last_line[end_b..]) catch return error.OutOfMemory;
+            const joined_owned = joined.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
+            self.alloc.free(first);
+            self.lines.items[anchor_line] = head_owned;
+            var i: usize = anchor_line + 1;
+            while (i <= end_line) : (i += 1) self.alloc.free(self.lines.items[i]);
+            var j: usize = anchor_line + 1;
+            var k: usize = end_line + 1;
+            while (k < self.lines.items.len) : (k += 1) {
+                self.lines.items[j] = self.lines.items[k];
+                j += 1;
+            }
+            self.lines.shrinkRetainingCapacity(self.lines.items.len - (end_line - anchor_line));
+            // Insert the middle parts, then the joined last line.
+            for (parts.items[1 .. parts.items.len - 1], 0..) |p, pi| {
+                self.lines.insert(anchor_line + 1 + pi, p) catch return error.OutOfMemory;
+            }
+            self.lines.insert(anchor_line + parts.items.len - 1, joined_owned) catch return error.OutOfMemory;
+            self.cursor_line = anchor_line + parts.items.len - 1;
+            self.cursor_col = parts.items[parts.items.len - 1].len;
+            self.clearSelection();
+            return;
+        }
+        // No selection (or same-line selection): split the anchor line at
+        // the insert point and splice the parts in between.
+        const tail = self.alloc.dupe(u8, first[anchor_col..]) catch return error.OutOfMemory;
+        const head = self.alloc.dupe(u8, first[0..anchor_col]) catch {
+            self.alloc.free(tail);
+            return error.OutOfMemory;
+        };
+        self.alloc.free(first);
+        self.lines.items[anchor_line] = head;
+        for (parts.items, 0..) |p, pi| {
+            if (pi == 0) {
+                var joined: std.ArrayListUnmanaged(u8) = .empty;
+                joined.appendSlice(self.alloc, head) catch return error.OutOfMemory;
+                joined.appendSlice(self.alloc, p) catch return error.OutOfMemory;
+                const joined_owned = joined.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
+                self.alloc.free(head);
+                self.alloc.free(p);
+                self.lines.items[anchor_line] = joined_owned;
+            } else {
+                self.lines.insert(anchor_line + pi, p) catch return error.OutOfMemory;
+            }
+        }
+        const last_idx = anchor_line + parts.items.len - 1;
+        if (tail.len > 0) {
+            var joined: std.ArrayListUnmanaged(u8) = .empty;
+            joined.appendSlice(self.alloc, self.lines.items[last_idx]) catch return error.OutOfMemory;
+            joined.appendSlice(self.alloc, tail) catch return error.OutOfMemory;
+            const joined_owned = joined.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
+            self.alloc.free(self.lines.items[last_idx]);
+            self.alloc.free(tail);
+            self.lines.items[last_idx] = joined_owned;
+        }
+        self.cursor_line = last_idx;
+        self.cursor_col = self.lines.items[last_idx].len - tail.len;
+        if (b != null) self.clearSelection();
+    }
+
+    /// Replace the current selection's byte range with `text`, parking the
+    /// cursor after the insertion.
+    fn replaceSelection(self: *Editor, text: []const u8) !void {
+        self.invalidateWrapCache();
+        const b = self.selBounds() orelse return error.NoSelection;
+        const first = self.lines.items[b.start.line];
+        const start_b = @min(b.start.col, first.len);
+        // Tail: everything after the selection's end point.
+        var tail: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer tail.deinit(self.alloc);
+        const last_line = self.lines.items[b.end.line];
+        const end_b = @min(b.end.col, last_line.len);
+        tail.appendSlice(self.alloc, last_line[end_b..]) catch return error.OutOfMemory;
+        // Splice the first line: [0,start_b) + text + tail.
+        var nl: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer nl.deinit(self.alloc);
+        nl.appendSlice(self.alloc, first[0..start_b]) catch return error.OutOfMemory;
+        nl.appendSlice(self.alloc, text) catch return error.OutOfMemory;
+        nl.appendSlice(self.alloc, tail.items) catch return error.OutOfMemory;
+        const owned = nl.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
+        self.alloc.free(first);
+        self.lines.items[b.start.line] = owned;
+        // Drop the fully-consumed lines between (and the emptied last
+        // line) — the exact survivors list, no shrinkRetainingCapacity
+        // (which would truncate the buffer: the list was not empty, and
+        // the emptied line index may not be the last element).
+        const removed = b.end.line - b.start.line;
+        if (removed > 0) {
+            // Free exactly the consumed lines (start.line, end.line]; the
+            // emptied tail was already merged into the first line, so
+            // every one of these slots dies.
+            var i: usize = b.start.line + 1;
+            while (i <= b.end.line) : (i += 1) {
+                self.alloc.free(self.lines.items[i]);
+            }
+            // Left-shift the untouched tail by `removed` slots.
+            var j: usize = b.start.line + 1;
+            var k: usize = b.end.line + 1;
+            while (k < self.lines.items.len) : (k += 1) {
+                self.lines.items[j] = self.lines.items[k];
+                j += 1;
+            }
+            self.lines.shrinkRetainingCapacity(self.lines.items.len - removed);
+        }
+        self.cursor_line = b.start.line;
+        self.cursor_col = start_b + text.len;
+        // Selection points lived INSIDE the replaced range: clear.
+        self.clearSelection();
+    }
+
     fn backspace(self: *Editor) void {
+        self.invalidateWrapCache();
         if (self.cursor_col > 0) {
             const line = self.lines.items[self.cursor_line];
             // Delete a whole character (CJK = 3 bytes), not just one byte.
@@ -404,6 +868,7 @@ pub const Editor = struct {
     }
 
     fn deleteForward(self: *Editor) void {
+        self.invalidateWrapCache();
         const line = self.lines.items[self.cursor_line];
         if (self.cursor_col < line.len) {
             // Delete a whole character (CJK = 3 bytes), not just one byte.
@@ -436,6 +901,7 @@ pub const Editor = struct {
     }
 
     pub fn newLine(self: *Editor) !void {
+        self.invalidateWrapCache();
         const line = self.lines.items[self.cursor_line];
         const after = line[self.cursor_col..];
         var nl: std.ArrayListUnmanaged(u8) = .empty;
@@ -482,6 +948,7 @@ pub const Editor = struct {
     }
 
     fn deleteWordBackward(self: *Editor) void {
+        self.invalidateWrapCache();
         if (self.cursor_col == 0) {
             self.backspace();
             return;
@@ -503,6 +970,7 @@ pub const Editor = struct {
     }
 
     fn deleteToLineStart(self: *Editor) void {
+        self.invalidateWrapCache();
         const line = self.lines.items[self.cursor_line];
         var nl: std.ArrayListUnmanaged(u8) = .empty;
         defer nl.deinit(self.alloc);
@@ -514,6 +982,7 @@ pub const Editor = struct {
     }
 
     fn deleteToLineEnd(self: *Editor) void {
+        self.invalidateWrapCache();
         const line = self.lines.items[self.cursor_line];
         var nl: std.ArrayListUnmanaged(u8) = .empty;
         defer nl.deinit(self.alloc);
