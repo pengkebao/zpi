@@ -2,7 +2,7 @@
 
 > 一个用纯 Zig 写的终端编程智能体 —— [pi](https://pi.dev) 1.5.0 的行为级重实现
 
-![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/tests-602%2B-brightgreen)
+![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/tests-630%2B-brightgreen)
 
 **零第三方依赖 · 单二进制 · 与 pi 配置/会话双向兼容**
 
@@ -144,13 +144,15 @@ src/
 ## 测试
 
 ```bash
-zig test test_ui.zig              # 236 个 UI/逻辑测试
-zig test leak_g2.zig              # 184 个泄漏回归测试（SafeAllocator 全路径）
+zig test test_ui.zig              # 238 个 UI/逻辑测试
+zig test leak_g2.zig              # 186 个泄漏回归测试（SafeAllocator 全路径）
 zig test src/ui/keys.zig          # 按键/鼠标序列解析（18）
+zig test src/ui/tool_block.zig    # 工具块渲染：diff/ANSI/CJK 折行（25）
 zig test test_openai.zig          # SSE 协议解析（10）
 zig test test_mcp.zig             # MCP 客户端单测（9）
+zig test test_pt.zig              # bracketed paste（4）
 zig test test_clip.zig            # 剪贴板（2）
-zig test test_pending.zig         # steering/follow-up 队列（含传递依赖共 153）
+zig test test_pending.zig         # steering/follow-up 队列（含传递依赖共 156）
 zig run bench_scroll.zig    # 滚动帧基准
 zig run bench_stream.zig    # 流式帧基准
 zig run bench_markdown.zig  # markdown 渲染基准
