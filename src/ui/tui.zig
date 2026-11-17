@@ -3686,8 +3686,10 @@ pub const TUI = struct {
         // pi updatePendingMessagesDisplay: messages queued while the agent
         // works (steering / follow-up) or while compaction runs render as
         // dim rows between the transcript and the editor border.
-        const live_q_h: usize = if (self.working and !self.compacting) self.session.queuedPeekLen() else 0;
-        const compact_q_h: usize = if (self.compacting) self.compact_queue.items.len else 0;
+        // Pending rows WRAP to the width (appendPendingRows); the budget must
+        // count the same wraps or long messages clip and the bottom goes off.
+        const live_q_h: usize = if (self.working and !self.compacting) self.session.queuedPeekRows(self.width) else 0;
+        const compact_q_h: usize = if (self.compacting) self.compactQueueRows() else 0;
         const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h + compact_q_h + live_q_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
@@ -3973,7 +3975,7 @@ pub const TUI = struct {
         const cursor_row = if (mcp_modal)
             transcript_h + self.height // park off-frame (pi shows no cursor in the manager)
         else
-            transcript_h + 1 + (cursor_vis.row - vis_top);
+            transcript_h + compact_q_h + 1 + (cursor_vis.row - vis_top);
         const cursor_col: u16 = @intCast(if (1 + cursor_vis.col < self.width) 1 + cursor_vis.col else self.width);
         // diffRender adopts the frame's lines (they become the next diff
         // base); afterwards only the array itself needs releasing.
@@ -7470,6 +7472,31 @@ pub const TUI = struct {
         return 1;
     }
 
+    /// Wrap a pending-message text into dim rows: the label ("Steering: " /
+    /// "Follow-up: ") prefixes the first visual row and continuation rows
+    /// align under the text (label width). A long or multi-line message
+    /// takes several rows — the layout budget (queuedPeekRows /
+    /// compactQueueRows) counts the same wraps, so the bottom stays on
+    /// screen and nothing is clipped.
+    fn appendPendingRows(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), text: []const u8, mode: CompactQueueMode) void {
+        const label: []const u8 = switch (mode) {
+            .steer => "Steering: ",
+            .followUp => "Follow-up: ",
+        };
+        const label_w: usize = wmod.visualWidth(label);
+        const w: usize = if (self.width > label_w) self.width - label_w else 1;
+        const rows = wrapPlain(self.alloc, text, w) catch return;
+        defer {
+            for (rows) |r| self.alloc.free(r);
+            self.alloc.free(rows);
+        }
+        for (rows, 0..) |r, i| {
+            const prefix = if (i == 0) label else (SPACES48)[0..@min(label_w, 48)];
+            const line = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}{s}{s}", .{ prefix, r, ansi.RESET }) catch continue;
+            frame.append(self.alloc, line) catch {};
+        }
+    }
+
     /// pi updatePendingMessagesDisplay: the dim "Steering: ..." / "Follow-up:
     /// ..." rows for messages queued while the agent is WORKING (live peek
     /// of the session queues; they drain invisibly mid-run).
@@ -7480,30 +7507,105 @@ pub const TUI = struct {
             self.alloc.free(queued);
         }
         for (queued) |q| {
-            const label: []const u8 = switch (q.mode) {
-                .steer => "Steering: ",
-                .followUp => "Follow-up: ",
+            const mode: CompactQueueMode = switch (q.mode) {
+                .steer => .steer,
+                .followUp => .followUp,
             };
-            const line = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}{s}" ++ ansi.RESET, .{ label, q.text }) catch continue;
-            const truncated = truncateToWidth(self.alloc, line, self.width) catch line;
-            if (truncated.ptr != line.ptr) self.alloc.free(line);
-            frame.append(self.alloc, truncated) catch {};
+            self.appendPendingRows(frame, q.text, mode);
         }
     }
 
     /// pi updatePendingMessagesDisplay: the dim "Steering: ..." / "Follow-up:
     /// ..." rows between the transcript and the editor border.
     fn renderCompactQueue(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        for (self.compact_queue.items) |e| self.appendPendingRows(frame, e.text, e.mode);
+    }
+
+    /// Display rows the compaction queue occupies at the current width
+    /// (same wrap math as appendPendingRows).
+    fn compactQueueRows(self: *const TUI) usize {
+        const wrap = struct {
+            fn count(s: []const u8, w: usize) usize {
+                if (w == 0) return 1; // unused; callers guard
+                var rows: usize = 0;
+                var start: usize = 0;
+                while (start < s.len) {
+                    rows += 1;
+                    var end = start;
+                    var cw_sum: usize = 0;
+                    var last_space: ?usize = null;
+                    while (end < s.len) {
+                        const ce = wmod.nextCharEnd(s, end);
+                        const cw = wmod.visualWidth(s[end..ce]);
+                        if (cw_sum + cw > w) break;
+                        if (s[end] == ' ') last_space = end;
+                        cw_sum += cw;
+                        end = ce;
+                    }
+                    var brk: usize = 0;
+                    if (end < s.len and last_space != null and last_space.? > start) {
+                        brk = last_space.? + 1;
+                    } else {
+                        brk = end;
+                    }
+                    if (brk <= start) brk = wmod.nextCharEnd(s, start);
+                    start = brk;
+                }
+                return if (rows == 0) 1 else rows;
+            }
+        }.count;
+        var total: usize = 0;
         for (self.compact_queue.items) |e| {
-            const label: []const u8 = switch (e.mode) {
-                .steer => "Steering: ",
-                .followUp => "Follow-up: ",
+            const label_w: usize = switch (e.mode) {
+                .steer => 10, // "Steering: "
+                .followUp => 11, // "Follow-up: "
             };
-            const line = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}{s}" ++ ansi.RESET, .{ label, e.text }) catch continue;
-            const truncated = truncateToWidth(self.alloc, line, self.width) catch line;
-            if (truncated.ptr != line.ptr) self.alloc.free(line);
-            frame.append(self.alloc, truncated) catch {};
+            const w: usize = if (self.width > label_w) self.width - label_w else 1;
+            total += wrap(e.text, w);
         }
+        return total;
+    }
+
+    /// Word-wrap a plain (no-ANSI) text into visual rows of at most `width`
+    /// columns; explicit newlines always break. CJK-aware via width.zig.
+    /// Caller owns the slice and every row.
+    fn wrapPlain(alloc: std.mem.Allocator, text: []const u8, width: usize) ![][]u8 {
+        var out: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (out.items) |r| alloc.free(r);
+            out.deinit(alloc);
+        }
+        var start: usize = 0;
+        while (start < text.len) {
+            var end = start;
+            var cw_sum: usize = 0;
+            var last_space: ?usize = null;
+            while (end < text.len) {
+                if (text[end] == '\n') break; // explicit newline always breaks
+                const ce = wmod.nextCharEnd(text, end);
+                const cw = wmod.visualWidth(text[end..ce]);
+                if (cw_sum + cw > width) break;
+                if (text[end] == ' ') last_space = end;
+                cw_sum += cw;
+                end = ce;
+            }
+            var brk: usize = 0;
+            if (end < text.len and text[end] == '\n') {
+                brk = end + 1; // consume the newline
+            } else if (end < text.len and last_space != null and last_space.? > start) {
+                brk = last_space.? + 1;
+            } else {
+                brk = end;
+            }
+            if (brk <= start) brk = wmod.nextCharEnd(text, start);
+            const row = alloc.dupe(u8, text[start..brk]) catch return error.OutOfMemory;
+            out.append(alloc, row) catch return error.OutOfMemory;
+            start = brk;
+        }
+        if (out.items.len == 0) {
+            out.append(alloc, try alloc.dupe(u8, "")) catch return error.OutOfMemory;
+        }
+        return out.toOwnedSlice(alloc) catch return error.OutOfMemory;
     }
 
     fn parseCmd(cmd: []const u8) struct { word: []const u8, arg: []const u8 } {

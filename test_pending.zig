@@ -154,3 +154,77 @@ test "isRecoverableLength matches pi overflow heuristic" {
     try std.testing.expect(session.isRecoverableLength());
     _ = ai.FinishReason.stop; // keep import referenced
 }
+
+test "pending rows wrap long text and budget counts the same wraps" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    defer session.deinit();
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+    t.working = true;
+    t.width = 40;
+
+    // A long steering message that must wrap at width 40 (label "Steering: "
+    // is 10 cols, so the text wraps at 30).
+    const long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda";
+    session.queueSteering(long);
+
+    // The render must produce MORE than one row (it used to be one, clipped).
+    var frame: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (frame.items) |l| alloc.free(l);
+        frame.deinit(alloc);
+    }
+    t.renderLiveQueue(&frame);
+    try std.testing.expect(frame.items.len > 1);
+    // First row carries the label; continuation rows align under the text.
+    try std.testing.expect(std.mem.indexOf(u8, frame.items[0], "Steering: alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame.items[1], "Steering:") == null);
+    // The whole message survived the wrap (nothing clipped).
+    var all: std.ArrayListUnmanaged(u8) = .empty;
+    defer all.deinit(alloc);
+    for (frame.items) |r| all.appendSlice(alloc, r) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "lambda") != null);
+
+    // The layout budget matches the rendered row count exactly.
+    try std.testing.expectEqual(frame.items.len, session.queuedPeekRows(40));
+
+    // A multi-line message keeps its explicit newlines (fresh session).
+    var model2: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    var registry2 = tools.Registry.init(alloc);
+    try tools.registerAll(&registry2);
+    var session2 = try agent.Session.init(alloc, io, &model2, &registry2, provider, "test");
+    defer session2.deinit();
+    var t2 = tui.TUI.init(io, alloc, &session2, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t2.deinit();
+    t2.working = true;
+    t2.width = 40;
+    session2.queueSteering("line one\nline two");
+    var frame2: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (frame2.items) |l| alloc.free(l);
+        frame2.deinit(alloc);
+    }
+    t2.renderLiveQueue(&frame2);
+    try std.testing.expect(std.mem.indexOf(u8, frame2.items[0], "Steering: line one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame2.items[1], "line two") != null);
+}

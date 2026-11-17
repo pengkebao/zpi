@@ -10,6 +10,7 @@ const tools = @import("../tools/registry.zig");
 const config = @import("config.zig");
 const ss = @import("session_store.zig");
 const compact = @import("compaction.zig");
+const wmod = @import("../ui/width.zig");
 
 /// Global abort flag, set by the SIGINT handler (signal handlers cannot
 /// reach session state). Checked between stream chunks and around tool calls.
@@ -293,12 +294,61 @@ pub const Session = struct {
         return out.toOwnedSlice(self.alloc) catch &.{};
     }
 
-    /// Total queued message count (steering + follow-up); the TUI reserves
-    /// a pending-row per message above the editor.
+    /// Total queued message count (steering + follow-up).
     pub fn queuedPeekLen(self: *Session) usize {
         self.queue_mutex.lock(self.io) catch return 0;
         defer self.queue_mutex.unlock(self.io);
         return self.steering_queue.items.len + self.followup_queue.items.len;
+    }
+
+    /// Number of DISPLAY rows the queued messages will occupy above the
+    /// editor at `width`: each queued text is wrapped to the width, so a
+    /// long (or multi-line) message takes more than one row. The TUI
+    /// reserves this many layout rows; wrapping to one row would clip the
+    /// message and the layout would push the bottom off-screen.
+    pub fn queuedPeekRows(self: *Session, width: usize) usize {
+        self.queue_mutex.lock(self.io) catch return 0;
+        defer self.queue_mutex.unlock(self.io);
+        const wrap = struct {
+            fn count(s: []const u8, w: usize) usize {
+                if (w == 0) return 1;
+                var rows: usize = 0;
+                var start: usize = 0;
+                while (start < s.len) {
+                    rows += 1;
+                    var end = start;
+                    var cw_sum: usize = 0;
+                    var last_space: ?usize = null;
+                    while (end < s.len) {
+                        const ce = wmod.nextCharEnd(s, end);
+                        const cw = wmod.visualWidth(s[end..ce]);
+                        if (cw_sum + cw > w) break;
+                        if (s[end] == ' ') last_space = end;
+                        cw_sum += cw;
+                        end = ce;
+                    }
+                    var brk: usize = 0;
+                    if (end < s.len and last_space != null and last_space.? > start) {
+                        brk = last_space.? + 1;
+                    } else {
+                        brk = end;
+                    }
+                    if (brk <= start) brk = wmod.nextCharEnd(s, start);
+                    start = brk;
+                }
+                return if (rows == 0) 1 else rows;
+            }
+        }.count;
+        var total: usize = 0;
+        for (self.steering_queue.items) |t| {
+            const w: usize = if (width > 10) width - 10 else 1; // "Steering: "
+            total += wrap(t, w);
+        }
+        for (self.followup_queue.items) |t| {
+            const w: usize = if (width > 11) width - 11 else 1; // "Follow-up: "
+            total += wrap(t, w);
+        }
+        return total;
     }
 
     /// Number of queued follow-up messages (steering drains invisibly).
