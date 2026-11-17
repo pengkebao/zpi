@@ -310,6 +310,19 @@ pub const Session = struct {
         return out.toOwnedSlice(self.alloc) catch &.{};
     }
 
+    /// Drop every queued steering/follow-up message (pi clearQueue, RPC
+    /// mode `clear_queue` command). Returns the number removed.
+    pub fn clearQueue(self: *Session) usize {
+        self.queue_mutex.lock(self.io) catch return 0;
+        defer self.queue_mutex.unlock(self.io);
+        const n = self.steering_queue.items.len + self.followup_queue.items.len;
+        for (self.steering_queue.items) |t| self.alloc.free(t);
+        self.steering_queue.clearRetainingCapacity();
+        for (self.followup_queue.items) |t| self.alloc.free(t);
+        self.followup_queue.clearRetainingCapacity();
+        return n;
+    }
+
     /// Total queued message count (steering + follow-up).
     pub fn queuedPeekLen(self: *Session) usize {
         self.queue_mutex.lock(self.io) catch return 0;

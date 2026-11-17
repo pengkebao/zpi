@@ -15,3 +15,4 @@ width_test_tmp.zig
 main
 test_read
 test_repl
+t_esc_tmp

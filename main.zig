@@ -15,6 +15,7 @@ const hooks = @import("src/core/hooks.zig");
 const command_tools = @import("src/tools/command_tools.zig");
 const selection = @import("src/tools/selection.zig");
 const tui = @import("src/ui/tui.zig");
+const rpcmod = @import("src/core/rpc.zig");
 const ss = @import("src/core/session_store.zig");
 const sp = @import("src/core/system_prompt.zig");
 const msgmod = @import("src/core/message.zig");
@@ -1144,7 +1145,8 @@ pub fn main(init: std.process.Init) !void {
     {
         const stdin_file = std.Io.File.stdin();
         const is_tty = stdin_file.isTty(io) catch false;
-        if (!is_tty) {
+        // RPC mode owns stdin (the JSONL command stream); never pre-read it.
+        if (!is_tty and !mode_rpc) {
             var buf = std.array_list.Managed(u8).init(alloc);
             var rbuf: [4096]u8 = undefined;
             var fr = stdin_file.reader(io, &rbuf);
@@ -1442,22 +1444,35 @@ pub fn main(init: std.process.Init) !void {
 
     // Run
     if (print_mode) {
-        if (mode_rpc) {
-            std.debug.print("error: --mode rpc is not implemented yet\n", .{});
-            return error.BadUsage;
-        }
         const stdout = std.Io.File.stdout();
-        // Both modes suppress the streamed echo (print-mode semantics);
-        // json mode's output is the event stream itself.
-        session.quiet = true;
-        if (mode_json) {
-            // K1: JSONL event stream (pi json-event shape). Session header
-            // first (the store file's first line), then live events.
-            if (session.store) |st| {
-                st.emitHeader(stdout, io) catch {};
-            }
+        if (mode_rpc) {
+            // K2: JSONL command stream on stdin, events + responses on stdout.
+            // The K1 event stream is the same stdout, so both share the
+            // session's json_out writer.
+            session.quiet = true;
             session.json_out = stdout;
+            var rpc = rpcmod.Rpc.init(alloc, io, &session, &cfg, sessions_dir, cwd_abs, stdout);
+            defer rpc.deinit();
+            rpc.run();
+            session.json_out = null;
+        } else {
+            // Both modes suppress the streamed echo (print-mode semantics);
+            // json mode's output is the event stream itself.
+            session.quiet = true;
+            if (mode_json) {
+                // K1: JSONL event stream (pi json-event shape). Session header
+                // first (the store file's first line), then live events.
+                if (session.store) |st| {
+                    st.emitHeader(stdout, io) catch {};
+                }
+                session.json_out = stdout;
+            }
         }
+
+        if (mode_rpc) {
+            // rpc.run() returned on stdin EOF; skip the one-shot prompt path
+            // and fall through to shared cleanup.
+        } else {
         var run_failed = false;
         if (prompt) |p| {
             session.runPromptWithImages(p, image_attachments.items) catch |e| {
@@ -1492,6 +1507,7 @@ pub fn main(init: std.process.Init) !void {
         if (run_failed) {
             // pi print-mode: console.error + exit 1 (no error-return trace).
             std.process.exit(1);
+        }
         }
     } else {
         // TUI mode

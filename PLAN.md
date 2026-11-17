@@ -168,7 +168,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 | `-p` print（一次运行退出，stdout 只输出正文） | ✅ | ✅ | pi print-mode 语义：全程静默（quiet），回合结束从最后一条 assistant 消息一次性输出正文；thinking/tool 完全不落 stderr；错误 → stderr + **exit 1**（process.exit，无 error trace）；leak 清零（prompt/stdin/@file/trust-ctx 路径） |
 | `--mode text` | ✅ | ✅ | `-p` 等价 |
 | `--mode json`（JSONL 事件流） | ✅ | ✅ | **K1**：stdout 逐行 JSONL——session header（store 首行 / 合成）+ agent_start / turn_start / message_start / message_update（text_delta/thinking_delta/toolcall_start{id,toolName}/toolcall_delta，pi assistantMessageEvent 形状）/ message_end（assistant 全 content blocks + stopReason/usage；toolResult 带 toolCallId/content/isError）/ compaction_start|end(reason) / turn_end / agent_end / agent_settled(aborted)；stderr 全静默；工具回合 E2E 双轮验证全部行合法 JSON |
-| `--mode rpc`（stdin/stdout JSONL 双向控制） | ✅ | ❌ | K2（复用 K1 事件流 + 命令解析），CLI 已占位报未实现 |
+| `--mode rpc`（stdin/stdout JSONL 双向控制） | ✅ | ✅ | **K2**：session header 先行 + 全命令集（28 命令，pi rpc-mode 对齐）；`--mode rpc` 隐含 `-p`；stdin 归 RPC 线程（main 不预读）；prompt 响应在 turn 结束后发出；E2E 20 步全过 |
 | SDK（进程内 TS） | ✅ | ➖ | Zig 侧等价物是库链接；可后置 |
 
 ### 9. 扩展与资源
@@ -454,8 +454,8 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 - [ ] J6 OAuth 浏览器流程（以 login 存 token 近似；完整 OAuth 待做）
 
 ### Phase K — JSON/RPC 模式与分发（~2k 行）
-- [ ] K1 `--mode json`：事件全集（agent_start/turn_*/message_*/tool_*/compaction/...）
-- [ ] K2 `--mode rpc`：命令集（prompt/get_state/abort/set_model/...）+ 事件流 + 扩展 UI 记录
+- [x] K1 `--mode json`：事件全集（agent_start/turn_*/message_*/tool_*/compaction/...）
+- [x] K2 `--mode rpc`：命令集（prompt/steer/follow_up/abort/clear_queue/new_session/get_state/set_model/cycle_model/get_available_models/set_thinking_level/cycle_thinking_level/get_available_thinking_levels/set_steering_mode/set_follow_up_mode/compact/set_auto_compaction/set_auto_retry/bash/abort_bash/get_session_stats/export_html/switch_session/fork/clone/get_fork_messages/get_entries/get_tree/get_last_assistant_text/set_session_name/get_messages/get_commands）+ 事件流复用 K1 + Python E2E 20 步全过（mock SSE，/tmp/e2e_rpc/test.py）+ test_rpc.zig 单测。实现：src/core/rpc.zig（stdin 线程解析入队 + 主循环执行 + 1 字节流式读避免 SSE 批处理 bug；Job 字段 dup 防悬垂；prompt 响应在 turn 结束后发出）
 - [ ] K3 `/share`（gist 最小实现，radius 可选）、`/bug`（可裁剪）
 - [ ] K4 子命令收尾：`pi config`、`pi list`、`--export`、`--version`、`--help` 全量对齐；package 安装（npm 源最小化 = tarball HTTP 下载 + std.tar 解包，无 npm 进程依赖）
 - [ ] K5 **跨平台矩阵发布**：darwin/linux/windows × x86_64/aarch64 六个静态二进制；windows 终端 raw mode 用 Win32 Console API（OS API 不算依赖）；HOME→USERPROFILE；CI 矩阵构建
