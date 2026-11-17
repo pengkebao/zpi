@@ -283,8 +283,13 @@ fn tokenizeWords(arena: std.mem.Allocator, line: []const u8) ![]Token {
         const start = i;
         if (std.ascii.isAlphanumeric(line[i]) or line[i] == '_') {
             while (i < line.len and (std.ascii.isAlphanumeric(line[i]) or line[i] == '_')) i += 1;
+        } else if (line[i] < 0x80) {
+            i += 1; // single-byte punctuation / space
         } else {
-            i += 1;
+            // Multi-byte (CJK etc.): one whole character per token, never a
+            // byte slice — inverse-video boundaries between tokens must not
+            // split a character (split bytes render as ? diamonds).
+            i += charLen(line, i);
         }
         try out.append(arena, .{ .text = line[start..i] });
     }
@@ -592,6 +597,14 @@ fn wrapSpans(arena: std.mem.Allocator, spans: []const Span, width: usize, out: *
         var start: usize = 0;
         var i: usize = 0;
         while (i < sp.text.len) {
+            // ANSI sequences are atomic and zero-width: jump over them whole.
+            // Counting (or breaking inside) them leaked literal "27m"/"[27m"
+            // fragments at row starts and left dangling CSIs that swallowed
+            // the newline, joining rows into overlong lines.
+            if (sp.text[i] == 0x1b) {
+                i = escapeEnd(sp.text, i);
+                continue;
+            }
             const n = charLen(sp.text, i);
             const w = wmod.visualWidth(sp.text[i .. i + n]);
             if (col + w > width and col > 0) {
@@ -1245,4 +1258,68 @@ test "diffStyle follows the diff line format" {
     try t.expectEqualStrings(FG_DIFF_CONTEXT, diffStyle(" 12 same"));
     try t.expectEqualStrings(FG_DIFF_CONTEXT, diffStyle("+++ b/file")); // not a numbered diff row
     try t.expectEqualStrings(FG_DIFF_CONTEXT, diffStyle("   ..."));
+}
+
+test "edit diff: wrap never breaks inside ANSI sequences or CJK chars" {
+    // A long removed line with CJK + an inverse word-diff span. The wrap must
+    // keep every escape sequence whole (no literal "27m"/"[27m" fragments at
+    // row starts) and never split a multi-byte character (split bytes render
+    // as ? diamonds).
+    const block = try render(t.allocator, .{
+        .name = "edit",
+        .args = "{\"path\":\"x.md\"}",
+        .result = "Successfully applied the edit.\n\n- 5 技能（Skills）与提示模板：pi 同款发现机制与 SKILL.md 格式说明文字很长需要折行测试\n+ 5 技能（Skills）与提示模板：pi 同款发现机制与 SKILL.md 格式说明文字很长需要折行测试二",
+    }, .{ .width = 60 });
+    defer t.allocator.free(block);
+    const rows = try plainRows(t.allocator, block);
+    defer freeRows(t.allocator, rows);
+    for (rows) |r| {
+        try t.expect(std.mem.indexOf(u8, r, "27m") == null);
+        try t.expect(std.mem.indexOf(u8, r, "[27m") == null);
+        try t.expect(std.mem.indexOf(u8, r, "[7m") == null);
+        try t.expect(std.mem.indexOfScalar(u8, r, '?') == null);
+    }
+    // All the content survived the wrap.
+    var all: std.ArrayListUnmanaged(u8) = .empty;
+    defer all.deinit(t.allocator);
+    for (rows) |r| try all.appendSlice(t.allocator, r);
+    try t.expect(std.mem.indexOf(u8, all.items, "同款发现机制") != null);
+    try t.expect(std.mem.indexOf(u8, all.items, "折行测试二") != null);
+}
+
+test "wrapSpans: escape sequences count zero columns and stay whole" {
+    const spans = [_]Span{.{ .style = "", .text = "\x1b[7m高亮文本\x1b[27m普通文本继续延续到很长的位置需要折行才可以看到结尾" }};
+    var rows: std.ArrayListUnmanaged(Row) = .empty;
+    defer {
+        for (rows.items) |r| t.allocator.free(r);
+        rows.deinit(t.allocator);
+    }
+    try wrapSpans(t.allocator, &spans, 20, &rows);
+    try t.expect(rows.items.len > 1);
+    // Strip complete escape sequences; whatever remains must have no debris
+    // (a sequence cut in half would leave a literal "[7m"/"[27m" fragment).
+    const strip = struct {
+        fn go(al: std.mem.Allocator, s: []const u8) ![]u8 {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            var k: usize = 0;
+            while (k < s.len) {
+                if (s[k] == 0x1b) {
+                    k = escapeEnd(s, k);
+                } else {
+                    try out.append(al, s[k]);
+                    k += 1;
+                }
+            }
+            return try out.toOwnedSlice(al);
+        }
+    }.go;
+    for (rows.items) |r| {
+        for (r) |sp| {
+            const plain = try strip(t.allocator, sp.text);
+            defer t.allocator.free(plain);
+            try t.expect(std.mem.indexOf(u8, plain, "27m") == null);
+            try t.expect(std.mem.indexOf(u8, plain, "[7m") == null);
+            try t.expect(wmod.visualWidth(plain) <= 20);
+        }
+    }
 }
