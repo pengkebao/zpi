@@ -175,7 +175,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
 | 扩展：registerTool / 命令 / 事件钩子（tool_call 拦截）/ 自定义渲染 / UI 组件 | ✅ TS 进程内 | ❌ | 决策点：Zig 动态库 or 内嵌脚本解释器，见 Phase 9 |
-| Skills（SKILL.md、agentskills.io 规范、/skill:name、按需加载） | ✅ | ✅ | `skills.zig`：4 处发现（agent/skills、~/.agents/skills、cwd/.pi/skills、cwd/.agents/skills）+ 递归（含 SKILL.md 目录=根）+ 最小 frontmatter 解析 + 名字校验 + 无描述跳过 + 同名去重；系统提示 `<available_skills>` 广告；`/skill:name [args]` 读正文包 `<skill>` 块发送（pi invokeSkill）；`/skill:<tab>` 补全；6 单测 + E2E |
+| Skills（SKILL.md、agentskills.io 规范、/skill:name、按需加载） | ✅ | ✅ | `skills.zig`：4 处发现（agent/skills、~/.agents/skills、cwd/.pi/skills、cwd/.agents/skills）+ 递归（含 SKILL.md 目录=根）+ 最小 frontmatter 解析 + 名字校验 + 无描述跳过 + 同名去重；系统提示 `<available_skills>` 广告；`/skill:name [args]` 读正文包 `<skill>` 块发送（pi invokeSkill）；`/skill:<tab>` 补全；**转写折叠渲染**（pi SkillInvocationMessageComponent：一行 `[skill] name`，点击/Ctrl+O 展开，args 独立 user 消息，`-c` 回放同样折叠）；6 单测 + E2E |
 | Prompt templates（Markdown、$1/$@/默认值） | ✅ | ✅ | Phase D：agent-dir/prompts + cwd/.pi/prompts；`/name args` 展开 $1..$n/$@/$ARGUMENTS/${N:-default}/${@:N[:L]}（bash 引号解析）；未识别 slash 回退模板 |
 | 主题 JSON 文件 | ✅ | ⚠️ | theme.zig 仅硬编码 ANSI 暗色；JSON 主题发现/加载 + /settings 切换 + truecolor 迁移 ⏳（H3） |
 | Pi packages（npm/git/local 安装分发、`pi install/remove/update/list`） | ✅ | ❌ | 依赖扩展机制成型 |
@@ -414,6 +414,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
   - **多击**：keys.zig 解析 5 字段 SGR multi-click 后缀 + TUI 500ms 时间/位置连击兜底；双击选词（CJK 逐字）、三击选行（editor + transcript，`selectWordOrLine`/`selectDocWord`）
   - **剪贴板双通道**：`clipboard.writeClipboardText`（macOS pbcopy / Windows·WSL PowerShell / Linux xclip·wl-copy）+ OSC52 同时发送——Terminal.app 忽略 OSC 52 的场景（"Copied!" 显示但剪贴板为空）修复；`copyToClipboard` 两路并发。Zig 0.17 坑：`Child.wait()` 前必须 `stdin.close()` 且置 `child.stdin = null`（否则 double-close）
   - 验证：pty E2E（SGR 鼠标序列注入 → 断言 OSC52 字节 + `pbpaste` 内容一致）；test_ui 234 / keys 18 / clip 2 全过
+- **`/skill:name` 不再刷屏（对齐 pi SkillInvocationMessageComponent）**（用户反馈：用技能时整个 SKILL.md 正文铺满内容区）：对照 pi 1.5.0 `skill-invocation-message.js`——模型收到完整 `<skill>` 块（`_expandSkillCommand` 不变），但**转写只渲染一行** `[skill] name (ctrl+o to expand)`（customMessageBg 背景 + bold label + muted 提示），点击或 Ctrl+O 才展开完整正文（`**name**` + body markdown）；`/skill:name args` 的 args 作为**独立 user 消息**渲染在块下方（pi：userMessage 与 skill 块分离）。实现：`SkillEntry`（name/location/content + `expanded ?bool` 跟随全局 tools_expanded + `block_idx`，session allocator）+ `BlockSrc.skill` + `parseSkillBlock`（对齐 pi 正则语义：`<skill name=".." location="..">\n…\n</skill>` + 可选 `\n\n` user 消息尾）；`addSubmittedMessage` 统一四个提交路径（编辑器/命令/compact 队列/回放）+ `-c` 回放路径（持久化的 `<skill>` 消息重放为折叠块，不再重放整篇 markdown）；`setToolsExpanded` 同步重置并重绘 skill 块（pi 遍历所有 expandable chat 子节点）；鼠标点击 `skillAt` 切换（与 toolAt/thinkingShutAt 同派发链）。验证：test_ui 236（新增 2：折叠单行 + 点击展开 + Ctrl+O 联动；args 独立 user 块）；pty E2E 8/8（折叠行/正文不刷屏/args 独立/请求体含完整 `<skill>` 块）+ `-c` 回放 E2E 3/3
 ### Phase H — 资源系统（~1.5k 行）
 - [x] H1 Skills：`skills.zig` 发现/解析/校验/去重 + 系统提示广告 + `/skill:name` + `/skill:<tab>` + 6 单测 + E2E（`15ade5a`）
 - [x] H2 Prompt templates：Phase D 完成（发现/$1/$@/默认值/未识别 slash 回退）

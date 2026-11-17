@@ -1032,3 +1032,92 @@ test "editor visualToLogical maps every visual row of wrapped lines" {
     try std.testing.expectEqual(@as(usize, 1), p2.col);
     try std.testing.expectEqual(@as(usize, 3), e.visualLineCount(10));
 }
+
+// ---- Skill invocation block (pi SkillInvocationMessageComponent) ----
+
+test "skill: /skill:name renders a single collapsed line, click expands the body" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+
+    const body = "Use the xlsx skill.\n\n- step one\n- step two";
+    t.addSkillInvocation("xlsx", "/tmp/skills/xlsx/SKILL.md", body, "");
+
+    // One collapsed block: a single line with the name + expand hint, on the
+    // custom message background — the body is NOT in the transcript.
+    try std.testing.expectEqual(@as(usize, 1), t.scrollback.items.len);
+    const collapsed = t.scrollback.items[0];
+    try std.testing.expect(std.mem.indexOf(u8, collapsed, "xlsx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collapsed, "ctrl+o") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collapsed, "\n") == null); // single line
+    try std.testing.expect(std.mem.indexOf(u8, collapsed, "step one") == null);
+
+    // Click toggle: the block expands in place (same slot, body visible).
+    try std.testing.expectEqual(@as(usize, 1), t.skill_invocations.items.len);
+    t.skill_invocations.items[0].expanded = true;
+    t.renderSkillBlockAt(0);
+    try std.testing.expectEqual(@as(usize, 1), t.scrollback.items.len);
+    const expanded = t.scrollback.items[0];
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "[skill]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "step one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "step two") != null);
+
+    // Toggle back collapses again.
+    t.skill_invocations.items[0].expanded = false;
+    t.renderSkillBlockAt(0);
+    try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "step one") == null);
+
+    // Ctrl+O (setToolsExpanded) expands skill blocks too (pi setToolsExpanded
+    // walks every expandable chat child), and the next toggle collapses them.
+    t.setToolsExpanded(true);
+    try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "step one") != null);
+    t.setToolsExpanded(false);
+    try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "step one") == null);
+}
+
+test "skill: trailing args render as a separate user message below the block" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+
+    // pi _expandSkillCommand output: <skill> block + blank line + args.
+    const expanded =
+        "<skill name=\"xlsx\" location=\"/tmp/skills/xlsx/SKILL.md\">\n" ++
+        "References are relative to /tmp/skills/xlsx.\n\n" ++
+        "Body text here.\n" ++
+        "</skill>\n\n" ++
+        "make me a report";
+    t.addSubmittedMessage(expanded);
+
+    // Two blocks: the collapsed skill line, then the args as a user message.
+    try std.testing.expectEqual(@as(usize, 2), t.scrollback.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "xlsx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "Body text here.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[1], "make me a report") != null);
+}

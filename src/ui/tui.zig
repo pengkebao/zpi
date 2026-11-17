@@ -224,12 +224,41 @@ pub const TUI = struct {
         compaction: ss.CompactionInfo,
         /// tool_calls index (the block is rebuilt from the entry).
         tool: usize,
+        /// skill_invocations index (the block is rebuilt from the entry).
+        skill: usize,
 
         fn deinit(self: BlockSrc, alloc: std.mem.Allocator) void {
             switch (self) {
                 .assistant, .user, .thinking => |s| alloc.free(s),
                 else => {},
             }
+        }
+    };
+
+    /// One `/skill:name` invocation (pi SkillInvocationMessageComponent):
+    /// the SKILL.md body is sent to the model in full, but the transcript
+    /// shows a single collapsed `[skill] name` line — clicking expands it.
+    /// Strings are owned by the session allocator (like ToolEntry).
+    const SkillEntry = struct {
+        name: []const u8,
+        location: []const u8,
+        content: []const u8,
+        /// Per-block expansion override (clicking the block toggles it);
+        /// null follows the global tools_expanded (Ctrl+O) — pi's skill
+        /// blocks are expandable children toggled by app.tools.expand.
+        expanded: ?bool = null,
+        /// Index into `scrollback` of this invocation's block; null until
+        /// rendered.
+        block_idx: ?usize = null,
+
+        fn effectiveExpanded(self: *const SkillEntry, global: bool) bool {
+            return self.expanded orelse global;
+        }
+
+        fn deinit(self: *SkillEntry, alloc: std.mem.Allocator) void {
+            alloc.free(self.name);
+            alloc.free(self.location);
+            alloc.free(self.content);
         }
     };
 
@@ -481,6 +510,8 @@ pub const TUI = struct {
     thinking_hidden: bool = false,
     /// Tool calls of the transcript, re-renderable (see ToolEntry).
     tool_calls: std.ArrayListUnmanaged(ToolEntry) = .empty,
+    /// `/skill:name` invocations of the transcript (see SkillEntry).
+    skill_invocations: std.ArrayListUnmanaged(SkillEntry) = .empty,
     /// Scrollback indices of thinking blocks, for Ctrl+T.
     thinking_blocks: std.ArrayListUnmanaged(usize) = .empty,
     /// Scrollback indices of user messages (prompt jumps, Ctrl+Up/Down).
@@ -3364,6 +3395,8 @@ pub const TUI = struct {
         if (self.flash_msg) |m| self.alloc.free(m);
         for (self.tool_calls.items) |*e| e.deinit(self.session.alloc);
         self.tool_calls.deinit(self.session.alloc);
+        for (self.skill_invocations.items) |*e| e.deinit(self.session.alloc);
+        self.skill_invocations.deinit(self.session.alloc);
         self.thinking_blocks.deinit(self.alloc);
         if (self.at_suppress) |sup| self.alloc.free(sup);
         self.user_blocks.deinit(self.alloc);
@@ -4534,6 +4567,13 @@ pub const TUI = struct {
                 self.renderToolBlockAt(ti);
                 return true;
             }
+            if (self.skillAt(col, row)) |si| {
+                const e = &self.skill_invocations.items[si];
+                e.expanded = !e.effectiveExpanded(self.tools_expanded);
+                self.render_mutex.unlock(self.io);
+                self.renderSkillBlockAt(si);
+                return true;
+            }
             if (self.thinkingShutAt(col, row)) {
                 self.render_mutex.unlock(self.io);
                 self.redrawCached();
@@ -5590,6 +5630,145 @@ pub const TUI = struct {
         self.appendBgRow(block, "", USER_BG);
     }
 
+    /// A `/skill:name [args]` submission (pi SkillInvocationMessageComponent):
+    /// the full SKILL.md body goes to the model as a `<skill>` block, but the
+    /// transcript shows a single collapsed `[skill] name` line on the custom
+    /// message background — clicking it expands the body, and any trailing
+    /// args render as a normal user message below (pi renders the user
+    /// message separately from the skill block).
+    pub fn addSkillInvocation(self: *TUI, name: []const u8, location: []const u8, content: []const u8, args: []const u8) void {
+        const s_alloc = self.session.alloc;
+        const entry = SkillEntry{
+            .name = s_alloc.dupe(u8, name) catch return,
+            .location = s_alloc.dupe(u8, location) catch {
+                s_alloc.free(name);
+                return;
+            },
+            .content = s_alloc.dupe(u8, content) catch {
+                s_alloc.free(name);
+                s_alloc.free(location);
+                return;
+            },
+        };
+        self.skill_invocations.append(s_alloc, entry) catch {
+            s_alloc.free(name);
+            s_alloc.free(location);
+            s_alloc.free(content);
+            return;
+        };
+        self.renderSkillBlockAt(self.skill_invocations.items.len - 1);
+        // pi: the args (the user's actual request) are a separate user
+        // message, not part of the skill block.
+        if (args.len > 0) self.addUserMessage(args);
+    }
+
+    /// The skill block's rows: collapsed = one dim line, expanded = label +
+    /// bold name + the body markdown, all on the custom message background.
+    fn renderSkillBlock(self: *TUI, e: *const SkillEntry, block: *std.ArrayListUnmanaged(u8)) void {
+        if (e.effectiveExpanded(self.tools_expanded)) {
+            const label = std.fmt.allocPrint(self.alloc, "{s}\x1b[1m[skill]\x1b[22m", .{CUSTOM_MSG_BG}) catch return;
+            defer self.alloc.free(label);
+            self.appendBgRow(block, label, CUSTOM_MSG_BG);
+            const header = std.fmt.allocPrint(self.alloc, "**{s}**", .{e.name}) catch return;
+            defer self.alloc.free(header);
+            const joined = std.mem.concat(self.alloc, u8, &.{ header, "\n\n", e.content }) catch return;
+            defer self.alloc.free(joined);
+            const inner = if (self.width > 2) self.width - 2 else 1;
+            const rendered = markdown.renderWith(self.alloc, joined, inner, .{ .base_style = FG_MUTED }) catch return;
+            defer markdown.freeLines(self.alloc, rendered);
+            for (rendered) |row| self.appendBgRow(block, row, CUSTOM_MSG_BG);
+        } else {
+            const line = std.fmt.allocPrint(self.alloc,
+                "{s}\x1b[1m[skill]\x1b[22m {s}{s} (\x1b[2mctrl+o\x1b[0m to expand)",
+                .{ CUSTOM_MSG_BG, FG_MUTED, e.name }) catch return;
+            defer self.alloc.free(line);
+            self.appendBgRow(block, line, CUSTOM_MSG_BG);
+        }
+    }
+
+    /// (Re-)render skill invocation `i` into its scrollback slot (first
+    /// render appends, a click toggle repaints in place). Caller must NOT
+    /// hold render_mutex.
+    pub fn renderSkillBlockAt(self: *TUI, i: usize) void {
+        if (i >= self.skill_invocations.items.len) return;
+        const e = &self.skill_invocations.items[i];
+        var block: std.ArrayListUnmanaged(u8) = .empty;
+        defer block.deinit(self.alloc);
+        self.renderSkillBlock(e, &block);
+        if (block.items.len == 0) return;
+        const src: BlockSrc = .{ .skill = i };
+        self.render_mutex.lock(self.io) catch {
+            self.alloc.free(block.toOwnedSlice(self.alloc) catch unreachable);
+            return;
+        };
+        defer self.render_mutex.unlock(self.io);
+        const joined = block.toOwnedSlice(self.alloc) catch {
+            return;
+        };
+        if (e.block_idx) |idx| {
+            const old = self.scrollback.items[idx];
+            self.scrollback.items[idx] = joined;
+            self.alloc.free(old);
+            self.scrollback_src.items[idx] = src;
+        } else {
+            self.scrollback.append(joined) catch {
+                self.alloc.free(joined);
+                return;
+            };
+            self.scrollback_src.append(src) catch {
+                _ = self.scrollback.pop();
+                self.alloc.free(joined);
+                return;
+            };
+            e.block_idx = self.scrollback.items.len - 1;
+        }
+        self.transcript_gen += 1;
+    }
+
+    /// The skill invocation a mouse click points at, if any. Caller holds
+    /// render_mutex. Returns the entry index.
+    fn skillAt(self: *TUI, col: usize, row: usize) ?usize {
+        const blk = self.blockAt(col, row) orelse return null;
+        if (blk >= self.scrollback_src.items.len) return null;
+        return switch (self.scrollback_src.items[blk]) {
+            .skill => |si| si,
+            else => null,
+        };
+    }
+
+    /// Parse a submitted user message for a leading `<skill ...>` block
+    /// (pi parseSkillBlock; session replay renders it as a collapsed skill
+    /// block instead of a wall of markdown). Returns null when the message
+    /// carries no skill block.
+    fn parseSkillBlock(text: []const u8) ?struct { name: []const u8, location: []const u8, content: []const u8, user_message: []const u8 } {
+        const open = "<skill name=\"";
+        if (!std.mem.startsWith(u8, text, open)) return null;
+        const rest = text[open.len..];
+        const name_end = std.mem.indexOfScalarPos(u8, rest, 0, '"') orelse return null;
+        const name = rest[0..name_end];
+        const after_name = rest[name_end + 1 ..];
+        const loc_open = " location=\"";
+        if (!std.mem.startsWith(u8, after_name, loc_open)) return null;
+        const loc_rest = after_name[loc_open.len..];
+        const loc_end = std.mem.indexOfScalarPos(u8, loc_rest, 0, '"') orelse return null;
+        const location = loc_rest[0..loc_end];
+        const after_loc = loc_rest[loc_end + 1 ..];
+        // The block opens with a newline after the closing quote.
+        if (!std.mem.startsWith(u8, after_loc, ">\n")) return null;
+        const close = "\n</skill>";
+        const close_at = std.mem.indexOfPos(u8, after_loc, 0, close) orelse return null;
+        const content = after_loc[2..close_at];
+        const tail = after_loc[close_at + close.len ..];
+        // Optional user message after a blank line (pi: `\n\n` separator).
+        var user_message: []const u8 = "";
+        if (std.mem.startsWith(u8, tail, "\n\n")) {
+            user_message = std.mem.trim(u8, tail[2..], " \t\n");
+        } else if (tail.len != 0) {
+            return null; // trailing junk: not a well-formed skill block
+        }
+        return .{ .name = name, .location = location, .content = content, .user_message = user_message };
+    }
+
     /// Record the block as a user message when it made it into the
     /// scrollback (for the Ctrl+Up/Down prompt jumps).
     fn rememberUserBlock(self: *TUI, n_before: usize) void {
@@ -6126,7 +6305,9 @@ pub const TUI = struct {
                         },
                         else => {},
                     };
-                    if (buf.items.len > 0) self.addUserMessage(buf.items);
+                    // A persisted `<skill>` block replays as a collapsed
+                    // skill block (pi parseSkillBlock in renderSessionItems).
+                    if (buf.items.len > 0) self.addSubmittedMessage(buf.items);
                 },
                 .assistant => {
                     for (m.blocks.items) |b| switch (b) {
@@ -6764,8 +6945,20 @@ pub const TUI = struct {
 
     /// Send text as a user prompt with the full submit ceremony (display,
     /// scroll-to-end, spinner, watch). Frees the caller-owned text.
+    /// Render a submitted message into the transcript: a leading `<skill>`
+    /// block becomes a collapsed skill block (args as a separate user
+    /// message), anything else a plain user message (pi addMessageToChat's
+    /// parseSkillBlock branch).
+    pub fn addSubmittedMessage(self: *TUI, text: []const u8) void {
+        if (parseSkillBlock(text)) |sb| {
+            self.addSkillInvocation(sb.name, sb.location, sb.content, sb.user_message);
+        } else {
+            self.addUserMessage(text);
+        }
+    }
+
     fn submitText(self: *TUI, text: []const u8) void {
-        self.addUserMessage(text);
+        self.addSubmittedMessage(text);
         self.loader.start();
         self.render_mutex.lock(self.io) catch {};
         self.sv.scrollToEnd(ss.nowMs(self.io));
@@ -6874,11 +7067,14 @@ pub const TUI = struct {
     pub fn setToolsExpanded(self: *TUI, expanded: bool) void {
         self.tools_expanded = expanded;
         // The global toggle resets per-block overrides (Ctrl+O wins until
-        // new clicks).
+        // new clicks) — for tool and skill blocks alike (pi setToolsExpanded
+        // walks every expandable chat child).
         self.render_mutex.lock(self.io) catch {};
         for (self.tool_calls.items) |*e| e.expanded = null;
+        for (self.skill_invocations.items) |*e| e.expanded = null;
         self.render_mutex.unlock(self.io);
         for (0..self.tool_calls.items.len) |i| self.renderToolBlockAt(i);
+        for (0..self.skill_invocations.items.len) |i| self.renderSkillBlockAt(i);
         // pi: the same flag flips the BuiltInHeader between its compact and
         // expanded content.
         self.refreshWelcomeHeader();
@@ -6954,6 +7150,11 @@ pub const TUI = struct {
                     self.renderCompactionBlock(info, &block);
                     break :blk block.toOwnedSlice(self.alloc) catch null;
                 },
+                .skill => |si| blk: {
+                    if (si >= self.skill_invocations.items.len) break :blk null;
+                    self.renderSkillBlock(&self.skill_invocations.items[si], &block);
+                    break :blk if (block.items.len == 0) null else block.toOwnedSlice(self.alloc) catch null;
+                },
             };
             const next = rendered orelse continue;
             self.scrollback.items[idx] = next;
@@ -7025,6 +7226,8 @@ pub const TUI = struct {
         self.scrollback_src.clearRetainingCapacity();
         for (self.tool_calls.items) |*e| e.deinit(self.session.alloc);
         self.tool_calls.clearRetainingCapacity();
+        for (self.skill_invocations.items) |*e| e.deinit(self.session.alloc);
+        self.skill_invocations.clearRetainingCapacity();
         self.thinking_blocks.clearRetainingCapacity();
         self.user_blocks.clearRetainingCapacity();
         self.thinking_shut.clearRetainingCapacity();
@@ -7208,7 +7411,7 @@ pub const TUI = struct {
         // the prompt that follows (the worker kept them off).
         self.session.record_turn_events = true;
         if (first) |text| {
-            self.addUserMessage(text);
+            self.addSubmittedMessage(text);
             self.render_mutex.lock(self.io) catch {};
             self.sv.scrollToEnd(ss.nowMs(self.io));
             self.render_mutex.unlock(self.io);
@@ -8902,7 +9105,7 @@ pub const TUI = struct {
                         self.alloc.free(input);
                         break :blk expanded_input;
                     } else expanded_input;
-                    self.addUserMessage(text_to_send);
+                    self.addSubmittedMessage(text_to_send);
                     self.loader.start();
                     // Jump back to the end and re-follow: the reply must be
                     // visible even if the user had scrolled up (or a search

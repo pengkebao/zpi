@@ -2,7 +2,7 @@
 
 > 一个用纯 Zig 写的终端编程智能体 —— [pi](https://pi.dev) 1.5.0 的行为级重实现
 
-![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/tests-600%2B-brightgreen))
+![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/tests-602%2B-brightgreen)
 
 **零第三方依赖 · 单二进制 · 与 pi 配置/会话双向兼容**
 
@@ -27,7 +27,7 @@ zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP
 - **运行中可干预**（pi 同款 steering / follow-up）：流式期间 Enter 排入 steering（下个 LLM 请求前注入上下文）、alt+Enter 排入 follow-up（本回合结束后跑新回合），编辑器上方实时显示 `Steering: …` / `Follow-up: …` pending 行；ESC 中断时全部排队消息恢复回编辑器（不丢失）；`steeringMode` / `followUpMode` 设置（all / one-at-a-time）从 settings.json 读取
 - **流式韧性**：SSE 断流（无 `[DONE]`/终止事件）判定为传输错误自动重试，不再把截断响应当作成功；空响应显式报错；工具轮次上限（默认 200）触顶时提示而非静默停止
 - MCP 客户端：stdio + HTTP 传输、OAuth 登录、工具注册与热重载、`zpi mcp add/remove/list` 全套管理
-- 技能（Skills）与提示模板（Prompts）：pi 同款发现机制与 `SKILL.md` 格式
+- 技能（Skills）与提示模板（Prompts）：pi 同款发现机制与 `SKILL.md` 格式；`/skill:name` 调用时**完整技能体发给模型，但转写只占一行** `[skill] name (ctrl+o to expand)`——点击或 Ctrl+O 才展开正文（对齐 pi `SkillInvocationMessageComponent`，不再把整个 SKILL.md 刷屏）
 - 事件总线 + hooks.json 钩子（session_start / pre_tool_call / post_tool_call / compaction）
 
 **TUI**
@@ -139,7 +139,7 @@ src/
 ## 测试
 
 ```bash
-zig test test_ui.zig              # 234 个 UI/逻辑测试
+zig test test_ui.zig              # 236 个 UI/逻辑测试
 zig test leak_g2.zig              # 184 个泄漏回归测试（SafeAllocator 全路径）
 zig test src/ui/keys.zig          # 按键/鼠标序列解析（18）
 zig test test_openai.zig          # SSE 协议解析（10）
