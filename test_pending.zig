@@ -69,3 +69,88 @@ test "restoreQueued joins steering+follow-up into the editor" {
     // empty queues → null
     try std.testing.expect(t.session.restoreQueued() == null);
 }
+
+// ---- P1/P2 recovery helpers (empty-retry backoff, isRecoverableLength,
+//      all-thinking detection) -------------------------------------------
+
+fn makeSession(alloc: std.mem.Allocator, io: std.Io, model: *config.Config.Model) !agent.Session {
+    const provider = try aiprovider.buildFromModel(alloc, io, model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    return agent.Session.init(alloc, io, model, &registry, provider, "test");
+}
+
+test "emptyRetryDelayMs is exponential 1s,2s,4s" {
+    try std.testing.expectEqual(@as(i64, 1000), agent.Session.emptyRetryDelayMs(1));
+    try std.testing.expectEqual(@as(i64, 2000), agent.Session.emptyRetryDelayMs(2));
+    try std.testing.expectEqual(@as(i64, 4000), agent.Session.emptyRetryDelayMs(3));
+    // attempt 0 is clamped to 1 (never negative exponent)
+    try std.testing.expectEqual(@as(i64, 1000), agent.Session.emptyRetryDelayMs(0));
+}
+
+test "blocksAreAllThinking detects thinking-only rounds" {
+    const msg = @import("src/core/message.zig");
+    const alloc = std.heap.page_allocator;
+    const only = [_]msg.ContentBlock{.{ .thinking = "hmm" }};
+    try std.testing.expect(msg.blocksAreAllThinking(&only));
+
+    const mixed = [_]msg.ContentBlock{
+        .{ .thinking = "hmm" },
+        .{ .text = "answer" },
+    };
+    try std.testing.expect(!msg.blocksAreAllThinking(&mixed));
+
+    const empty = [_]msg.ContentBlock{};
+    try std.testing.expect(!msg.blocksAreAllThinking(&empty));
+
+    const tid = try alloc.dupe(u8, "t1");
+    defer alloc.free(tid);
+    const tname = try alloc.dupe(u8, "bash");
+    defer alloc.free(tname);
+    const targs = try alloc.dupe(u8, "{}");
+    defer alloc.free(targs);
+    const tool = [_]msg.ContentBlock{.{ .tool_call = .{ .id = tid, .name = tname, .arguments = targs } }};
+    try std.testing.expect(!msg.blocksAreAllThinking(&tool));
+}
+
+test "isRecoverableLength matches pi overflow heuristic" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+        .max_tokens = 1000,
+    };
+    var session = try makeSession(alloc, io, &model);
+    defer session.deinit();
+
+    const ai = @import("src/ai/openai.zig");
+
+    // finish != length → not recoverable
+    session.stream_finish = .stop;
+    session.stream_usage = .{ .output = 10 };
+    try std.testing.expect(!session.isRecoverableLength());
+
+    // finish == length, output < max_tokens → recoverable
+    session.stream_finish = .length;
+    session.stream_usage = .{ .output = 10 };
+    try std.testing.expect(session.isRecoverableLength());
+
+    // recoverable only once (flag set)
+    session.length_recovered = true;
+    try std.testing.expect(!session.isRecoverableLength());
+
+    // output reached max_tokens → NOT recoverable (model used its full budget)
+    session.length_recovered = false;
+    session.stream_usage = .{ .output = 1000 };
+    try std.testing.expect(!session.isRecoverableLength());
+
+    // no usage → treated as 0 output → recoverable under length
+    session.stream_usage = null;
+    try std.testing.expect(session.isRecoverableLength());
+    _ = ai.FinishReason.stop; // keep import referenced
+}

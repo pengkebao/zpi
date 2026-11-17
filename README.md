@@ -25,7 +25,12 @@ zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP
 - 上下文压缩：手动 `/compact` + 阈值自动压缩，压缩摘要块入转写
 - 成本 / 缓存命中率 / token 统计（footer 实时显示）
 - **运行中可干预**（pi 同款 steering / follow-up）：流式期间 Enter 排入 steering（下个 LLM 请求前注入上下文）、alt+Enter 排入 follow-up（本回合结束后跑新回合），编辑器上方实时显示 `Steering: …` / `Follow-up: …` pending 行；ESC 中断时全部排队消息恢复回编辑器（不丢失）；`steeringMode` / `followUpMode` 设置（all / one-at-a-time）从 settings.json 读取
-- **流式韧性**：SSE 断流（无 `[DONE]`/终止事件）判定为传输错误自动重试，不再把截断响应当作成功；空响应显式报错；工具轮次上限（默认 200）触顶时提示而非静默停止
+- **流式韧性**（对齐 pi 1.5.0 的 `http-dispatcher` / `retry` / `overflow` 三层防护）：
+  - **空闲看门狗**：SSE 读是阻塞 `read(2)`，看门狗线程轮询 abort 标志 + 空闲计时（默认 300s，`$ZPI_HTTP_IDLE_TIMEOUT_MS` 可调，`0` 关闭），超时或对 ESC 时 `shutdown(fd)` 解除阻塞——网关静默挂起不再卡死，ESC 即时响应
+  - **空响应自动重试**：网关偶发返回 200 但空/截断 SSE 体时，指数退避重试（默认 3 次，1s/2s/4s），不再静默 `EmptyResponse` 死回合
+  - **长度截断恢复**（pi `isRecoverableLength`）：`finish_reason=length` 且 `output < max_tokens` 时判定上下文压力/网关截断，一次性压缩并重试
+  - **纯思考回合轻推**：某轮只产出 thinking（无文本无工具调用）时注入一次 continue 提示，防止模型把输出预算耗在推理上后静默停滞
+  - 工具轮次上限（默认 200）触顶时提示而非静默停止
 - MCP 客户端：stdio + HTTP 传输、OAuth 登录、工具注册与热重载、`zpi mcp add/remove/list` 全套管理
 - 技能（Skills）与提示模板（Prompts）：pi 同款发现机制与 `SKILL.md` 格式；`/skill:name` 调用时**完整技能体发给模型，但转写只占一行** `[skill] name (ctrl+o to expand)`——点击或 Ctrl+O 才展开正文（对齐 pi `SkillInvocationMessageComponent`，不再把整个 SKILL.md 刷屏）
 - 事件总线 + hooks.json 钩子（session_start / pre_tool_call / post_tool_call / compaction）

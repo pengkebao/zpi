@@ -4,6 +4,7 @@
 //! streamChat (same shape as openai.zig).
 
 const std = @import("std");
+const stream_guard = @import("stream_guard.zig");
 
 pub const SseOutcome = enum { ok, transport_error, retryable_status, fatal_status };
 
@@ -63,13 +64,23 @@ pub fn postSse(
 
     var rbuf: [16384]u8 = undefined;
     var reader = response.reader(&rbuf);
+    // Watchdog (openai.zig): the read below blocks the process, so abort and
+    // the idle timeout need a second thread to shut the socket down.
+    const Guard = stream_guard.Guard(@TypeOf(session));
+    var guard: Guard = .{};
+    var guard_active = false;
+    if (request.connection) |conn| {
+        guard.start(session, conn.stream_reader.stream.socket.handle, client.io, stream_guard.idle_timeout_ms);
+        guard_active = guard.thread != null;
+    }
+    errdefer if (guard_active) guard.stop();
     // A clean end is [DONE] / a terminal SSE event; a connection that just
     // drops (EndOfStream/ReadFailed without either) is a TRANSPORT error —
     // returning .ok here made truncated responses look like success and the
     // agent turn silently died mid-task.
     var done_cleanly = false;
     while (!done_cleanly) {
-        if (session.isAborted()) return .ok;
+        if (session.isAborted()) break;
         const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
             error.EndOfStream, error.ReadFailed => break,
             error.StreamTooLong => {
@@ -77,6 +88,7 @@ pub fn postSse(
                 continue;
             },
         };
+        if (guard_active) guard.noteData();
         const trimmed = std.mem.trim(u8, line, " \r\n");
         if (trimmed.len == 0) continue;
         if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
@@ -87,6 +99,8 @@ pub fn postSse(
         }
         ctx.parseSseData(data, session) catch continue;
     }
+    if (guard_active) guard.stop();
+    if (session.isAborted()) return .ok;
     if (!done_cleanly) {
         // Protocols without [DONE] (anthropic/google/responses) signal the
         // clean end via a terminal event the parser records on the provider.

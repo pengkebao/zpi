@@ -136,6 +136,21 @@ pub const Session = struct {
     stream_thinking: *std.array_list.Managed(u8) = undefined,
     stream_tools: *std.array_list.Managed(msg.ToolCall) = undefined,
     stream_usage: ?msg.Usage = null,
+    /// Finish reason of the round currently streaming (null = none yet).
+    stream_finish: ?ai.FinishReason = null,
+    /// pi retry budget: auto-retry a round that failed with a transient
+    /// provider error (EmptyResponse / stream drop) — exponential backoff.
+    retry_attempt: usize = 0,
+    /// Max auto-retries per round (pi settings.retry.maxRetries default 3).
+    retry_max: usize = 3,
+    /// pi isRecoverableLength: one compact-and-retry when a round is cut by
+    /// `finish_reason=length` below the model's output limit (context
+    /// pressure / provider-side truncation).
+    length_recovered: bool = false,
+    /// A pure-thinking round (no text, no tool call) already triggered one
+    /// automatic "continue" nudge (P2): avoids a silent stall where the model
+    /// burns its output budget on reasoning and ends without acting.
+    thinking_nudged: bool = false,
 
     /// Stable storage for the system message blocks (a pointer to a temporary
     /// would dangle once buildWireMessages returns).
@@ -660,6 +675,25 @@ pub const Session = struct {
         return info;
     }
 
+    /// pi isRecoverableLength: the round was cut by finish_reason=length while
+    /// the model's output budget (max_tokens) still had room — the truncation
+    /// came from context pressure or a provider-side cap, not from the model
+    /// choosing to stop. True exactly once per turn (the `length_recovered`
+    /// flag is set by the caller before re-entering the loop).
+    pub fn isRecoverableLength(self: *Session) bool {
+        if (self.stream_finish != .length) return false;
+        if (self.length_recovered) return false;
+        const out_tokens = self.stream_usage orelse msg.Usage{};
+        return out_tokens.output < self.model.max_tokens;
+    }
+
+    /// Backoff for the Nth empty-response retry (1-indexed): 1s, 2s, 4s.
+    /// Exponential, matching pi's retry schedule. Factored out so it is
+    /// unit-testable without driving a full runPrompt.
+    pub fn emptyRetryDelayMs(attempt: usize) i64 {
+        return 1000 * @as(i64, @intCast(std.math.pow(u64, 2, @max(attempt, 1) - 1)));
+    }
+
     /// Auto-compact at a turn boundary if the context exceeds the budget.
     fn maybeAutoCompact(self: *Session) !void {
         const ctx_tokens = compact.estimateContextTokens(self.context.messages.items);
@@ -702,6 +736,13 @@ pub const Session = struct {
         var follow_up = true;
         while (follow_up) {
             follow_up = false;
+            // Per-turn recovery budgets (reset on every new turn, not every
+            // tool round: a stall nudge is at most one per user turn, and the
+            // empty-retry budget must not be carried over from a turn that
+            // ended in a provider failure).
+            self.thinking_nudged = false;
+            self.length_recovered = false;
+            self.retry_attempt = 0;
 
         // Add user message (context.append deep-copies; we own user_msg)
         var user_msg = msg.Message.init(self.alloc);
@@ -747,6 +788,7 @@ pub const Session = struct {
             self.stream_thinking = &thinking_buf;
             self.stream_tools = &tool_calls;
             self.stream_usage = null;
+            self.stream_finish = null;
 
             self.jsonEvent("{{\"type\":\"message_start\",\"message\":{{\"role\":\"assistant\"}}}}", .{});
 
@@ -829,9 +871,39 @@ pub const Session = struct {
             const aborted = self.isAborted();
             if (assistant_msg.blocks.items.len == 0) {
                 // The provider "succeeded" but produced nothing (truncated
-                // stream, gateway hiccup). A silent break here made the turn
-                // die without a trace; fail loudly instead.
+                // stream, gateway hiccup). pi auto-retries transient provider
+                // failures (settings.retry, default 3, exponential backoff);
+                // the failed round left no assistant message in the context,
+                // so the same round is simply rebuilt and re-requested.
+                if (self.retry_attempt < self.retry_max) {
+                    self.retry_attempt += 1;
+                    const delay_ms = Session.emptyRetryDelayMs(self.retry_attempt);
+                    var rb: [64]u8 = undefined;
+                    const rmsg = std.fmt.bufPrint(&rb, "\n[empty response — retrying ({d}/{d})]\n", .{ self.retry_attempt, self.retry_max }) catch "\n[empty response — retrying]\n";
+                    self.emit(.tool_info, rmsg);
+                    var slept: i64 = 0;
+                    while (slept < delay_ms) {
+                        if (self.isAborted()) break;
+                        const step: i64 = @min(200, delay_ms - slept);
+                        std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(step), .real) catch break;
+                        slept += step;
+                    }
+                    if (self.isAborted()) return;
+                    continue;
+                }
                 return error.EmptyResponse;
+            }
+            // A real response arrived: the transient-failure budget resets.
+            self.retry_attempt = 0;
+            // pi isRecoverableLength: the round was cut by
+            // finish_reason=length below the model's output limit — usually
+            // context pressure or provider-side truncation. One bounded
+            // compact-and-retry, like the overflow path above.
+            if (self.isRecoverableLength()) {
+                self.length_recovered = true;
+                self.emit(.tool_info, "\n[length-truncated response — compacting and retrying]\n");
+                _ = self.runCompactionReasoned(null, "length") catch {};
+                continue;
             }
             const sr: []const u8 = if (n_tool_calls_pending(&assistant_msg) > 0) "toolUse" else "stop";
             assistant_msg.stop_reason = msg.Message.allocStr(self.alloc, sr);
@@ -842,6 +914,22 @@ pub const Session = struct {
             const n_tool_calls: usize = n_tool_calls_pending(&assistant_msg);
 
             if (n_tool_calls == 0) {
+                // P2: a round that produced ONLY thinking (no text, no tool
+                // call) ends the turn silently — the model burned its output
+                // budget reasoning about the work instead of doing it. Nudge
+                // once per turn so the user sees a note and gets an answer.
+                if (msg.blocksAreAllThinking(assistant_msg.blocks.items) and !self.thinking_nudged) {
+                    self.thinking_nudged = true;
+                    self.emit(.tool_info, "\n[round produced reasoning only — continuing]\n");
+                    var nudge = msg.Message.init(self.alloc);
+                    defer nudge.deinit();
+                    nudge.role = .user;
+                    const nudge_text = self.alloc.dupe(u8, "Continue. Your previous response contained only reasoning — now perform the work (call the tools / write the files).") catch "Continue.";
+                    try nudge.blocks.append(.{ .text = nudge_text });
+                    try self.appendAndRecord(&nudge);
+                    self.alloc.free(nudge_text);
+                    continue;
+                }
                 // Turn complete. Queued follow-up messages start new turns
                 // (pi: the outer loop continues with followUpQueue.drain();
                 // mode "all" takes them all at once, "one-at-a-time" the
@@ -1308,7 +1396,7 @@ pub const Session = struct {
                 );
                 self.stream_usage = usage_val;
             },
-            .done => {},
+            .done => |reason| self.stream_finish = reason,
         }
     }
 };

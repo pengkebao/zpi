@@ -7257,7 +7257,17 @@ pub const TUI = struct {
             },
             .turn_event => t.drainTurnEvents(),
             // Tool activity is rendered from the structured turn events.
-            .tool_info => {},
+            .tool_info => {
+                // Recovery notices (empty-response retry, length-truncated
+                // compact-and-retry, thinking-only nudge): surface them as a
+                // transient flash so the user sees WHY the turn is pausing.
+                var s: []const u8 = text;
+                while (s.len > 0 and (s[0] == '\n' or s[0] == '\r')) s = s[1..];
+                while (s.len > 0 and (s[s.len - 1] == '\n' or s[s.len - 1] == '\r')) s = s[0 .. s.len - 1];
+                if (s.len == 0) return;
+                t.flash(s);
+                t.redrawCached();
+            },
         }
     }
 

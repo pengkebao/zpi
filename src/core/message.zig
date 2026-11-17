@@ -174,7 +174,7 @@ pub const Message = struct {
         if (self.model_id) |mid| self.blocks.allocator.free(mid);
     }
 
-    /// Dupe a string for storage in an owned field; on OOM returns the
+        /// Dupe a string for storage in an owned field; on OOM returns the
     /// original (caller may pass a literal, which then leaks — acceptable
     /// under OOM).
     pub fn allocStr(alloc: std.mem.Allocator, s: []const u8) []const u8 {
@@ -218,6 +218,16 @@ pub const Message = struct {
         return out;
     }
 };
+
+/// True when every block in the message is a thinking block (the model
+/// spent its round reasoning and produced no text or tool call).
+pub fn blocksAreAllThinking(blocks: []const ContentBlock) bool {
+    if (blocks.len == 0) return false;
+    for (blocks) |b| {
+        if (b != .thinking) return false;
+    }
+    return true;
+}
 
 /// Conversation: system prompt + history.
 pub const Context = struct {

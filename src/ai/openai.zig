@@ -5,6 +5,7 @@ const std = @import("std");
 const msg = @import("../core/message.zig");
 const config = @import("../core/config.zig");
 const json = @import("json.zig");
+const stream_guard = @import("stream_guard.zig");
 
 /// Debug: when set (main.zig reads $ZPI_DEBUG_BODY), every outgoing
 /// chat-completions body is written to this path for inspection
@@ -140,8 +141,11 @@ pub const OpenAiProvider = struct {
             attempt += 1;
             const had_output = self.hasStreamedOutput(session);
             const outcome = self.tryStream(uri, body.items, session);
-            if (outcome == .ok) return;
+            // Abort check BEFORE the .ok shortcut: the stream guard shuts the
+            // socket down on ESC, which makes tryStream return .ok on a
+            // truncated stream — that must surface as Aborted, not success.
             if (session.isAborted()) return error.Aborted;
+            if (outcome == .ok) return;
             if (attempt >= max_retries) return error.HttpError;
             const retryable = outcome == .transport_error or
                 (outcome == .retryable_status and !had_output);
@@ -149,7 +153,6 @@ pub const OpenAiProvider = struct {
             // Exponential backoff: 250ms, 500ms (abort-aware)
             const delay_ms: i64 = 250 * @as(i64, @intCast(std.math.pow(u64, 2, attempt - 1)));
             std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(delay_ms), .real) catch {};
-            std.debug.print("[retry {d}/{d}]\n", .{ attempt, max_retries - 1 });
         }
     }
 
@@ -219,14 +222,29 @@ pub const OpenAiProvider = struct {
         // empty slice forever (busy loop).
         var rbuf: [16384]u8 = undefined;
         var reader = response.reader(&rbuf);
+        // Watchdog: the read below blocks the whole process, so neither the
+        // abort flag nor any idle timeout could fire inside it (pi solves the
+        // same stall with an undici bodyTimeout). The guard thread shuts the
+        // socket down on abort or idle expiry to unblock the read.
+        const Guard = stream_guard.Guard(@TypeOf(session));
+        var guard: Guard = .{};
+        var guard_active = false;
+        if (request.connection) |conn| {
+            guard.start(session, conn.stream_reader.stream.socket.handle, self.io, stream_guard.idle_timeout_ms);
+            guard_active = guard.thread != null;
+        }
+        errdefer if (guard_active) guard.stop();
         var done = false;
         while (!done) {
-            if (session.isAborted()) return .ok;
+            if (session.isAborted()) break;
             const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
-                // Socket died mid-stream: a TRANSPORT error, not success.
-                // Returning .ok here made truncated responses look complete
-                // and the agent turn silently died mid-task.
+                // Socket died mid-stream. ESC trips the watchdog's shutdown
+                // (checked by the caller as Aborted); anything else is a
+                // TRANSPORT error, not success — returning .ok here made
+                // truncated responses look complete and the agent turn
+                // silently died mid-task.
                 error.EndOfStream, error.ReadFailed => {
+                    if (session.isAborted()) return .ok;
                     std.debug.print("error: SSE stream ended without [DONE]\n", .{});
                     return .transport_error;
                 },
@@ -238,6 +256,7 @@ pub const OpenAiProvider = struct {
                     continue;
                 },
             };
+            if (guard_active) guard.noteData(); // data arrived: reset idle window
             const trimmed = std.mem.trim(u8, line, " \r\n");
             if (trimmed.len == 0) continue;
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
@@ -248,6 +267,10 @@ pub const OpenAiProvider = struct {
             }
             self.parseChunk(data, session) catch continue;
         }
+        if (guard_active) guard.stop();
+        // ESC (the guard unblocked the read) is checked by the caller before
+        // treating .ok as success, so a truncated stream is never mistaken
+        // for a clean end.
         return .ok;
     }
 

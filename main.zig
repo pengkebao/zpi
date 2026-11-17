@@ -7,6 +7,7 @@ const config = @import("src/core/config.zig");
 const agent = @import("src/core/agent.zig");
 const ai = @import("src/ai/openai.zig");
 const aiprovider = @import("src/ai/provider.zig");
+const stream_guard = @import("src/ai/stream_guard.zig");
 const tools = @import("src/tools/registry.zig");
 const trust = @import("src/core/trust.zig");
 const events = @import("src/core/events.zig");
@@ -693,6 +694,13 @@ pub fn main(init: std.process.Init) !void {
         std.process.Environ.getPosix(init.minimal.environ, "USERPROFILE");
     if (std.process.Environ.getPosix(init.minimal.environ, "ZPI_DEBUG_BODY")) |p| {
         ai.debug_body_path = p;
+    }
+    // SSE idle timeout (pi httpIdleTimeoutMs, default 300s): no bytes for this
+    // long fails the stream and the provider retry loop retries. "0" disables.
+    if (std.process.Environ.getPosix(init.minimal.environ, "ZPI_HTTP_IDLE_TIMEOUT_MS")) |raw| {
+        if (std.fmt.parseInt(i64, raw, 10)) |ms| {
+            if (ms >= 0) stream_guard.idle_timeout_ms = ms;
+        } else |_| {}
     }
     defer cfg.deinit(alloc);
 
