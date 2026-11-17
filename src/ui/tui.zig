@@ -6040,6 +6040,26 @@ pub const TUI = struct {
         self.renderToolBlockAt(self.tool_calls.items.len - 1);
     }
 
+    /// A streaming tool call grew its arguments, or a finished call was
+    /// announced (pi updateToolCall while the model writes): update the
+    /// pending entry with the same id in place — the preview grows without
+    /// a new card. Falls back to addPendingTool when no entry matches yet.
+    pub fn updatePendingToolArgs(self: *TUI, ev: agent.TurnEvent.ToolStart) void {
+        for (self.tool_calls.items, 0..) |*e, i| {
+            if (!e.pending or !std.mem.eql(u8, e.id, ev.id)) continue;
+            // Empty id (arguments arrived before the id): adopt by position —
+            // the streaming index has no stable id yet, and only one call is
+            // ever streaming at a time.
+            self.session.alloc.free(ev.name);
+            self.session.alloc.free(ev.id);
+            self.session.alloc.free(e.args);
+            e.args = ev.arguments;
+            self.renderToolBlockAt(i);
+            return;
+        }
+        self.addPendingTool(ev);
+    }
+
     /// A tool call finished: fill in its entry and repaint its block. Takes
     /// ownership of the event's strings.
     pub fn finishTool(self: *TUI, result: agent.TurnEvent.ToolEnd) void {
@@ -7190,6 +7210,7 @@ pub const TUI = struct {
                     self.addAssistantMessage(t);
                 },
                 .tool_start => |s| self.addPendingTool(s),
+                .tool_args => |s| self.updatePendingToolArgs(s),
                 .tool_result => |r| self.finishTool(r),
                 .compaction => |info| self.addCompactionBlock(info),
                 .note => |n| {
@@ -7205,6 +7226,10 @@ pub const TUI = struct {
         self.render_mutex.lock(self.io) catch return;
         defer self.render_mutex.unlock(self.io);
         self.footer_stats = stats;
+        // Streaming tool previews render OUTSIDE the spinner's 22 ms cadence
+        // (renderToolBlockAt only bumps transcript_gen; without an immediate
+        // frame the growing card waits for the next unrelated repaint).
+        self.redrawLocked();
     }
 
     /// Empty a live-stream buffer (spinner thread reads it under the mutex).

@@ -57,6 +57,11 @@ pub const TurnEvent = union(enum) {
     /// A compaction was recorded (tokens before it + the summarization
     /// request's usage) — the "✂ Context compacted" transcript line.
     compaction: ss.CompactionInfo,
+    /// A streaming tool call grew its arguments (pi: the tool block renders
+    /// while the model is still writing it — write's path appears first,
+    /// then the content preview grows line by line with the "N more lines"
+    /// counter). Replaces the pending entry with the same id.
+    tool_args: ToolStart,
 
     pub const ToolStart = struct {
         id: []u8,
@@ -86,6 +91,11 @@ pub const TurnEvent = union(enum) {
                 alloc.free(r.content);
             },
             .compaction => {},
+            .tool_args => |s| {
+                alloc.free(s.id);
+                alloc.free(s.name);
+                alloc.free(s.arguments);
+            },
         }
     }
 };
@@ -142,6 +152,12 @@ pub const Session = struct {
     /// pi retry budget: auto-retry a round that failed with a transient
     /// provider error (EmptyResponse / stream drop) — exponential backoff.
     retry_attempt: usize = 0,
+    /// Streaming tool-call preview throttle (pi: toolCall updates repaint
+    /// the block as arguments grow). A turn_event per delta would flood the
+    /// queue at token cadence; push at most every `tool_args_throttle_ms`
+    /// or when the args length doubled since the last push.
+    tool_args_last_ms: i64 = 0,
+    tool_args_last_len: usize = 0,
     /// Max auto-retries per round (pi settings.retry.maxRetries default 3).
     retry_max: usize = 3,
     /// pi isRecoverableLength: one compact-and-retry when a round is cut by
@@ -839,6 +855,8 @@ pub const Session = struct {
             self.stream_tools = &tool_calls;
             self.stream_usage = null;
             self.stream_finish = null;
+            self.tool_args_last_ms = 0;
+            self.tool_args_last_len = 0;
 
             self.jsonEvent("{{\"type\":\"message_start\",\"message\":{{\"role\":\"assistant\"}}}}", .{});
 
@@ -1433,6 +1451,31 @@ pub const Session = struct {
                         defer self.alloc.free(esc);
                         const base = contentBaseIndex(self.stream_thinking.items.len > 0, self.stream_text.items.len > 0);
                         self.jsonEvent("{{\"type\":\"message_update\",\"usage\":null,\"assistantMessageEvent\":{{\"type\":\"toolcall_delta\",\"contentIndex\":{d},\"delta\":\"{s}\"}}}}", .{ base + d.index, esc });
+                    }
+                }
+                // Live tool preview (pi: the tool block renders while the
+                // model writes its arguments — write's path first, then the
+                // content preview grows). Throttled: at most one event per
+                // 250 ms, or immediately when the args length doubled (so
+                // fast bursts still show visible progress).
+                if (self.record_turn_events) {
+                    const now_ms = ss.nowMs(self.io);
+                    const cur_len = self.stream_tools.items[d.index].arguments.len;
+                    if (cur_len > 0 and (now_ms - self.tool_args_last_ms >= 250 or cur_len >= self.tool_args_last_len * 2)) {
+                        self.tool_args_last_ms = now_ms;
+                        self.tool_args_last_len = cur_len;
+                        const tc = self.stream_tools.items[d.index];
+                        const id_c = self.alloc.dupe(u8, tc.id) catch return;
+                        const name_c = self.alloc.dupe(u8, tc.name) catch {
+                            self.alloc.free(id_c);
+                            return;
+                        };
+                        const args_c = self.alloc.dupe(u8, tc.arguments) catch {
+                            self.alloc.free(id_c);
+                            self.alloc.free(name_c);
+                            return;
+                        };
+                        self.pushTurnEvent(.{ .tool_args = .{ .id = id_c, .name = name_c, .arguments = args_c } });
                     }
                 }
             },

@@ -80,6 +80,41 @@ const Span = struct { style: []const u8 = "", text: []const u8 };
 const Row = []const Span;
 
 /// Render `view` as a scrollback block. The caller owns the result.
+/// Close an unterminated streaming-JSON prefix so a partial tool-call's
+/// preview renders while the arguments are still arriving: append `"` when
+/// inside a string value and `}` when the object is still open. Best-effort —
+/// the full block re-renders once the arguments complete.
+fn closePartialJson(arena: std.mem.Allocator, s: []const u8) ![]u8 {
+    if (s.len == 0) return arena.dupe(u8, "{}");
+    var in_string = false;
+    var escaped = false;
+    var depth: usize = 0;
+    for (s) |c| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        switch (c) {
+            '\\' => {
+                if (in_string) escaped = true;
+            },
+            '"' => in_string = !in_string,
+            '{' => {
+                if (!in_string) depth += 1;
+            },
+            '}' => {
+                if (!in_string and depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(arena, s);
+    if (in_string) try out.append(arena, '"');
+    while (depth > 0) : (depth -= 1) try out.append(arena, '}');
+    return out.items;
+}
+
 pub fn render(alloc: std.mem.Allocator, view: ToolView, opts: Options) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -89,7 +124,13 @@ pub fn render(alloc: std.mem.Allocator, view: ToolView, opts: Options) ![]u8 {
     var b: Builder = .{ .arena = arena, .inner = width - 2 * PAD_X, .opts = opts };
 
     const parsed: ?std.json.Parsed(std.json.Value) =
-        std.json.parseFromSlice(std.json.Value, arena, view.args, .{}) catch null;
+        std.json.parseFromSlice(std.json.Value, arena, view.args, .{}) catch blk: {
+            // Arguments still streaming: a JSON prefix is valid enough for a
+            // preview if we close the string and the object (pi renders the
+            // partial toolCall the same way). Recover the last complete
+            // string value by truncating an unterminated one.
+            break :blk std.json.parseFromSlice(std.json.Value, arena, try closePartialJson(arena, view.args), .{}) catch null;
+        };
     const args: Args = .{ .value = if (parsed) |p| p.value else .null };
 
     if (eql(view.name, "bash")) {
@@ -1322,4 +1363,17 @@ test "wrapSpans: escape sequences count zero columns and stay whole" {
             try t.expect(wmod.visualWidth(plain) <= 20);
         }
     }
+}
+
+test "partial streaming JSON args render a preview (closePartialJson)" {
+    // Arguments mid-stream: the content string is unterminated. The write
+    // block must still render path + a partial preview (pi renders the
+    // partial toolCall), not "[invalid arg]".
+    const block = try render(t.allocator, .{
+        .name = "write",
+        .args = "{\"path\": \"tasks/prd.md\", \"content\": \"first line\\nsecond li",
+        .pending = true,
+    }, .{ .width = 60 });
+    defer t.allocator.free(block);
+    try expectRows(&.{ "", "", " write tasks/prd.md", "", " first line", " second li", "" }, block);
 }
