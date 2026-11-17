@@ -70,7 +70,7 @@ pub fn postSse(
     var guard: Guard = .{};
     var guard_active = false;
     if (request.connection) |conn| {
-        guard.start(session, conn.stream_reader.stream.socket.handle, client.io, stream_guard.idle_timeout_ms);
+        guard.start(session, conn.stream_reader.stream.socket.handle, client.io, stream_guard.idle_timeout_ms, stream_guard.data_timeout_ms);
         guard_active = guard.thread != null;
     }
     errdefer if (guard_active) guard.stop();
@@ -88,7 +88,7 @@ pub fn postSse(
                 continue;
             },
         };
-        if (guard_active) guard.noteData();
+        if (guard_active) guard.noteAny(); // bytes arrived: reset byte-idle window
         const trimmed = std.mem.trim(u8, line, " \r\n");
         if (trimmed.len == 0) continue;
         if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
@@ -97,6 +97,9 @@ pub fn postSse(
             done_cleanly = true;
             break;
         }
+        // Real payload line: reset the DATA-line window (blank lines and SSE
+        // comments never reach here — a keep-alive-only stall cannot hide).
+        if (guard_active) guard.noteData();
         ctx.parseSseData(data, session) catch continue;
     }
     if (guard_active) guard.stop();

@@ -703,6 +703,15 @@ pub fn main(init: std.process.Init) !void {
             if (ms >= 0) stream_guard.idle_timeout_ms = ms;
         } else |_| {}
     }
+    // SSE data-line timeout (default 300s): no `data:` line for this long fails
+    // the stream — keep-alive heartbeats (blank lines/comments) do NOT reset
+    // it, so a proxy that stalls upstream while heartbeating cannot hide the
+    // stall from the byte-level window. "0" disables.
+    if (std.process.Environ.getPosix(init.minimal.environ, "ZPI_HTTP_DATA_TIMEOUT_MS")) |raw| {
+        if (std.fmt.parseInt(i64, raw, 10)) |ms| {
+            if (ms >= 0) stream_guard.data_timeout_ms = ms;
+        } else |_| {}
+    }
     defer cfg.deinit(alloc);
 
     // Resolve cwd EARLY: the trust decision gates project settings (which

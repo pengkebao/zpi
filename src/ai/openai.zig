@@ -230,7 +230,7 @@ pub const OpenAiProvider = struct {
         var guard: Guard = .{};
         var guard_active = false;
         if (request.connection) |conn| {
-            guard.start(session, conn.stream_reader.stream.socket.handle, self.io, stream_guard.idle_timeout_ms);
+            guard.start(session, conn.stream_reader.stream.socket.handle, self.io, stream_guard.idle_timeout_ms, stream_guard.data_timeout_ms);
             guard_active = guard.thread != null;
         }
         errdefer if (guard_active) guard.stop();
@@ -262,21 +262,21 @@ pub const OpenAiProvider = struct {
                     // once complete below.
                     overflow.appendSlice(self.alloc, reader.buffered()) catch {};
                     reader.toss(reader.end - reader.seek);
-                    if (guard_active) guard.noteData(); // a full buffer IS data
+                    if (guard_active) guard.noteAny(); // a full buffer IS traffic
                     continue;
                 },
             };
-            if (guard_active) guard.noteData(); // data arrived: reset idle window
+            if (guard_active) guard.noteAny(); // bytes arrived: reset byte-idle window
             if (overflow.items.len > 0) {
                 // A previous takeDelimiterInclusive hit StreamTooLong; this
                 // call returned the line's TAIL. Join head + tail and parse.
                 overflow.appendSlice(self.alloc, line) catch {};
                 const joined = self.alloc.dupe(u8, overflow.items) catch continue;
                 overflow.clearRetainingCapacity();
-                self.parseSseLine(joined, session, &done);
+                if (self.parseSseLine(joined, session, &done) and guard_active) guard.noteData();
                 self.alloc.free(joined);
             } else {
-                self.parseSseLine(line, session, &done);
+                if (self.parseSseLine(line, session, &done) and guard_active) guard.noteData();
             }
             if (done) break;
         }
@@ -522,16 +522,20 @@ pub const OpenAiProvider = struct {
 
 /// One SSE wire line ("data: {...}" / "data: [DONE]" / comments). Shared by
 /// the normal read path and the oversized-line reassembly path.
-fn parseSseLine(self: *OpenAiProvider, line: []const u8, session: anytype, done: *bool) void {
+/// Returns true when the line was a real `data:` payload line (the stream
+/// guard's data-line idle window resets on those ONLY — blank lines and SSE
+/// comments are keep-alive traffic a stalled proxy uses to hide the stall).
+fn parseSseLine(self: *OpenAiProvider, line: []const u8, session: anytype, done: *bool) bool {
     const trimmed = std.mem.trim(u8, line, " \r\n");
-    if (trimmed.len == 0) return;
-    if (!std.mem.startsWith(u8, trimmed, "data:")) return;
+    if (trimmed.len == 0) return false;
+    if (!std.mem.startsWith(u8, trimmed, "data:")) return false;
     const data = std.mem.trim(u8, trimmed["data:".len..], " \r\n");
     if (std.mem.eql(u8, data, "[DONE]")) {
         done.* = true;
-        return;
+        return false;
     }
     self.parseChunk(data, session) catch {};
+    return true;
 }
 
 fn parseChunk(self: *OpenAiProvider, data: []const u8, session: anytype) !void {
@@ -926,10 +930,10 @@ test "SSE oversized line is reassembled, not dropped" {
             overflow.appendSlice(alloc, line) catch {};
             const joined = alloc.dupe(u8, overflow.items) catch continue;
             overflow.clearRetainingCapacity();
-            p.parseSseLine(joined, &h, &done);
+            _ = p.parseSseLine(joined, &h, &done);
             alloc.free(joined);
         } else {
-            p.parseSseLine(line, &h, &done);
+            _ = p.parseSseLine(line, &h, &done);
         }
     }
     try std.testing.expect(done);
