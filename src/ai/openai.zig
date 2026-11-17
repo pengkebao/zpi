@@ -235,6 +235,14 @@ pub const OpenAiProvider = struct {
         }
         errdefer if (guard_active) guard.stop();
         var done = false;
+        // Oversized SSE lines are REASSEMBLED, not dropped: gateways merge
+        // large content chunks into single events (a whole PRD section in
+        // one "data:" line easily exceeds the 16 KiB read buffer). Dropping
+        // the line silently lost output tokens — usage reported them, the
+        // transcript never saw them, and the turn "completed" with a
+        // truncated answer.
+        var overflow: std.ArrayListUnmanaged(u8) = .empty;
+        defer overflow.deinit(self.alloc);
         while (!done) {
             if (session.isAborted()) break;
             const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
@@ -249,23 +257,28 @@ pub const OpenAiProvider = struct {
                     return .transport_error;
                 },
                 error.StreamTooLong => {
-                    // Pathological over-long line: drop the buffered bytes
-                    // and resync at the next newline; the garbage tail of the
-                    // line is skipped by parseChunk's catch.
+                    // Buffer full mid-line: stash what's buffered and keep
+                    // reading until the newline; the joined line is parsed
+                    // once complete below.
+                    overflow.appendSlice(self.alloc, reader.buffered()) catch {};
                     reader.toss(reader.end - reader.seek);
+                    if (guard_active) guard.noteData(); // a full buffer IS data
                     continue;
                 },
             };
             if (guard_active) guard.noteData(); // data arrived: reset idle window
-            const trimmed = std.mem.trim(u8, line, " \r\n");
-            if (trimmed.len == 0) continue;
-            if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
-            const data = std.mem.trim(u8, trimmed["data:".len..], " \r\n");
-            if (std.mem.eql(u8, data, "[DONE]")) {
-                done = true;
-                break;
+            if (overflow.items.len > 0) {
+                // A previous takeDelimiterInclusive hit StreamTooLong; this
+                // call returned the line's TAIL. Join head + tail and parse.
+                overflow.appendSlice(self.alloc, line) catch {};
+                const joined = self.alloc.dupe(u8, overflow.items) catch continue;
+                overflow.clearRetainingCapacity();
+                self.parseSseLine(joined, session, &done);
+                self.alloc.free(joined);
+            } else {
+                self.parseSseLine(line, session, &done);
             }
-            self.parseChunk(data, session) catch continue;
+            if (done) break;
         }
         if (guard_active) guard.stop();
         // ESC (the guard unblocked the read) is checked by the caller before
@@ -507,6 +520,20 @@ pub const OpenAiProvider = struct {
         try body.append('}');
     }
 
+/// One SSE wire line ("data: {...}" / "data: [DONE]" / comments). Shared by
+/// the normal read path and the oversized-line reassembly path.
+fn parseSseLine(self: *OpenAiProvider, line: []const u8, session: anytype, done: *bool) void {
+    const trimmed = std.mem.trim(u8, line, " \r\n");
+    if (trimmed.len == 0) return;
+    if (!std.mem.startsWith(u8, trimmed, "data:")) return;
+    const data = std.mem.trim(u8, trimmed["data:".len..], " \r\n");
+    if (std.mem.eql(u8, data, "[DONE]")) {
+        done.* = true;
+        return;
+    }
+    self.parseChunk(data, session) catch {};
+}
+
 fn parseChunk(self: *OpenAiProvider, data: []const u8, session: anytype) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, data, .{}) catch return;
         defer parsed.deinit();
@@ -688,7 +715,7 @@ fn writeJsonStr(body: *std.array_list.Managed(u8), s: []const u8) !void {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 test "buildBody default format sends reasoning_effort" {
-    const p = OpenAiProvider{
+    var p = OpenAiProvider{
         .alloc = std.testing.allocator,
         .io = undefined,
         .base_url = @constCast("http://x"),
@@ -705,7 +732,7 @@ test "buildBody default format sends reasoning_effort" {
 }
 
 test "buildBody zai format sends thinking switch" {
-    const p = OpenAiProvider{
+    var p = OpenAiProvider{
         .alloc = std.testing.allocator,
         .io = undefined,
         .base_url = @constCast("http://x"),
@@ -731,7 +758,7 @@ test "buildBody zai format sends thinking switch" {
 }
 
 test "buildBody qwen format sends enable_thinking" {
-    const p = OpenAiProvider{
+    var p = OpenAiProvider{
         .alloc = std.testing.allocator,
         .io = undefined,
         .base_url = @constCast("http://x"),
@@ -750,7 +777,7 @@ test "buildBody qwen format sends enable_thinking" {
 }
 
 test "buildBody qwen-chat-template sends chat_template_kwargs" {
-    const p = OpenAiProvider{
+    var p = OpenAiProvider{
         .alloc = std.testing.allocator,
         .io = undefined,
         .base_url = @constCast("http://x"),
@@ -773,7 +800,7 @@ test "buildBody qwen-chat-template sends chat_template_kwargs" {
 }
 
 test "buildBody sends max_completion_tokens (max_tokens on zai endpoints)" {
-    const p = OpenAiProvider{
+    var p = OpenAiProvider{
         .alloc = std.testing.allocator,
         .io = undefined,
         .base_url = @constCast("http://x"),
@@ -812,7 +839,7 @@ test "buildBody sends max_completion_tokens (max_tokens on zai endpoints)" {
 }
 
 test "buildBody thinkingLevelMap remaps effort" {
-    const p = OpenAiProvider{
+    var p = OpenAiProvider{
         .alloc = std.testing.allocator,
         .io = undefined,
         .base_url = @constCast("http://x"),
@@ -832,4 +859,79 @@ test "buildBody thinkingLevelMap remaps effort" {
     body.clearRetainingCapacity();
     try p.buildBody(&body, "m", &msgs, "", false, .low, .{ .format = .zai, .reasoning = true, .supports_effort = true, .map = &map }, 0);
     try std.testing.expect(std.mem.indexOf(u8, body.items, "\"reasoning_effort\":\"low\"") != null);
+}
+
+test "SSE oversized line is reassembled, not dropped" {
+    // A real Reader over a tiny buffer: the data line exceeds the buffer,
+    // so takeDelimiterInclusive errors StreamTooLong on the head and the
+    // reassembly path must join head + tail before parsing.
+    const alloc = std.testing.allocator;
+    var p = OpenAiProvider{
+        .alloc = alloc,
+        .io = undefined,
+        .base_url = @constCast("http://x"),
+        .api_key = "",
+        .client = undefined,
+    };
+
+    const Harness = struct {
+        alloc: std.mem.Allocator,
+        text: std.ArrayListUnmanaged(u8) = .empty,
+        done_flag: bool = false,
+        pub fn isAborted(_: *@This()) bool {
+            return false;
+        }
+        pub fn onStreamEvent(self: *@This(), event: StreamEvent) void {
+            switch (event) {
+                .text_delta => |t| self.text.appendSlice(self.alloc, t) catch {},
+                .done => self.done_flag = true,
+                else => {},
+            }
+        }
+    };
+
+    // Build a wire body: one data line whose JSON payload is ~48 KiB
+    // (3x the 16 KiB read buffer used in streamChat).
+    const big_len: usize = 48 * 1024;
+    const payload = try alloc.alloc(u8, big_len);
+    defer alloc.free(payload);
+    // ASCII 'x' is valid JSON inside the string value; escape nothing.
+    @memset(payload, 'x');
+    const wire = try std.fmt.allocPrint(alloc, "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{s}\"}}}}]}}\n\ndata: [DONE]\n\n", .{payload});
+    defer alloc.free(wire);
+
+    const small = try alloc.dupe(u8, wire);
+    defer alloc.free(small);
+
+    // Drive the same state machine as streamChat: take lines with a 16 KiB
+    // buffer, reassemble StreamTooLong heads via parseSseLine.
+    var h = Harness{ .alloc = alloc };
+    defer h.text.deinit(alloc);
+    var rr = std.Io.Reader.fixed(small);
+    var done = false;
+    var overflow: std.ArrayListUnmanaged(u8) = .empty;
+    defer overflow.deinit(alloc);
+    var iters: usize = 0;
+    while (!done and iters < 10000) : (iters += 1) {
+        const line = rr.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.StreamTooLong => {
+                overflow.appendSlice(alloc, rr.buffered()) catch {};
+                rr.toss(rr.end - rr.seek);
+                continue;
+            },
+            error.ReadFailed => break,
+        };
+        if (overflow.items.len > 0) {
+            overflow.appendSlice(alloc, line) catch {};
+            const joined = alloc.dupe(u8, overflow.items) catch continue;
+            overflow.clearRetainingCapacity();
+            p.parseSseLine(joined, &h, &done);
+            alloc.free(joined);
+        } else {
+            p.parseSseLine(line, &h, &done);
+        }
+    }
+    try std.testing.expect(done);
+    try std.testing.expectEqual(big_len, h.text.items.len);
 }
