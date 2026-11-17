@@ -1391,6 +1391,14 @@ pub fn main(init: std.process.Init) !void {
                 alloc.free(branch);
             }
             for (branch) |m| session.context.append(m) catch {};
+            // Seed the footer's running totals from the replayed messages
+            // (totals only accumulates live streams; without this a -c/
+            // resume session starts at 0 tokens/$0 even though the store
+            // holds the prior consumption).
+            for (branch) |m| {
+                if (m.role != .assistant) continue;
+                if (m.usage) |u| session.totals.add(u);
+            }
             if (session_name) |n| st.recordSessionInfo(n);
             // pi: restore the session's model and thinking level (last
             // model_change / thinking_level_change on the leaf path), unless

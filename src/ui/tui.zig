@@ -2188,6 +2188,10 @@ pub const TUI = struct {
         self.session.model = m;
         self.session.thinking_level = m.thinking_level;
         self.model_name = m.name;
+        // Persist the switch so `-c`/resume restores this model (pi
+        // recordModelChange): the restore path reads the last model_change
+        // on the leaf path.
+        if (self.session.store) |st| st.recordModelChange(m.provider, m.id);
         // pi showStatus: "Switched to <name>[ (thinking: <level>)]" in dim
         // gray. Reasoning models follow the model's default thinking level.
         if (m.reasoning and m.thinking_level != .off) {

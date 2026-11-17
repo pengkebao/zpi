@@ -422,6 +422,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
   - **P2a 长度截断恢复**（pi `isRecoverableLength`）：`stream_finish == .length` 且 `usage.output < model.max_tokens` → 上下文压力/网关截断，一次性 compact-and-retry（`length_recovered` 防循环，每回合重置）；`onStreamEvent .done` 捕获 finish reason
   - **P2b 纯思考回合轻推**：某轮 blocks 全为 thinking（无文本无工具调用，`msg.blocksAreAllThinking`）→ 注入一次 continue 提示消息重入循环（`thinking_nudged` 每回合限一次）——模型把输出预算耗在推理上后不再静默停摆
   - 验证：全套件 611 过（test_pending 156 新增 3：退避序列/all-thinking 判定/isRecoverableLength 五分支）；**pty E2E 10/10**（① mock 服务器"连接后零字节"挂起：idle 1s 下 12s 内有限失败不再无限挂起、进程存活、失败后仍可交互；② ESC 在阻塞 read 中 <2.5s 解锁回输入行；③ 200+`[DONE]` 零内容块 ×2 后第 3 次正常响应：retry flash 可见、回合自动恢复出结果）。附带：`outputCallback` 的 `.tool_info` 从静默丢弃改为 flash 提示（恢复类通知可见，trim 首尾换行）
+- **`-c` 继续会话：模型恢复 + 消费数据播种**（用户反馈：`-c` 后模型回默认、历史消费数据不显示）：两处根因——① `store.recordModelChange` 存在但**从未被调用**，`-c`/resume 的恢复逻辑（`latestModelChange` 读 leaf 路径最后一条 model_change）永远落空；② `session.totals` 只在实时流式时累加（`totals.add(u)`），replay 加载后仍为零，footer 显示 0 tokens/$0。修复：`switchModel`（ctrl+p 循环 + /model 选择器共用路径）切模型后 `st.recordModelChange(provider, id)` 持久化；main.zig store 挂载后遍历 replayed branch 的 assistant 消息 `session.totals.add(m.usage)` 播种。验证：pty E2E 8/8（mock 双 provider mocka/a1+mockb/b2：`-c` 后 footer 显示历史 1.2k input → /model 切 Beta → model_change 条目落盘 + provider 重绑定后 beta-ok 响应 → 再 `-c` 模型恢复 Beta + footer 累计 2.4k）；全套件 611 过
 ### Phase H — 资源系统（~1.5k 行）
 - [x] H1 Skills：`skills.zig` 发现/解析/校验/去重 + 系统提示广告 + `/skill:name` + `/skill:<tab>` + 6 单测 + E2E（`15ade5a`）
 - [x] H2 Prompt templates：Phase D 完成（发现/$1/$@/默认值/未识别 slash 回退）
