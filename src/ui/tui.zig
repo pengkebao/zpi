@@ -123,6 +123,20 @@ const StreamPrefix = struct {
     width: usize,
 };
 
+/// The in-flight streaming tool call (pi renders the growing toolCall as the
+/// LAST child of the streaming message component, below the text — the model
+/// writes text first, then the call). Parked here while the arguments stream;
+/// the live block renders it after the text rows. It must not commit to the
+/// scrollback early: the final order is text above, card below, so an early
+/// commit would show the card ABOVE the streaming text and flip below it once
+/// the round commits (the text event precedes tool_start). Strings are owned
+/// by the session allocator. Guarded by stream_mutex.
+const StreamTool = struct {
+    id: []u8 = "",
+    name: []u8 = "",
+    args: []u8 = "",
+};
+
 /// A 0-based screen cell (mouse gesture tracking).
 pub const MousePoint = struct { col: usize, row: usize };
 
@@ -444,6 +458,23 @@ pub const TUI = struct {
     live_cache_xlen: usize = 0,
     live_cache_think_rows: usize = 0,
     live_cache_collapsed: bool = false,
+    /// The streaming tool-call preview currently being written by the model
+    /// (see StreamTool). Cleared by addPendingTool when the real card is
+    /// announced, and by dropStreamTool when a turn ends without announcing
+    /// it (provider error / abort). Guarded by stream_mutex.
+    stream_tool: ?StreamTool = null,
+    /// Bumped on every stream_tool change. live_cache borrows live_tool_rows,
+    /// which are freed OUTSIDE liveBlockLocked (addPendingTool/dropStreamTool/
+    /// /clear); the generation in the cache key is what keeps those borrows
+    /// from going dangling.
+    stream_tool_gen: usize = 0,
+    /// Rendered rows of the streaming tool preview, rebuilt only when the
+    /// preview changed or the width changed. Owned. Guarded by stream_mutex
+    /// (live-block rebuild) and render_mutex (shutdown /clear).
+    live_tool_rows: ?[][]u8 = null,
+    live_tool_gen: usize = 0,
+    live_tool_w: usize = 0,
+    live_cache_gen: usize = 0,
     /// Incremental streaming render state, one per append-only stream buffer.
     /// pi re-renders the streaming markdown fully every frame; on a long
     /// stream that re-parses tens of KB on every 80ms spinner tick while
@@ -3396,6 +3427,16 @@ pub const TUI = struct {
         if (self.live_cache) |c| self.alloc.free(c); // rows owned by stream caches
         self.invalidateStreamLocked(&self.live_stream_think);
         self.invalidateStreamLocked(&self.live_stream_text);
+        {
+            if (self.stream_tool) |st| {
+                self.session.alloc.free(st.id);
+                self.session.alloc.free(st.name);
+                self.session.alloc.free(st.args);
+                self.stream_tool = null;
+                self.stream_tool_gen += 1;
+            }
+            self.invalidateLiveToolRowsLocked();
+        }
         if (self.flash_msg) |m| self.alloc.free(m);
         for (self.tool_calls.items) |*e| e.deinit(self.session.alloc);
         self.tool_calls.deinit(self.session.alloc);
@@ -4641,7 +4682,18 @@ pub const TUI = struct {
         // the bottom — the viewport visibly bounces. When scrolled up the
         // tail simply sits below the viewport, out of view.
         var live: [][]u8 = &.{};
-        if (self.working and self.streamHasContent()) {
+        // While the stream has text (or thinking), the live block is the
+        // document's tail. A tool-only round (no text yet) parks its
+        // streaming preview the same way: the tool_args event must not
+        // commit a card to the scrollback while the round is still open —
+        // the text that follows would land above it and the card would
+        // visibly flip position when the round commits.
+        const has_live_tool = blk: {
+            self.stream_mutex.lock(self.io) catch break :blk false;
+            defer self.stream_mutex.unlock(self.io);
+            break :blk self.stream_tool != null;
+        };
+        if (self.working and (self.streamHasContent() or has_live_tool)) {
             live = self.liveBlockLocked() catch &.{};
         }
 
@@ -4875,7 +4927,12 @@ pub const TUI = struct {
         var all: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer all.deinit(self.alloc);
         try all.appendSlice(self.alloc, self.doc_lines.items);
-        const streaming = self.working and self.streamHasContent();
+        var streaming = self.working and self.streamHasContent();
+        if (!streaming) {
+            self.stream_mutex.lock(self.io) catch return all;
+            streaming = self.stream_tool != null;
+            self.stream_mutex.unlock(self.io);
+        }
         if (streaming) {
             const live: [][]u8 = self.liveBlockLocked() catch &.{};
             for (live) |l| try all.append(self.alloc, l);
@@ -5407,6 +5464,7 @@ pub const TUI = struct {
         if (self.live_cache) |c| {
             if (self.live_cache_w == self.width and self.live_cache_tlen == tlen and
                 self.live_cache_xlen == xlen and
+                self.live_cache_gen == self.stream_tool_gen and
                 self.live_cache_collapsed == self.thinking_collapsed) return c;
             // Rows are owned by the per-stream caches; only the assembled
             // header array is released here.
@@ -5440,13 +5498,57 @@ pub const TUI = struct {
         } else {
             self.invalidateStreamLocked(&self.live_stream_text);
         }
+        // The streaming tool call renders as the live block's LAST rows (pi:
+        // the growing toolCall is the streaming message's last child). Rows
+        // are owned and cached independently — rebuilt only when the args
+        // grew or the width changed.
+        if (self.stream_tool) |st| {
+            if (self.live_tool_rows == null or self.live_tool_gen != self.stream_tool_gen or
+                self.live_tool_w != self.width)
+            {
+                self.invalidateLiveToolRowsLocked();
+                if (tool_block.render(self.alloc, .{
+                    .name = st.name,
+                    .args = st.args,
+                    .pending = true,
+                }, .{ .width = self.width, .home = self.home_dir })) |block| {
+                    defer self.alloc.free(block);
+                    var rows: std.ArrayListUnmanaged([]u8) = .empty;
+                    errdefer for (rows.items) |r| self.alloc.free(r);
+                    var it = std.mem.splitScalar(u8, block, '\n');
+                    while (it.next()) |line| {
+                        try rows.append(self.alloc, try self.alloc.dupe(u8, line));
+                    }
+                    self.live_tool_rows = try rows.toOwnedSlice(self.alloc);
+                    self.live_tool_gen = self.stream_tool_gen;
+                    self.live_tool_w = self.width;
+                } else |_| {}
+            }
+            if (self.live_tool_rows) |rows| {
+                for (rows) |l| try out.append(self.alloc, l);
+            }
+        } else {
+            self.invalidateLiveToolRowsLocked();
+        }
         self.live_cache = try out.toOwnedSlice(self.alloc);
         self.live_cache_w = self.width;
         self.live_cache_tlen = tlen;
         self.live_cache_xlen = xlen;
+        self.live_cache_gen = self.stream_tool_gen;
         self.live_cache_collapsed = self.thinking_collapsed;
         self.live_cache_think_rows = think_rows;
         return self.live_cache.?;
+    }
+
+    /// Free the rendered streaming-tool rows. Caller holds stream_mutex
+    /// (live-block rebuild) or render_mutex (shutdown, /clear).
+    fn invalidateLiveToolRowsLocked(self: *TUI) void {
+        if (self.live_tool_rows) |old| {
+            for (old) |l| self.alloc.free(l);
+            self.live_tool_rows = null;
+        }
+        self.live_tool_gen = 0;
+        self.live_tool_w = 0;
     }
 
     /// Free a per-stream cache entirely (rows and header).
@@ -6023,8 +6125,22 @@ pub const TUI = struct {
 
     /// A tool call is starting: render its pending box now (gray); the result
     /// event repaints the same block in place (green/red). Takes ownership of
-    /// the event's strings (session allocator).
+    /// the event's strings (session allocator). The live preview's job ends
+    /// here: the announced card owns the position, and the final order (text
+    /// above, card below) must hold.
     pub fn addPendingTool(self: *TUI, start: agent.TurnEvent.ToolStart) void {
+        {
+            self.stream_mutex.lock(self.io) catch {};
+            defer self.stream_mutex.unlock(self.io);
+            if (self.stream_tool) |st| {
+                self.session.alloc.free(st.id);
+                self.session.alloc.free(st.name);
+                self.session.alloc.free(st.args);
+                self.stream_tool = null;
+                self.stream_tool_gen += 1;
+            }
+            self.invalidateLiveToolRowsLocked();
+        }
         const entry = ToolEntry{
             .id = start.id,
             .name = start.name,
@@ -6040,16 +6156,20 @@ pub const TUI = struct {
         self.renderToolBlockAt(self.tool_calls.items.len - 1);
     }
 
-    /// A streaming tool call grew its arguments, or a finished call was
-    /// announced (pi updateToolCall while the model writes): update the
-    /// pending entry with the same id in place — the preview grows without
-    /// a new card. Falls back to addPendingTool when no entry matches yet.
+    /// A streaming tool call grew its arguments: park the preview under the
+    /// live block (below the streaming text) instead of committing a card to
+    /// the scrollback. Committing early would put the card ABOVE the text —
+    /// the text event of the finished round lands in the scrollback first,
+    /// so the real card comes out below it and the block would visibly flip
+    /// (pi keeps the growing toolCall inside the streaming component as its
+    /// last child, and it never jumps). The announced .tool_start clears the
+    /// preview and commits the real card.
+    ///
+    /// A matching committed pending entry (replay or a repeated announce of
+    /// the same id) still updates in place.
     pub fn updatePendingToolArgs(self: *TUI, ev: agent.TurnEvent.ToolStart) void {
         for (self.tool_calls.items, 0..) |*e, i| {
             if (!e.pending or !std.mem.eql(u8, e.id, ev.id)) continue;
-            // Empty id (arguments arrived before the id): adopt by position —
-            // the streaming index has no stable id yet, and only one call is
-            // ever streaming at a time.
             self.session.alloc.free(ev.name);
             self.session.alloc.free(ev.id);
             self.session.alloc.free(e.args);
@@ -6057,7 +6177,48 @@ pub const TUI = struct {
             self.renderToolBlockAt(i);
             return;
         }
-        self.addPendingTool(ev);
+        {
+            self.stream_mutex.lock(self.io) catch {
+                self.session.alloc.free(ev.id);
+                self.session.alloc.free(ev.name);
+                self.session.alloc.free(ev.arguments);
+                return;
+            };
+            defer self.stream_mutex.unlock(self.io);
+            if (self.stream_tool) |st| {
+                self.session.alloc.free(st.id);
+                self.session.alloc.free(st.name);
+                self.session.alloc.free(st.args);
+            }
+            self.stream_tool = .{
+                .id = ev.id,
+                .name = ev.name,
+                .args = ev.arguments,
+            };
+            self.stream_tool_gen += 1;
+        }
+        self.redrawCached();
+    }
+
+    /// Drop the streaming tool preview without committing a card: a turn
+    /// that ended before announcing the call (provider error, abort). The
+    /// spinner thread is already joined by the time this runs on the turn
+    /// path; the main path (drainTurnEvents) runs on the output callback
+    /// thread and must take the render lock itself.
+    pub fn dropStreamTool(self: *TUI) void {
+        {
+            self.stream_mutex.lock(self.io) catch return;
+            defer self.stream_mutex.unlock(self.io);
+            if (self.stream_tool) |st| {
+                self.session.alloc.free(st.id);
+                self.session.alloc.free(st.name);
+                self.session.alloc.free(st.args);
+                self.stream_tool = null;
+                self.stream_tool_gen += 1;
+            }
+            self.invalidateLiveToolRowsLocked();
+        }
+        self.redrawCached();
     }
 
     /// A tool call finished: fill in its entry and repaint its block. Takes
@@ -7002,6 +7163,9 @@ pub const TUI = struct {
         // Same post-turn ceremony as the editor path.
         self.drainTurnEvents();
         self.stopWatch();
+        // The turn ended without announcing the call (error / abort): the
+        // live preview would otherwise linger above the next turn's output.
+        self.dropStreamTool();
         self.stopSpinner();
         self.loader.stop();
         self.redraw();
@@ -7251,6 +7415,19 @@ pub const TUI = struct {
     pub fn clearTranscript(self: *TUI) void {
         self.render_mutex.lock(self.io) catch return;
         defer self.render_mutex.unlock(self.io);
+        // /clear during a stream: the live tool preview dies with the rest
+        // (stream_mutex nested inside the held render lock — the same order
+        // liveBlockLocked uses under render callers).
+        self.stream_mutex.lock(self.io) catch {};
+        if (self.stream_tool) |st| {
+            self.session.alloc.free(st.id);
+            self.session.alloc.free(st.name);
+            self.session.alloc.free(st.args);
+            self.stream_tool = null;
+            self.stream_tool_gen += 1;
+            self.invalidateLiveToolRowsLocked();
+        }
+        self.stream_mutex.unlock(self.io);
         for (self.scrollback.items) |s| self.alloc.free(s);
         self.scrollback.clearRetainingCapacity();
         for (self.scrollback_src.items) |*s| s.deinit(self.alloc);
@@ -9294,6 +9471,10 @@ pub const TUI = struct {
                         const err_msg = std.fmt.bufPrint(&err_buf, "[error: {s}]", .{@errorName(e)}) catch "error";
                         self.addAssistantMessage(err_msg);
                     }
+                    // The turn ended without announcing the call (error /
+                    // abort): the live preview would otherwise linger above
+                    // the next turn's output.
+                    self.dropStreamTool();
                     self.thinking_active = false;
                     self.stopWatch();
                     self.stopSpinner();

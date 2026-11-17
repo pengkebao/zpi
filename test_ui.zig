@@ -228,6 +228,83 @@ test "tool call: the pending box is repainted in place by its result" {
     try std.testing.expectEqual(@as(usize, 0), t.tool_calls.items.len);
 }
 
+// ---- Streaming tool-call preview order ----
+
+// The streaming tool preview must NOT commit a scrollback card: a round's
+// text event lands in the scrollback before the tool's .tool_start, so an
+// early commit renders the card ABOVE the text during streaming and flips it
+// BELOW once the round commits (the regression this fixes).
+test "streaming tool args park in the live block, not the scrollback" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // Logic-only test: page allocator, leak tracking lives in leak_g2.
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+
+    const pending_bg = "\x1b[48;2;52;56;58m";
+    t.width = 80;
+
+    // Arguments arrive mid-stream (no committed entry yet): no scrollback
+    // card, the preview parks under the live block instead.
+    t.updatePendingToolArgs(.{
+        .id = try alloc.dupe(u8, "s1"),
+        .name = try alloc.dupe(u8, "bash"),
+        .arguments = try alloc.dupe(u8, "{\"command\":\"echo hi\""),
+    });
+    try std.testing.expectEqual(@as(usize, 0), t.scrollback.items.len);
+    try std.testing.expect(t.stream_tool != null);
+
+    // The parked preview renders as live rows, below the (empty) text rows.
+    t.working = true;
+    const live = t.liveBlockLocked() catch return error.NoLive;
+    try std.testing.expect(live.len > 0);
+    var found_header = false;
+    for (live) |row| {
+        if (std.mem.indexOf(u8, row, "$ echo hi") != null) found_header = true;
+    }
+    try std.testing.expect(found_header);
+
+    // A round with text: the text commits ABOVE where the card will appear.
+    t.addMessage("Let me run that for you.");
+
+    // The round finishes: .tool_start commits the real card and clears the
+    // parked preview. The card lands BELOW the text — no flip.
+    t.addPendingTool(.{
+        .id = try alloc.dupe(u8, "s1"),
+        .name = try alloc.dupe(u8, "bash"),
+        .arguments = try alloc.dupe(u8, "{\"command\":\"echo hi\"}"),
+    });
+    try std.testing.expect(t.stream_tool == null);
+    try std.testing.expectEqual(@as(usize, 2), t.scrollback.items.len);
+    try std.testing.expectEqualStrings("Let me run that for you.", t.scrollback.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[1], pending_bg) != null);
+    try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[1], "$ echo hi") != null);
+
+    // A parked preview that never gets announced (error/abort) is dropped
+    // with the turn.
+    t.updatePendingToolArgs(.{
+        .id = try alloc.dupe(u8, "s2"),
+        .name = try alloc.dupe(u8, "bash"),
+        .arguments = try alloc.dupe(u8, "{\"command\":\"echo again\""),
+    });
+    try std.testing.expect(t.stream_tool != null);
+    t.dropStreamTool();
+    try std.testing.expect(t.stream_tool == null);
+    try std.testing.expectEqual(@as(usize, 2), t.scrollback.items.len);
+}
+
 // ---- Selection + click-to-toggle ----
 
 test "selection: drag selects doc text, highlight reverses the range" {
