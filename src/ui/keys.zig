@@ -630,6 +630,29 @@ pub fn isDeviceAttributesReply(seq: []const u8) bool {
     return true;
 }
 
+/// Cursor-position report (CPR): the reply to a DSR `ESC [ 6 n` query —
+/// `ESC [ <row> ; <col> R`, both 1-based. Requires params (a bare `ESC [ R`
+/// or `ESC [ 1 ; 2 R`-style modified function key is not a CPR — those stay
+/// keys; worst case a mismatched reply costs one extra full repaint).
+pub const Cpr = struct { row: u16, col: u16 };
+
+pub fn parseCpr(seq: []const u8) ?Cpr {
+    if (seq.len < 6) return null;
+    if (seq[0] != 27 or seq[1] != '[' or seq[2] == '?' or seq[seq.len - 1] != 'R') return null;
+    const params = seq[2 .. seq.len - 1];
+    const semi = std.mem.indexOfScalar(u8, params, ';') orelse return null;
+    const row_s = params[0..semi];
+    const col_s = params[semi + 1 ..];
+    if (row_s.len == 0 or col_s.len == 0) return null;
+    for (params) |d| {
+        if (!(d >= '0' and d <= '9') and d != ';') return null;
+    }
+    const row = std.fmt.parseInt(u16, row_s, 10) catch return null;
+    const col = std.fmt.parseInt(u16, col_s, 10) catch return null;
+    if (row == 0 or col == 0) return null;
+    return .{ .row = row, .col = col };
+}
+
 /// Parse one complete raw input sequence, honoring the kitty-protocol state
 /// for the ambiguous legacy sequences (pi's `_kittyProtocolActive` checks).
 /// NOTE (deliberate pi deviation): `\n` (Ctrl+J) is ALWAYS a newline here —
@@ -673,6 +696,12 @@ pub const KeyReader = struct {
     flags_reply: ?usize = null,
     /// Set when a DA1 reply was consumed without a flags reply (no Kitty).
     da_reply: bool = false,
+    /// The last cursor-position report (DSR 6n reply), consumed from the
+    /// input stream. The TUI compares it against where it parked the cursor
+    /// after painting the frame: a mismatch means the screen moved behind
+    /// the diff model's back (a stray scroll from any source), and the
+    /// stale ghost rows would sit forever — the TUI forces a full repaint.
+    cpr_reply: ?Cpr = null,
     /// True right after a negotiation reply was consumed; nextKey returns
     /// immediately so the caller can act on flags_reply/da_reply without
     /// waiting for a keypress.
@@ -765,6 +794,11 @@ pub const KeyReader = struct {
         }
         if (isDeviceAttributesReply(data)) {
             self.da_reply = true;
+            self.consumed_reply = true;
+            return null;
+        }
+        if (parseCpr(data)) |cpr| {
+            self.cpr_reply = cpr;
             self.consumed_reply = true;
             return null;
         }
@@ -1100,4 +1134,32 @@ test "seqLenAt splits batched sequences" {
     try std.testing.expect(seqLenAt("\x1b[13;2") == null); // incomplete CSI
     try std.testing.expect(seqLenAt("\xE4\xB8") == null); // incomplete UTF-8
     try std.testing.expectEqual(@as(?usize, 2), seqLenAt("\x1ba rest"));
+}
+
+test "cpr: cursor position report parses and does not swallow keys" {
+    // The DSR reply: ESC[24;80R
+    const cpr = parseCpr("\x1b[24;80R") orelse return error.NoCpr;
+    try std.testing.expectEqual(@as(u16, 24), cpr.row);
+    try std.testing.expectEqual(@as(u16, 80), cpr.col);
+    // 1-based minimums.
+    try std.testing.expectEqual(@as(u16, 1), parseCpr("\x1b[1;1R").?.row);
+    // Not a CPR: bare CSI R (some terminals' F3), DA reply, SGR mouse, kitty.
+    try std.testing.expect(parseCpr("\x1b[R") == null);
+    try std.testing.expect(parseCpr("\x1b[?62;c") == null);
+    try std.testing.expect(parseCpr("\x1b[<0;10;5M") == null);
+    try std.testing.expect(parseCpr("\x1b[?1u") == null);
+    try std.testing.expect(parseCpr("\x1b[13;2u") == null);
+
+    // End-to-end: the KeyReader consumes the reply and surfaces it.
+    var kr = KeyReader{};
+    kr.paste_alloc = std.heap.page_allocator;
+    @memcpy(kr.pending[0..8], "\x1b[24;80R");
+    kr.pending_len = 8;
+    const k = try kr.nextKey(0, undefined);
+    // The reply was consumed wholesale (pending drained).
+    try std.testing.expectEqual(@as(usize, 0), kr.pending_len);
+    _ = k; // consumed_reply path returns .unknown
+    const got = kr.cpr_reply orelse return error.NoCprReply;
+    try std.testing.expectEqual(@as(u16, 24), got.row);
+    try std.testing.expectEqual(@as(u16, 80), got.col);
 }

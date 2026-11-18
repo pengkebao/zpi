@@ -146,7 +146,7 @@ pub const TUI = struct {
     /// leading slash (pi item.value: label may differ, e.g. models show the
     /// id but complete to "provider/id"); empty = use `name`.
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null, value: []const u8 = "" };
-    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped, model_selector, thinking_selector };
+    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped, model_selector, thinking_selector, login_select, login_key, login_method, logout_select };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
 
     /// pi settings-selector items (pi-tui SettingsList + settings-selector.js),
@@ -593,6 +593,45 @@ pub const TUI = struct {
     ts_sel: usize = 0,
     /// /scoped-models: dirty flag (changes applied live; Ctrl+S persists).
     scoped_dirty: bool = false,
+    // ---- /login + /logout (pi OAuthSelectorComponent + LoginDialogComponent,
+    // api_key paths only — zpi has no browser OAuth yet) ----
+    /// Rows of the login/logout provider selector: index into login_providers
+    /// (login) or stored credential ids (logout). Static copies, like
+    /// mcp_server_name.
+    const LOGIN_MAX = 32;
+    const LoginProvider = struct {
+        id: [48]u8 = undefined,
+        name: [48]u8 = undefined,
+        id_len: usize = 0,
+        name_len: usize = 0,
+        fn idSlice(self: *const LoginProvider) []const u8 {
+            return self.id[0..self.id_len];
+        }
+        fn nameSlice(self: *const LoginProvider) []const u8 {
+            return self.name[0..self.name_len];
+        }
+    };
+    login_providers: [LOGIN_MAX]LoginProvider = undefined,
+    login_len: usize = 0,
+    login_sel: usize = 0,
+    login_filtered: [LOGIN_MAX]usize = undefined,
+    login_visible: usize = 0,
+    /// Which /login command form opened the selector (pi providerRef):
+    /// null = no argument (top-level), otherwise the typed provider ref
+    /// shown when the user escapes back from the key dialog.
+    login_arg: ?[]u8 = null,
+    /// The provider the key dialog edits (login_key mode).
+    login_key_provider: [48]u8 = undefined,
+    login_key_provider_len: usize = 0,
+    /// Echo style for the key dialog: pi prompts with type "secret" — input
+    /// is masked as • (the key stays editable; backspace deletes one dot).
+    login_secret: bool = true,
+    /// Previous model ref (provider/id) before the key dialog opened — pi
+    /// completeProviderAuthentication only auto-selects the provider's
+    /// default model when the session model is not already usable.
+    login_prev_model: [128]u8 = undefined,
+    login_prev_model_len: usize = 0,
+
     /// Set by modal open/close paths: the next redraw hard-clears instead of
     /// diffing (large view-height swings leave stale rows behind otherwise).
     force_full_repaint: bool = false,
@@ -609,6 +648,19 @@ pub const TUI = struct {
     /// Last emitted cursor park (hidden flag + row<<32|col): a no-change
     /// frame re-parking the same cursor used to emit bytes every tick.
     cursor_park_key: u64 = std.math.maxInt(u64),
+    /// DSR cursor-report self-heal: after painting a frame the TUI queries
+    /// the hardware cursor (`ESC[6n`); when the reply names a cell other
+    /// than the park position, the screen moved behind the diff model's
+    /// back (a stray scroll from ANY source — the frame path is clamped,
+    /// but external writers / terminal quirks are not) and unchanged rows
+    /// would otherwise keep showing shifted ghosts forever. The mismatch
+    /// forces a full repaint — the manual-resize heal, automatic.
+    /// Written by whichever thread holds render_mutex; read by the main
+    /// loop from the reply handler — atomics keep the cross-thread access
+    /// well-defined (a torn value could only cost one extra repaint).
+    cpr_in_flight: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cpr_expect: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // (row<<16)|col, 1-based
+    cpr_age: u32 = 0, // frames since the query (render_mutex held)
     /// Main-loop wheel frame pacing (same idea as the watcher's throttle):
     /// a frame per wheel event costs one terminal round trip per line, which
     /// over a slow pipe makes fast pulls freeze, then burst.
@@ -770,7 +822,7 @@ pub const TUI = struct {
         // Modal dialogs (settings, session/tree/fork pickers, the /mcp
         // manager, scoped-models) are not driven by editor text.
         switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector => return,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .login_select, .login_key, .login_method, .logout_select => return,
             else => {},
         }
         const text = self.editor.getText() catch {
@@ -1038,6 +1090,7 @@ pub const TUI = struct {
     fn menuMaxVisible(self: *const TUI) usize {
         if (self.menu_mode == .settings or self.menu_mode == .model_selector or self.menu_mode == .thinking_selector) return 10;
         if (self.menu_mode == .sessions or self.menu_mode == .tree or self.menu_mode == .forksel) return 10;
+        if (self.menu_mode == .login_select or self.menu_mode == .logout_select or self.menu_mode == .login_method) return 8;
         return switch (self.menu_mode) {
             .commands, .models, .files => 5,
             .mcp => MCP_MAX_VISIBLE,
@@ -1208,7 +1261,7 @@ pub const TUI = struct {
         // projected window directly and menu_view_start only decides the
         // selection marker.
         const projected = switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector => true,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .login_select, .login_key, .login_method, .logout_select => true,
             else => false,
         };
         const item_idx = if (projected) v else self.menu_view_start + v;
@@ -1365,6 +1418,28 @@ pub const TUI = struct {
                 self.menu_mode = .hidden;
                 self.editor.clear() catch {};
                 self.redraw();
+                return false;
+            },
+            .login_select, .logout_select => {
+                // pi OAuthSelector: Enter opens the login flow for the
+                // selected provider (or removes its stored credential).
+                self.loginSelectorActivate();
+                return false;
+            },
+            .login_key => {
+                // pi LoginDialog Input.onSubmit: submit the key.
+                self.loginKeySubmit();
+                return false;
+            },
+            .login_method => {
+                // pi LoginAuthTypeSelector (ExtensionSelectorComponent):
+                // first option = Sign in with an account, second = API key.
+                // zpi supports the api_key path only; when both options are
+                // shown the second is the actionable one.
+                const n = self.menu_len;
+                if (self.loginFilteredCount() > 0 and n > 1) {
+                    self.openLoginKeyDialog(self.loginFilteredId(1), null);
+                }
                 return false;
             },
             .files => {
@@ -3736,6 +3811,15 @@ pub const TUI = struct {
         const ms_h: usize = if (self.menu_mode == .model_selector) self.modelSelectorViewHeight() else 0;
         const ts_h: usize = if (self.menu_mode == .thinking_selector) self.thinkingSelectorViewHeight() else 0;
         const sc_h: usize = if (self.menu_mode == .scoped) self.scopedViewHeight() else 0;
+        // Login/logout selectors (pi OAuthSelectorComponent): title + search
+        // line + list; the key dialog (LoginDialogComponent) shows title +
+        // instructions instead.
+        const login_h: usize = if (self.menu_mode == .login_select or self.menu_mode == .logout_select or self.menu_mode == .login_method)
+            self.loginViewHeight()
+        else if (self.menu_mode == .login_key)
+            self.loginKeyViewHeight()
+        else
+            0;
         // pi updatePendingMessagesDisplay: messages queued while the agent
         // works (steering / follow-up) or while compaction runs render as
         // dim rows between the transcript and the editor border.
@@ -3781,7 +3865,7 @@ pub const TUI = struct {
         }
         const live_q_h: usize = live_q_rows.items.len;
         const compact_q_h: usize = compact_q_rows.items.len;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h + compact_q_h + live_q_h;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h + compact_q_h + live_q_h + login_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -3958,6 +4042,11 @@ pub const TUI = struct {
         if (self.menu_mode == .scoped and sc_h > 0) {
             self.renderScopedChrome(&frame);
         }
+        // 3.9 Login/logout views (pi OAuthSelectorComponent +
+        // LoginDialogComponent): title/search/list or the key-entry dialog.
+        if (login_h > 0) {
+            self.renderLoginView(&frame);
+        }
         // 3.75 MCP manager view (pi ui.menu): title/details header, item
         // rows, hint footer — all inside the editor borders.
         if (mcp_h > 0) {
@@ -4111,7 +4200,7 @@ pub const TUI = struct {
         // plain autocomplete menus (commands/models/files) keep the editor
         // in its normal editing state.
         switch (self.menu_mode) {
-            .settings, .scoped, .model_selector, .thinking_selector, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust => return BORDER_INFO,
+            .settings, .scoped, .model_selector, .thinking_selector, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .login_select, .login_key, .login_method, .logout_select => return BORDER_INFO,
             else => {},
         }
         return levelColor(self.session.thinking_level);
@@ -5510,6 +5599,16 @@ pub const TUI = struct {
         self.rendered_scroll_top = self.frame_scroll_top;
 
         self.parkCursorHidden(&frame_out, cursor_row, cursor_col, cursor_hidden);
+        // DSR cursor report: the terminal answers `ESC[<row>;<col>R` on
+        // stdin; the main loop compares it with the park position above and
+        // full-repaints on a mismatch (the screen moved behind the model's
+        // back). One query in flight at a time; only on visible-cursor
+        // frames (a hidden park has no position to compare against).
+        if (!cursor_hidden and !self.cpr_in_flight.load(.acquire)) {
+            frame_out.appendSlice(self.alloc, "\x1b[6n") catch return;
+            self.cpr_in_flight.store(true, .release);
+            self.cpr_age = 0;
+        }
     }
 
     /// Park the hardware cursor where it belongs after a frame: hidden while
@@ -5545,6 +5644,11 @@ pub const TUI = struct {
         const ml = ansi.moveTo(&mv, @intCast(cursor_row + 1), cursor_col);
         out.appendSlice(self.alloc, mv[0..ml]) catch return;
         out.appendSlice(self.alloc, ansi.SHOW_CURSOR) catch return;
+        // Record where the hardware cursor should be now (clamped like the
+        // terminal clamps CUP): a DSR reply naming any other cell means the
+        // screen moved behind the model's back.
+        const prow: u32 = @min(@as(u32, @intCast(cursor_row)) + 1, @as(u32, self.height));
+        self.cpr_expect.store((prow << 16) | cursor_col, .release);
     }
 
     /// Write the accumulated frame body wrapped in synchronized output, or
@@ -5556,6 +5660,16 @@ pub const TUI = struct {
         out.appendSlice(self.alloc, "\x1b[?2026h") catch return;
         out.appendSlice(self.alloc, body.items) catch return;
         out.appendSlice(self.alloc, "\x1b[?2026l") catch return;
+        // Give up on an unanswered DSR query after a few frames (a terminal
+        // without CPR support must degrade to plain rendering, not stop
+        // querying forever after the first lost reply).
+        if (self.cpr_in_flight.load(.acquire)) {
+            self.cpr_age += 1;
+            if (self.cpr_age > 8) {
+                self.cpr_in_flight.store(false, .release);
+                self.cpr_age = 0;
+            }
+        }
         if (self.last_frame_bytes.len > 0) self.alloc.free(self.last_frame_bytes);
         self.last_frame_bytes = self.alloc.dupe(u8, out.items) catch return;
         self.writeRaw(out.items);
@@ -8598,6 +8712,26 @@ pub const TUI = struct {
             if (self.compact_done) {
                 self.compact_done = false;
                 self.finishCompaction();
+            }
+            // Cursor-position report (the reply to a frame's DSR query): if
+            // the hardware cursor is NOT where we parked it, the screen
+            // moved behind the diff model's back — a stray scroll from any
+            // source. Rows whose strings never changed would keep showing
+            // shifted ghosts forever (the diff skips them); a full repaint
+            // resyncs (the manual-resize heal, automatic). Checked BEFORE
+            // the .unknown tick below: a consumed reply returns .unknown.
+            if (self.key_reader.cpr_reply) |cpr| {
+                self.key_reader.cpr_reply = null;
+                self.cpr_in_flight.store(false, .release);
+                self.cpr_age = 0;
+                const expect = self.cpr_expect.load(.acquire);
+                const exp_row: u16 = @intCast(expect >> 16);
+                const exp_col: u16 = @intCast(expect & 0xFFFF);
+                if (expect != 0 and (cpr.row != exp_row or cpr.col != exp_col)) {
+                    self.force_full_repaint = true;
+                    self.redraw();
+                    continue;
+                }
             }
             // Modal dialogs swallow the global bindings (scroll, search,
             // ctrl+c/d exit, paste...) — only the dialog's own keys respond.
