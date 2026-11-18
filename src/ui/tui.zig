@@ -152,8 +152,27 @@ pub const TUI = struct {
     /// leading slash (pi item.value: label may differ, e.g. models show the
     /// id but complete to "provider/id"); empty = use `name`.
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null, value: []const u8 = "" };
-    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped, model_selector, thinking_selector, login_select, login_key, login_method, logout_select };
+    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped, model_selector, thinking_selector, login_select, login_key, logout_select };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
+
+    const LOGIN_MAX = 32;
+    const LoginProvider = struct {
+        id: [48]u8 = undefined,
+        name: [48]u8 = undefined,
+        env: [40]u8 = undefined,
+        id_len: usize = 0,
+        name_len: usize = 0,
+        env_len: usize = 0,
+        fn idSlice(self: *const LoginProvider) []const u8 {
+            return self.id[0..self.id_len];
+        }
+        fn nameSlice(self: *const LoginProvider) []const u8 {
+            return self.name[0..self.name_len];
+        }
+        fn envSlice(self: *const LoginProvider) []const u8 {
+            return self.env[0..self.env_len];
+        }
+    };
 
     /// pi settings-selector items (pi-tui SettingsList + settings-selector.js),
     /// same ids/labels/descriptions/values. Items zpi cannot back yet render
@@ -604,19 +623,6 @@ pub const TUI = struct {
     /// Rows of the login/logout provider selector: index into login_providers
     /// (login) or stored credential ids (logout). Static copies, like
     /// mcp_server_name.
-    const LOGIN_MAX = 32;
-    const LoginProvider = struct {
-        id: [48]u8 = undefined,
-        name: [48]u8 = undefined,
-        id_len: usize = 0,
-        name_len: usize = 0,
-        fn idSlice(self: *const LoginProvider) []const u8 {
-            return self.id[0..self.id_len];
-        }
-        fn nameSlice(self: *const LoginProvider) []const u8 {
-            return self.name[0..self.name_len];
-        }
-    };
     login_providers: [LOGIN_MAX]LoginProvider = undefined,
     login_len: usize = 0,
     login_sel: usize = 0,
@@ -833,7 +839,7 @@ pub const TUI = struct {
         // Modal dialogs (settings, session/tree/fork pickers, the /mcp
         // manager, scoped-models) are not driven by editor text.
         switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .login_select, .login_key, .login_method, .logout_select => return,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .login_select, .login_key, .logout_select => return,
             else => {},
         }
         const text = self.editor.getText() catch {
@@ -1101,7 +1107,7 @@ pub const TUI = struct {
     fn menuMaxVisible(self: *const TUI) usize {
         if (self.menu_mode == .settings or self.menu_mode == .model_selector or self.menu_mode == .thinking_selector) return 10;
         if (self.menu_mode == .sessions or self.menu_mode == .tree or self.menu_mode == .forksel) return 10;
-        if (self.menu_mode == .login_select or self.menu_mode == .logout_select or self.menu_mode == .login_method) return 8;
+        if (self.menu_mode == .login_select or self.menu_mode == .logout_select) return 8;
         return switch (self.menu_mode) {
             .commands, .models, .files => 5,
             .mcp => MCP_MAX_VISIBLE,
@@ -1272,7 +1278,7 @@ pub const TUI = struct {
         // projected window directly and menu_view_start only decides the
         // selection marker.
         const projected = switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .login_select, .login_key, .login_method, .logout_select => true,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .login_select, .login_key, .logout_select => true,
             else => false,
         };
         const item_idx = if (projected) v else self.menu_view_start + v;
@@ -1440,17 +1446,6 @@ pub const TUI = struct {
             .login_key => {
                 // pi LoginDialog Input.onSubmit: submit the key.
                 self.loginKeySubmit();
-                return false;
-            },
-            .login_method => {
-                // pi LoginAuthTypeSelector (ExtensionSelectorComponent):
-                // first option = Sign in with an account, second = API key.
-                // zpi supports the api_key path only; when both options are
-                // shown the second is the actionable one.
-                const n = self.menu_len;
-                if (self.loginFilteredCount() > 0 and n > 1) {
-                    self.openLoginKeyDialog(self.loginFilteredId(1), null);
-                }
                 return false;
             },
             .files => {
@@ -1737,6 +1732,486 @@ pub const TUI = struct {
         }
         const hint = std.fmt.allocPrint(self.alloc, "  {s}Enter to select \u{b7} Ctrl+S to set as default \u{b7} Escape/Ctrl+C to cancel{s}", .{ muted, reset }) catch return;
         frame.append(self.alloc, hint) catch return;
+    }
+
+    // ---- /login + /logout (pi OAuthSelectorComponent + LoginDialogComponent,
+    //      interactive-mode.js handleLoginCommand/showOAuthSelector) ----
+
+    fn loginSetProvider(self: *TUI, idx: usize, id: []const u8, name: []const u8, env: []const u8) void {
+        if (idx >= LOGIN_MAX) return;
+        self.login_providers[idx] = .{};
+        const p = &self.login_providers[idx];
+        const n = @min(id.len, p.id.len);
+        @memcpy(p.id[0..n], id[0..n]);
+        p.id_len = n;
+        const mn = @min(name.len, p.name.len);
+        @memcpy(p.name[0..mn], name[0..mn]);
+        p.name_len = mn;
+        const en = @min(env.len, p.env.len);
+        @memcpy(p.env[0..en], env[0..en]);
+        p.env_len = en;
+    }
+
+    /// The provider's env var name ("" when unknown) — cached at list build.
+    fn loginEnvOf(self: *const TUI, provider_id: []const u8) []const u8 {
+        for (self.login_providers[0..self.login_len]) |*p| {
+            if (std.mem.eql(u8, p.idSlice(), provider_id)) return p.envSlice();
+        }
+        return "";
+    }
+
+    /// pi formatAuthSelectorProviderStatus: " ✓ <source>" when configured,
+    /// " • not configured" otherwise; env-var sources render as "env: NAME"
+    /// (pi renders ALL-CAPS env lists with the env: prefix).
+    fn loginStatusSuffix(self: *TUI, provider_id: []const u8, buf: *[160]u8) []const u8 {
+        const muted = FG_MUTED;
+        const success = "\x1b[38;2;114;178;134m";
+        const reset = ansi.RESET;
+        var stored = false;
+        if (self.cfg) |cfg| {
+            for (cfg.models.items) |*m| {
+                if (std.mem.eql(u8, m.provider, provider_id) and m.api_key.len > 0) {
+                    stored = true;
+                    break;
+                }
+            }
+        }
+        const env = self.loginEnvOf(provider_id);
+        const env_set = env.len > 0 and std.process.Environ.getPosix(self.environ, env) != null;
+        if (stored) {
+            return std.fmt.bufPrint(buf, "{s} ✓ configured{s}", .{ success, reset }) catch "";
+        }
+        if (env_set) {
+            return std.fmt.bufPrint(buf, "{s} • env: {s}{s}", .{ muted, env, reset }) catch "";
+        }
+        return std.fmt.bufPrint(buf, "{s} • not configured{s}", .{ muted, reset }) catch "";
+    }
+
+    /// Build the /login provider list (pi getLoginProviderOptions: every
+    /// provider's login methods; zpi covers the api_key kind). When a
+    /// providerRef was typed, only matching id/name entries (pi
+    /// findLoginProviderOptions).
+    pub fn openLoginSelector(self: *TUI, provider_ref: ?[]const u8) void {
+        self.closeLoginViews();
+        self.login_len = 0;
+        var all: []config.CatalogProvider = &.{};
+        var owned = false;
+        if (config.listCatalogProviders(self.alloc)) |l| {
+            all = l;
+            owned = true;
+        }
+        defer if (owned) config.freeCatalogProviders(self.alloc, all);
+        // pi: options.sort((a, b) => a.name.localeCompare(b.name)).
+        const Ctx = struct {};
+        std.mem.sort(config.CatalogProvider, all, Ctx{}, struct {
+            fn f(_: Ctx, a: config.CatalogProvider, b: config.CatalogProvider) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.f);
+        for (all) |p| {
+            if (self.login_len >= LOGIN_MAX) break;
+            if (provider_ref) |ref| {
+                const r = std.mem.trim(u8, ref, " ");
+                if (r.len > 0 and !std.ascii.eqlIgnoreCase(p.id, r) and !std.ascii.eqlIgnoreCase(p.name, r)) continue;
+            }
+            self.loginSetProvider(self.login_len, p.id, p.name, p.env);
+            self.login_len += 1;
+        }
+        self.menu_mode = .login_select;
+        self.editor.clear() catch {};
+        if (provider_ref) |ref| {
+            const r = std.mem.trim(u8, ref, " ");
+            if (r.len > 0) self.editor.setText(r) catch {};
+        }
+        self.login_sel = 0;
+        self.loginRefilter();
+        self.force_full_repaint = true;
+        self.freeMenuTextCache();
+        self.redraw();
+    }
+
+    /// /logout provider list (pi getLogoutProviderOptions): providers with a
+    /// stored credential in auth.json (env-only providers are not listed —
+    /// logging out must not touch environment variables).
+    pub fn openLogoutSelector(self: *TUI) void {
+        self.closeLoginViews();
+        self.login_len = 0;
+        if (self.cfg) |cfg| {
+            if (config.listAuthProviders(self.alloc, self.io, cfg.base_dir)) |stored| {
+                defer {
+                    for (stored) |s| self.alloc.free(s);
+                    self.alloc.free(stored);
+                }
+                for (stored) |pid| {
+                    if (self.login_len >= LOGIN_MAX) break;
+                    // Display name: catalog entry when known, else the id.
+                    var pname: []const u8 = pid;
+                    var owned_name: ?[]u8 = null;
+                    for (self.login_providers[0..0]) |_| {} // no-op; name resolved below
+                    if (config.listCatalogProviders(self.alloc)) |all| {
+                        defer config.freeCatalogProviders(self.alloc, all);
+                        for (all) |cp| {
+                            if (std.mem.eql(u8, cp.id, pid)) {
+                                owned_name = self.alloc.dupe(u8, cp.name) catch null;
+                                if (owned_name) |on| pname = on;
+                                break;
+                            }
+                        }
+                    }
+                    defer if (owned_name) |on| self.alloc.free(on);
+                    self.loginSetProvider(self.login_len, pid, pname, "");
+                    self.login_len += 1;
+                }
+            }
+        }
+        if (self.login_len == 0) {
+            // pi showStatus.
+            self.note("No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.", .{});
+            return;
+        }
+        self.menu_mode = .logout_select;
+        self.editor.clear() catch {};
+        self.login_sel = 0;
+        self.loginRefilter();
+        self.force_full_repaint = true;
+        self.freeMenuTextCache();
+        self.redraw();
+    }
+
+    /// pi OAuthSelector.filterProviders: fuzzy match over name + id
+    /// (+"authType method name" in pi; zpi has one method per provider).
+    fn loginRefilter(self: *TUI) void {
+        const query_raw = self.editor.getText() catch "";
+        defer self.alloc.free(query_raw);
+        const query = std.mem.trim(u8, query_raw, " ");
+        var n: usize = 0;
+        for (0..self.login_len) |i| {
+            const p = &self.login_providers[i];
+            if (query.len > 0) {
+                var tbuf: [160]u8 = undefined;
+                const text = std.fmt.bufPrint(&tbuf, "{s} {s} api_key", .{ p.nameSlice(), p.idSlice() }) catch continue;
+                if (fuzzy.fuzzyMatch(self.alloc, query, text) == null) continue;
+            }
+            self.login_filtered[n] = i;
+            n += 1;
+        }
+        self.login_visible = n;
+        if (self.login_sel >= n) self.login_sel = if (n > 0) n - 1 else 0;
+    }
+
+    /// pi startProviderLogin → showApiKeyLoginDialog: focus the key entry.
+    fn loginSelectorActivate(self: *TUI) void {
+        if (self.login_visible == 0) return;
+        const idx = self.login_filtered[self.login_sel];
+        const pid = self.alloc.dupe(u8, self.login_providers[idx].idSlice()) catch return;
+        defer self.alloc.free(pid);
+        if (self.menu_mode == .logout_select) {
+            self.closeLoginViews();
+            self.menu_mode = .hidden;
+            self.editor.clear() catch {};
+            self.logoutProvider(pid);
+            self.redraw();
+            return;
+        }
+        self.openLoginKeyDialog(pid);
+    }
+
+    fn closeLoginViews(self: *TUI) void {
+        if (self.login_arg) |a| {
+            self.alloc.free(a);
+            self.login_arg = null;
+        }
+        self.login_len = 0;
+        self.login_visible = 0;
+        self.login_sel = 0;
+        self.login_key_provider_len = 0;
+    }
+
+    fn loginExitToArg(self: *TUI) void {
+        // pi: Escape from the key dialog reopens the selector the login was
+        // started from (onBack), preserving the typed provider ref.
+        const ref: ?[]const u8 = if (self.login_arg) |a| a else null;
+        self.openLoginSelector(ref);
+    }
+
+    pub fn openLoginKeyDialog(self: *TUI, provider_id: []const u8) void {
+        self.login_key_provider_len = @min(provider_id.len, self.login_key_provider.len);
+        @memcpy(self.login_key_provider[0..self.login_key_provider_len], provider_id[0..self.login_key_provider_len]);
+        // pi showApiKeyLoginDialog keeps the previous model for the
+        // completion step; zpi records it as "provider/id".
+        const prev = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.session.model.provider, self.session.model.id }) catch "";
+        defer if (prev.len > 0) self.alloc.free(prev);
+        const n = @min(prev.len, self.login_prev_model.len);
+        @memcpy(self.login_prev_model[0..n], prev[0..n]);
+        self.login_prev_model_len = n;
+        self.menu_mode = .login_key;
+        self.login_secret = true;
+        self.editor.clear() catch {};
+        self.force_full_repaint = true;
+        self.freeMenuTextCache();
+        self.redraw();
+    }
+
+    /// pi envApiKeyAuth login prompt message: "Enter <name>" where name is
+    /// the auth method name (the env var for standard key providers).
+    fn loginKeyPromptName(self: *const TUI) []const u8 {
+        const p = self.login_key_provider[0..self.login_key_provider_len];
+        const env = self.loginEnvOf(p);
+        if (env.len > 0) return env;
+        // The dialog can be opened without the selector (direct /login ref);
+        // fall back to the catalog env var.
+        if (self.catalogEnvOf(p)) |env2| {
+            if (env2.len > 0) return env2;
+        }
+        return "API key";
+    }
+
+    /// Catalog env var for a provider (owned scratch copy through a static
+    /// buffer; only valid until the next call).
+    fn catalogEnvOf(self: *const TUI, provider_id: []const u8) ?[]const u8 {
+        const S = struct {
+            var buf: [40]u8 = undefined;
+        };
+        const all = config.listCatalogProviders(self.alloc) orelse return null;
+        defer config.freeCatalogProviders(self.alloc, all);
+        for (all) |p| {
+            if (std.mem.eql(u8, p.id, provider_id)) {
+                const n = @min(p.env.len, S.buf.len);
+                @memcpy(S.buf[0..n], p.env[0..n]);
+                return S.buf[0..n];
+            }
+        }
+        return null;
+    }
+
+    /// Frame rows around the key-input editor line (pi LoginDialogComponent:
+    /// border + title + instructions + input + cancel hint; the input is the
+    /// editor row appended by the caller between the two chrome blocks).
+    fn loginKeyViewHeight(self: *TUI) usize {
+        _ = self;
+        return 2; // blank + instructions (input line = the editor row)
+    }
+
+    fn renderLoginKeyView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        const muted = FG_MUTED;
+        const reset = ansi.RESET;
+        frame.append(self.alloc, "") catch return;
+        const instr = std.fmt.allocPrint(self.alloc, "  {s}Enter {s}{s}", .{ muted, self.loginKeyPromptName(), reset }) catch return;
+        frame.append(self.alloc, instr) catch return;
+    }
+
+    fn loginViewHeight(self: *TUI) usize {
+        var h: usize = 4; // blank + title + blank + hint
+        h += @min(self.login_visible, 8);
+        if (self.login_visible > 8) h += 1; // (n/total)
+        return h;
+    }
+
+    fn renderLoginView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        const muted = FG_MUTED;
+        const accent = ACCENT;
+        const reset = ansi.RESET;
+        frame.append(self.alloc, "") catch return;
+        const title_comptime: []const u8 = if (self.menu_mode == .logout_select)
+            "Select provider to logout:"
+        else
+            "Select provider to configure:";
+        const title = std.fmt.allocPrint(self.alloc, "{s}\x1b[1m{s}{s}", .{ accent, title_comptime, reset }) catch return;
+        frame.append(self.alloc, title) catch return;
+        // (The "> " search line is the editor row appended by the caller.)
+        const visible_rows = @min(self.login_visible, 8);
+        if (self.login_visible == 0) {
+            const msg: []const u8 = if (self.menu_mode == .logout_select)
+                "  No providers logged in. Use /login first."
+            else
+                "  No providers available";
+            const line = std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ muted, msg, reset }) catch return;
+            frame.append(self.alloc, line) catch return;
+        } else {
+            const total = self.login_visible;
+            const start: usize = if (self.login_sel >= visible_rows)
+                @min(self.login_sel - visible_rows / 2, total -| visible_rows)
+            else
+                0;
+            var sbuf: [160]u8 = undefined;
+            for (0..visible_rows) |v| {
+                const li = self.login_filtered[start + v];
+                const p = &self.login_providers[li];
+                const selected = (start + v) == self.login_sel;
+                var clean = std.array_list.Managed(u8).init(self.alloc);
+                defer clean.deinit();
+                clean.appendSlice(if (selected) "\u{2192} " else "  ") catch return;
+                if (selected) clean.appendSlice(accent) catch return;
+                clean.appendSlice(p.nameSlice()) catch return;
+                clean.appendSlice(reset) catch return;
+                clean.appendSlice(" ") catch return;
+                clean.appendSlice(muted) catch return;
+                clean.appendSlice("[") catch return;
+                clean.appendSlice(p.idSlice()) catch return;
+                clean.appendSlice("]") catch return;
+                clean.appendSlice(reset) catch return;
+                clean.appendSlice(self.loginStatusSuffix(p.idSlice(), &sbuf)) catch return;
+                frame.append(self.alloc, clean.toOwnedSlice() catch return) catch return;
+            }
+            if (total > visible_rows) {
+                const cnt = std.fmt.allocPrint(self.alloc, "  {s}({d}/{d}){s}", .{ muted, self.login_sel + 1, total, reset }) catch return;
+                frame.append(self.alloc, cnt) catch return;
+            }
+        }
+        frame.append(self.alloc, "") catch return;
+        const hint = std.fmt.allocPrint(self.alloc, "  {s}Enter to select \u{b7} Type to filter \u{b7} Escape to cancel{s}", .{ muted, reset }) catch return;
+        frame.append(self.alloc, hint) catch return;
+    }
+
+    /// pi LoginDialog Input.onSubmit + loginProvider("api_key") +
+    /// completeProviderAuthentication: store the key, refresh the provider's
+    /// models, auto-select its default model when the session model is not
+    /// already usable.
+    pub fn loginKeySubmit(self: *TUI) void {
+        const pid = self.alloc.dupe(u8, self.login_key_provider[0..self.login_key_provider_len]) catch return;
+        defer self.alloc.free(pid);
+        const key_raw = self.editor.getText() catch "";
+        const key = std.mem.trim(u8, key_raw, " \t");
+        if (key.len == 0) {
+            self.note("Enter the API key (Escape to cancel)", .{});
+            self.redraw();
+            return;
+        }
+        var stored = false;
+        if (self.cfg) |cfg| {
+            config.saveAuthEntry(self.alloc, self.io, cfg.base_dir, pid, key) catch {
+                self.note("failed to write auth.json", .{});
+                self.closeLoginViews();
+                self.menu_mode = .hidden;
+                self.editor.clear() catch {};
+                self.redraw();
+                return;
+            };
+            stored = true;
+            // Apply immediately to existing models of that provider.
+            for (cfg.models.items) |*m| {
+                if (std.mem.eql(u8, m.provider, pid)) {
+                    const copy = self.alloc.dupe(u8, key) catch continue;
+                    self.alloc.free(m.api_key);
+                    m.api_key = copy;
+                }
+            }
+            // pi modelRuntime.refresh: make the provider's catalog models
+            // available immediately.
+            _ = config.addProviderModels(self.alloc, cfg, pid, key) catch 0;
+        }
+        self.closeLoginViews();
+        self.menu_mode = .hidden;
+        self.editor.clear() catch {};
+        const name = self.loginProviderDisplayName(pid);
+        defer if (name.ptr != pid.ptr) self.alloc.free(name);
+        if (stored) {
+            self.note("\x1b[90mSaved API key for {s}. Credentials saved to {s}/auth.json\x1b[0m", .{ name, if (self.cfg) |c| c.base_dir else "~/.pi/agent" });
+        } else {
+            self.note("\x1b[90mSaved API key for {s}\x1b[0m", .{name});
+        }
+        // pi completeProviderAuthentication: when the session model is not
+        // one of the just-authenticated provider's models, switch to the
+        // provider's default model (settings default wins over catalog
+        // defaultModel; no default → hint at /model).
+        if (stored and !std.mem.eql(u8, self.session.model.provider, pid)) {
+            if (self.selectProviderDefaultModel(pid)) |default_ref| {
+                defer self.alloc.free(default_ref);
+                if (self.cfg.?.findModel(default_ref)) |m| {
+                    const idx = self.indexOfModel(m);
+                    if (idx) |i| {
+                        self.switchModel(i) catch {};
+                    }
+                }
+            } else {
+                self.note("\x1b[38;2;222;147;95mSaved API key for {s}, but no default model is configured for that provider. Use /model to select a model.\x1b[0m", .{name});
+            }
+        }
+        self.force_full_repaint = true;
+        self.redraw();
+    }
+
+    /// pi defaultModelPerProvider resolution for the freshly authenticated
+    /// provider: the settings default when it belongs to the provider,
+    /// otherwise the catalog defaultModel ("provider/id", owned). null when
+    /// the provider has no usable default.
+    fn selectProviderDefaultModel(self: *TUI, provider_id: []const u8) ?[]u8 {
+        const cfg = self.cfg orelse return null;
+        if (cfg.default_provider != null and cfg.default_model != null and
+            std.mem.eql(u8, cfg.default_provider.?, provider_id))
+        {
+            return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ provider_id, cfg.default_model.? }) catch null;
+        }
+        var all: []config.CatalogProvider = &.{};
+        var owned = false;
+        if (config.listCatalogProviders(self.alloc)) |l| {
+            all = l;
+            owned = true;
+        }
+        defer if (owned) config.freeCatalogProviders(self.alloc, all);
+        for (all) |p| {
+            if (std.mem.eql(u8, p.id, provider_id)) {
+                if (p.default_model.len > 0) {
+                    return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ provider_id, p.default_model }) catch null;
+                }
+                break;
+            }
+        }
+        // Fall back to the provider's first model.
+        for (cfg.models.items) |*m| {
+            if (std.mem.eql(u8, m.provider, provider_id)) {
+                return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ provider_id, m.id }) catch null;
+            }
+        }
+        return null;
+    }
+
+    /// Index of a model pointer in cfg.models (identity by provider+id).
+    fn indexOfModel(self: *TUI, target: *const config.Config.Model) ?usize {
+        const cfg = self.cfg orelse return null;
+        for (cfg.models.items, 0..) |*m, i| {
+            if (m == target) return i;
+            if (std.mem.eql(u8, m.provider, target.provider) and std.mem.eql(u8, m.id, target.id)) return i;
+        }
+        return null;
+    }
+
+    /// pi modelRuntime.logout: remove the stored credential (env vars and
+    /// models.json config are untouched).
+    pub fn logoutProvider(self: *TUI, provider_id: []const u8) void {
+        if (self.cfg) |cfg| {
+            config.removeAuthEntry(self.alloc, self.io, cfg.base_dir, provider_id) catch {
+                self.note("failed to update auth.json", .{});
+                return;
+            };
+            for (cfg.models.items) |*m| {
+                if (std.mem.eql(u8, m.provider, provider_id)) {
+                    const blank = self.alloc.dupe(u8, "") catch continue;
+                    self.alloc.free(m.api_key);
+                    m.api_key = blank;
+                }
+            }
+        }
+        const name = self.loginProviderDisplayName(provider_id);
+        defer if (name.ptr != provider_id.ptr) self.alloc.free(name);
+        self.note("Removed stored API key for {s}. Environment variables and models.json config are unchanged.", .{name});
+    }
+
+    /// Display name for a provider id: catalog entry when known, else the
+    /// id itself. Owned unless it aliases `provider_id` (the caller frees
+    /// only when the pointer differs).
+    fn loginProviderDisplayName(self: *TUI, provider_id: []const u8) []u8 {
+        if (config.listCatalogProviders(self.alloc)) |all| {
+            defer config.freeCatalogProviders(self.alloc, all);
+            for (all) |p| {
+                if (std.mem.eql(u8, p.id, provider_id)) {
+                    if (self.alloc.dupe(u8, p.name)) |owned| {
+                        return owned;
+                    } else |_| {}
+                }
+            }
+        }
+        return @constCast(provider_id);
     }
 
     fn openSettingsMenu(self: *TUI) void {
@@ -3841,7 +4316,8 @@ pub const TUI = struct {
         // component, default prompt "> "): render inset by 2 and let the
         // frame prepend the prompt prefix.
         const settings_search = self.menu_mode == .settings;
-        const modal_search = settings_search or self.menu_mode == .model_selector or self.menu_mode == .thinking_selector;
+        const modal_search = settings_search or self.menu_mode == .model_selector or self.menu_mode == .thinking_selector or
+            self.menu_mode == .login_select or self.menu_mode == .login_key or self.menu_mode == .logout_select;
         // MCP manager modal (pi ui.menu): replaces the editor line entirely.
         const mcp_modal = switch (self.menu_mode) {
             .mcp, .mcp_server, .mcp_tools, .mcp_exposure => true,
@@ -3870,7 +4346,9 @@ pub const TUI = struct {
         // at most 16 rows (pi select-list maxVisible).
         var menu_h: usize = if (self.menu_mode != .hidden and self.menu_mode != .scoped and
             self.menu_mode != .mcp and self.menu_mode != .mcp_server and
-            self.menu_mode != .mcp_tools and self.menu_mode != .mcp_exposure) @min(self.menu_len, self.menuMaxVisible()) else 0;
+            self.menu_mode != .mcp_tools and self.menu_mode != .mcp_exposure and
+            self.menu_mode != .login_select and self.menu_mode != .login_key and
+            self.menu_mode != .logout_select) @min(self.menu_len, self.menuMaxVisible()) else 0;
         // Session/tree pickers append a hint row after the entries.
         if (self.menu_mode == .sessions or self.menu_mode == .tree) menu_h += 1;
         // MCP manager chrome: title(+details) + items + hint inside borders.
@@ -3896,7 +4374,7 @@ pub const TUI = struct {
         // Login/logout selectors (pi OAuthSelectorComponent): title + search
         // line + list; the key dialog (LoginDialogComponent) shows title +
         // instructions instead.
-        const login_h: usize = if (self.menu_mode == .login_select or self.menu_mode == .logout_select or self.menu_mode == .login_method)
+        const login_h: usize = if (self.menu_mode == .login_select or self.menu_mode == .logout_select)
             self.loginViewHeight()
         else if (self.menu_mode == .login_key)
             self.loginKeyViewHeight()
@@ -4064,9 +4542,48 @@ pub const TUI = struct {
             if (!modal_search) {
                 frame.append(self.alloc, line) catch return;
             } else {
+                // pi LoginDialog Input type "secret": the key echoes as a
+                // fixed-width dot run (the length still leaks; that matches
+                // pi's masked editor rows).
+                var masked: ?[]u8 = null;
+                if (self.menu_mode == .login_key and self.login_secret and vis_top + vi == 0 and line.len > 0) {
+                    if (self.alloc.alloc(u8, line.len * 3)) |dots| {
+                        var di: usize = 0;
+                        var i: usize = 0;
+                        while (i < line.len) {
+                            const b = line[i];
+                            if (b == 0x1b) {
+                                // pass the SGR sequence through untouched
+                                var j = i + 1;
+                                if (j < line.len and line[j] == '[') {
+                                    j += 1;
+                                    while (j < line.len and !(line[j] >= 0x40 and line[j] <= 0x7e)) j += 1;
+                                    if (j < line.len) j += 1;
+                                } else if (di + 1 < dots.len) {
+                                    dots[di] = b;
+                                    di += 1;
+                                    j = i + 1;
+                                }
+                                i = j;
+                                continue;
+                            }
+                            // one UTF-8 rune → one bullet
+                            const rune_len = std.unicode.utf8ByteSequenceLength(b) catch 1;
+                            i += rune_len;
+                            const bullet = "\u{2022}";
+                            if (di + bullet.len <= dots.len) {
+                                @memcpy(dots[di .. di + bullet.len], bullet);
+                                di += bullet.len;
+                            }
+                        }
+                        masked = dots[0..di];
+                    } else |_| {}
+                }
+                const shown = if (masked) |m| m else line;
+                defer if (masked) |m| self.alloc.free(m);
                 const prefixed = std.fmt.allocPrint(self.alloc, "{s}{s}", .{
                     if (vis_top + vi == 0) "> " else "  ",
-                    line,
+                    shown,
                 }) catch {
                     frame.append(self.alloc, line) catch return;
                     continue;
@@ -4127,7 +4644,11 @@ pub const TUI = struct {
         // 3.9 Login/logout views (pi OAuthSelectorComponent +
         // LoginDialogComponent): title/search/list or the key-entry dialog.
         if (login_h > 0) {
-            self.renderLoginView(&frame);
+            if (self.menu_mode == .login_key) {
+                self.renderLoginKeyView(&frame);
+            } else {
+                self.renderLoginView(&frame);
+            }
         }
         // 3.75 MCP manager view (pi ui.menu): title/details header, item
         // rows, hint footer — all inside the editor borders.
@@ -4282,7 +4803,7 @@ pub const TUI = struct {
         // plain autocomplete menus (commands/models/files) keep the editor
         // in its normal editing state.
         switch (self.menu_mode) {
-            .settings, .scoped, .model_selector, .thinking_selector, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .login_select, .login_key, .login_method, .logout_select => return BORDER_INFO,
+            .settings, .scoped, .model_selector, .thinking_selector, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .login_select, .login_key, .logout_select => return BORDER_INFO,
             else => {},
         }
         return levelColor(self.session.thinking_level);
@@ -8260,58 +8781,25 @@ pub const TUI = struct {
             return false;
         }
 
-        // /login <provider> <api-key> — store a credential (pi /login: the
-        // interactive picker + secret prompt needs a text-input UI we don't
-        // have yet; the argument form covers api_key providers).
+        // pi handleLoginCommand: no argument opens the provider selector;
+        // a unique provider ref goes straight to its login dialog; an
+        // unknown ref falls back to the selector (prefiltered, pi
+        // showLoginProviderSelector(initialSearchInput)).
         if (std.mem.eql(u8, word, "/login")) {
-            var pid: ?[]const u8 = null;
-            var key: ?[]const u8 = null;
-            var it = std.mem.tokenizeAny(u8, arg, " \t");
-            if (it.next()) |a| pid = a;
-            if (it.next()) |k| key = k;
-            if (pid == null or key == null) {
-                self.note("usage: /login <provider> <api-key>", .{});
-            } else if (self.cfg) |c| {
-                config.saveAuthEntry(self.alloc, self.io, c.base_dir, pid.?, key.?) catch {
-                    self.note("failed to write auth.json", .{});
-                    self.redraw();
-                    return false;
-                };
-                // Apply immediately to models of that provider.
-                var n: usize = 0;
-                for (c.models.items) |*m| {
-                    if (std.ascii.eqlIgnoreCase(m.provider, pid.?)) {
-                        const copy = self.alloc.dupe(u8, key.?) catch continue;
-                        self.alloc.free(m.api_key);
-                        m.api_key = copy;
-                        n += 1;
-                    }
-                }
-                self.note("logged in to {s} ({d} models updated)", .{ pid.?, n });
+            const ref = std.mem.trim(u8, arg, " ");
+            if (ref.len > 0) {
+                if (self.login_arg) |a| self.alloc.free(a);
+                self.login_arg = self.alloc.dupe(u8, ref) catch null;
+                self.openLoginSelector(ref);
             } else {
-                self.note("no config loaded", .{});
+                self.openLoginSelector(null);
             }
-            self.redraw();
             return false;
         }
 
-        // /logout [provider] — drop a stored credential (default: current).
+        // pi showOAuthSelector("logout"): pick a stored credential to remove.
         if (std.mem.eql(u8, word, "/logout")) {
-            const pid = if (arg.len > 0) arg else self.session.model.provider;
-            if (self.cfg) |c| {
-                config.removeAuthEntry(self.alloc, self.io, c.base_dir, pid) catch {};
-                for (c.models.items) |*m| {
-                    if (std.mem.eql(u8, m.provider, pid)) {
-                        const blank = self.alloc.dupe(u8, "") catch continue;
-                        self.alloc.free(m.api_key);
-                        m.api_key = blank;
-                    }
-                }
-                self.note("logged out from {s}", .{pid});
-            } else {
-                self.note("no config loaded", .{});
-            }
-            self.redraw();
+            self.openLogoutSelector();
             return false;
         }
 
@@ -9472,6 +9960,85 @@ pub const TUI = struct {
                 }
                 continue; // swallow everything else while the selector is open
             }
+            if (self.menu_mode == .login_select or self.menu_mode == .logout_select) {
+                // Login/logout provider selector (pi OAuthSelectorComponent):
+                // arrows navigate; Enter activates; Esc cancels; printable
+                // keys edit the search (fuzzy filter).
+                if (self.bindings.matches(key, .menu_up)) {
+                    if (self.login_sel > 0) self.login_sel -= 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_down)) {
+                    if (self.login_sel + 1 < self.login_visible) self.login_sel += 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_close)) {
+                    self.closeLoginViews();
+                    self.menu_mode = .hidden;
+                    self.editor.clear() catch {};
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    self.loginSelectorActivate();
+                    continue;
+                }
+                switch (key) {
+                    .char => |c| {
+                        if (!c.ctrl and !c.alt and c.c >= 0x20 and c.c != 127) {
+                            self.editor.insertChar(c.c) catch {};
+                            self.login_sel = 0;
+                            self.loginRefilter();
+                            self.redraw();
+                            continue;
+                        }
+                    },
+                    .backspace => {
+                        const t = self.editor.getText() catch "";
+                        if (t.len > 0) {
+                            self.editor.replaceRange(t.len - 1, t.len, "") catch {};
+                            self.login_sel = 0;
+                            self.loginRefilter();
+                        }
+                        self.redraw();
+                        continue;
+                    },
+                    else => {},
+                }
+                continue; // swallow everything else while the selector is open
+            }
+            if (self.menu_mode == .login_key) {
+                // Key-entry dialog (pi LoginDialogComponent Input): Enter
+                // submits, Esc cancels back to the selector (onBack);
+                // printable keys type the key.
+                if (self.bindings.matches(key, .menu_close)) {
+                    self.menu_mode = .hidden;
+                    self.editor.clear() catch {};
+                    self.loginExitToArg();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    self.loginKeySubmit();
+                    continue;
+                }
+                switch (key) {
+                    .char => |c| {
+                        if (!c.ctrl and !c.alt and c.c >= 0x20 and c.c != 127) {
+                            self.editor.insertChar(c.c) catch {};
+                            self.redraw();
+                            continue;
+                        }
+                    },
+                    .backspace => {
+                        const t = self.editor.getText() catch "";
+                        if (t.len > 0) {
+                            self.editor.replaceRange(t.len - 1, t.len, "") catch {};
+                        }
+                        self.redraw();
+                        continue;
+                    },
+                    else => {},
+                }
+                continue; // swallow everything else while the dialog is open
+            }
             if (self.menu_mode == .settings) {
                 // Settings selector (pi SettingsSelectorComponent): the
                 // editor line is the search input; arrows navigate; Enter/
@@ -10105,3 +10672,53 @@ fn containsNoCase(haystack: []const u8, needle: []const u8) bool {
     }
     return false;
 }
+
+/// Test-only access to TUI internals (login/logout flows). Compiled in all
+/// builds but referenced only by the tests.
+pub const testAccess = struct {
+    pub const MenuMode = TUI.MenuMode;
+
+    pub fn menuMode(t: *const TUI) MenuMode {
+        return t.menu_mode;
+    }
+
+    pub fn loginCount(t: *const TUI) usize {
+        return t.login_visible;
+    }
+
+    pub fn loginSel(t: *const TUI) usize {
+        return t.login_sel;
+    }
+
+    pub fn loginName(t: *const TUI, i: usize) []const u8 {
+        return t.login_providers[t.login_filtered[i]].nameSlice();
+    }
+
+    pub fn loginId(t: *const TUI, i: usize) []const u8 {
+        return t.login_providers[t.login_filtered[i]].idSlice();
+    }
+
+    pub fn loginPromptName(t: *const TUI) []const u8 {
+        return t.loginKeyPromptName();
+    }
+
+    pub fn cfgOf(t: *const TUI) ?*config.Config {
+        return t.cfg;
+    }
+
+    pub fn sessionModelProvider(t: *const TUI) []const u8 {
+        return t.session.model.provider;
+    }
+
+    pub fn openLoginKeyDialogForTest(t: *TUI, provider_id: []const u8) void {
+        t.openLoginKeyDialog(provider_id);
+    }
+
+    pub fn typeKeyText(t: *TUI, text: []const u8) void {
+        for (text) |ch| t.editor.insertChar(ch) catch {};
+    }
+
+    pub fn submitLoginKey(t: *TUI) void {
+        t.loginKeySubmit();
+    }
+};

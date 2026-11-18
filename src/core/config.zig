@@ -579,32 +579,30 @@ pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, 
 pub fn saveAuthEntry(alloc: std.mem.Allocator, io: std.Io, base_dir: []const u8, provider: []const u8, key: []const u8) !void {
     const path = try std.fmt.allocPrint(alloc, "{s}/auth.json", .{base_dir});
     defer alloc.free(path);
-    var root: std.json.ObjectMap = .empty;
     var buf: [1 << 16]u8 = undefined;
-    if (std.Io.Dir.cwd().readFile(io, path, &buf)) |data| {
-        if (std.json.parseFromSlice(std.json.Value, alloc, data, .{})) |parsed| {
-            defer parsed.deinit();
-            if (parsed.value == .object) root = parsed.value.object;
-        } else |_| {}
-    } else |_| {}
-    // NOTE: root keys alias the parsed arena; rebuild the object with owned
-    // copies via stringify of a fresh value tree instead of mutating in place
-    // across allocators (the setEntryField lesson).
     var out = std.array_list.Managed(u8).init(alloc);
     defer out.deinit();
     try out.append('{');
     var wrote = false;
-    if (root.count() > 0) {
-        var it = root.iterator();
-        while (it.next()) |e| {
-            if (std.mem.eql(u8, e.key_ptr.*, provider)) continue; // replaced below
-            if (wrote) try out.append(',');
-            wrote = true;
-            try appendJsonStringField(&out, e.key_ptr.*, e.value_ptr.*);
-        }
-    }
+    // The existing entry keys alias the parsed arena, so the whole rebuild
+    // must happen INSIDE the parse scope (a `defer parsed.deinit()` on the
+    // inner if-block used to free the arena before the iterator ran — a
+    // dangling ObjectMap on every save with a non-empty auth.json).
+    if (std.Io.Dir.cwd().readFile(io, path, &buf)) |data| {
+        if (std.json.parseFromSlice(std.json.Value, alloc, data, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                var it = parsed.value.object.iterator();
+                while (it.next()) |e| {
+                    if (std.mem.eql(u8, e.key_ptr.*, provider)) continue; // replaced below
+                    if (wrote) try out.append(',');
+                    wrote = true;
+                    try appendJsonStringField(&out, e.key_ptr.*, e.value_ptr.*);
+                }
+            }
+        } else |_| {}
+    } else |_| {}
     if (wrote) try out.append(',');
-    wrote = true;
     try out.append('"');
     try out.appendSlice(provider);
     try out.appendSlice("\":{\"type\":\"api_key\",\"key\":");
@@ -637,6 +635,39 @@ pub fn removeAuthEntry(alloc: std.mem.Allocator, io: std.Io, base_dir: []const u
     }
     try out.append('}');
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+}
+
+/// All provider ids that have a stored credential in auth.json, sorted.
+/// Owned slice; pi listCredentials (the /logout selector shows exactly
+/// these — credentials saved by /login).
+pub fn listAuthProviders(alloc: std.mem.Allocator, io: std.Io, base_dir: []const u8) ?[][]const u8 {
+    const path = std.fmt.allocPrint(alloc, "{s}/auth.json", .{base_dir}) catch return null;
+    defer alloc.free(path);
+    var buf: [1 << 16]u8 = undefined;
+    const data = std.Io.Dir.cwd().readFile(io, path, &buf) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    var list = std.array_list.Managed([]const u8).init(alloc);
+    var it = parsed.value.object.iterator();
+    while (it.next()) |e| {
+        const id = alloc.dupe(u8, e.key_ptr.*) catch continue;
+        list.append(id) catch {
+            alloc.free(id);
+            continue;
+        };
+    }
+    const items = list.toOwnedSlice() catch {
+        for (list.items) |id| alloc.free(id);
+        list.deinit();
+        return null;
+    };
+    std.mem.sort([]const u8, items, {}, struct {
+        fn f(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.f);
+    return items;
 }
 
 /// Copy a JSON value (from a parsed arena) into `out` as `"key":value`.
@@ -1105,74 +1136,14 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                     continue;
                 }
 
-                const prov_base = Catalog.str(po, "baseUrl") orelse "";
-                var added = false;
-                if (po.get("models")) |mv| {
-                    switch (mv) {
-                        .array => |marr| {
-                            for (marr.items) |mi| {
-                                const mo = switch (mi) {
-                                    .object => |o| o,
-                                    else => continue,
-                                };
-                                const mid = Catalog.str(mo, "id") orelse continue;
-                                const m_api = Catalog.str(mo, "api") orelse "openai-completions";
-                                const m_base = Catalog.str(mo, "baseUrl") orelse prov_base;
-                                if (m_base.len == 0) continue;
-                                try cfg.models.append(.{
-                                    .provider = try alloc.dupe(u8, pid),
-                                    .id = try alloc.dupe(u8, mid),
-                                    .name = try alloc.dupe(u8, Catalog.str(mo, "name") orelse mid),
-                                    .base_url = try alloc.dupe(u8, m_base),
-                                    .api = try alloc.dupe(u8, m_api),
-                                    .api_key = try alloc.dupe(u8, key),
-                                    .context_window = @intCast(numIn(mo, "ctx") orelse 128000),
-                                    .max_tokens = @intCast(numIn(mo, "max") orelse 16384),
-                                    .reasoning = boolIn(mo, "reasoning", false),
-                                    .thinking_level = if (boolIn(mo, "reasoning", false)) ThinkingLevel.high else .off,
-                                    .thinking_format = blk_ctf: {
-                                        const tf = Catalog.str(mo, "tf") orelse break :blk_ctf .default;
-                                        if (std.mem.eql(u8, tf, "zai")) break :blk_ctf .zai;
-                                        if (std.mem.eql(u8, tf, "qwen")) break :blk_ctf .qwen;
-                                        if (std.mem.eql(u8, tf, "qwen-chat-template")) break :blk_ctf .qwen_chat_template;
-                                        break :blk_ctf .default;
-                                    },
-                                    .supports_images = boolIn(mo, "images", true),
-                                    .thinking_level_map = blk_cmap: {
-                                        var map = [6]?[]u8{null, null, null, null, null, null};
-                                        if (mo.get("map")) |tm| {
-                                            if (tm == .object) {
-                                                for (&map, 0..) |*slot, li| {
-                                                    const lv_name = @as(ThinkingLevel, @enumFromInt(li)).name();
-                                                    if (tm.object.get(lv_name)) |v| {
-                                                        if (v == .string) slot.* = alloc.dupe(u8, v.string) catch null;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        break :blk_cmap map;
-                                    },
-                                    // catalog.json stores rates flat (USD per
-                                    // million), unlike models.json's nested cost
-                                    // object.
-                                    .cost_input = floatIn(mo, "ci"),
-                                    .cost_output = floatIn(mo, "co"),
-                                    .cost_cache_read = floatIn(mo, "cr"),
-                                    .cost_cache_write = floatIn(mo, "cw"),
-                                });
-                                added = true;
-                            }
-                        },
-                        else => {},
-                    }
-                }
-                if (!added and is_default) {
+                const added = try appendCatalogModels(alloc, &cfg, po, pid, key);
+                if (added == 0 and is_default) {
                     if (cfg.default_model) |dm| {
                         try cfg.models.append(.{
                             .provider = try alloc.dupe(u8, pid),
                             .id = try alloc.dupe(u8, dm),
                             .name = try alloc.dupe(u8, dm),
-                            .base_url = try alloc.dupe(u8, prov_base),
+                            .base_url = try alloc.dupe(u8, Catalog.str(po, "baseUrl") orelse ""),
                             .api = try alloc.dupe(u8, "openai-completions"),
                             .api_key = try alloc.dupe(u8, key),
                         });
@@ -1242,6 +1213,165 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
     }
 
     return cfg;
+}
+
+/// Append every catalog model of provider `pid` (object `po`) to `cfg.models`
+/// with `key` as the resolved credential. Returns the number of models added.
+/// Shared by loadConfig (startup) and addProviderModels (/login refresh,
+/// pi modelRuntime.refresh for the freshly authenticated provider).
+fn appendCatalogModels(alloc: std.mem.Allocator, cfg: *Config, po: std.json.ObjectMap, pid: []const u8, key: []const u8) !usize {
+    const prov_base = Catalog.str(po, "baseUrl") orelse "";
+    var added: usize = 0;
+    const mv = po.get("models") orelse return 0;
+    const marr = switch (mv) {
+        .array => |a| a,
+        else => return 0,
+    };
+    for (marr.items) |mi| {
+        const mo = switch (mi) {
+            .object => |o| o,
+            else => continue,
+        };
+        if (try appendCatalogModel(alloc, cfg, mo, pid, prov_base, key)) added += 1;
+    }
+    return added;
+}
+
+/// Append one catalog model object to cfg.models; false when the object has
+/// no usable id/baseUrl.
+fn appendCatalogModel(alloc: std.mem.Allocator, cfg: *Config, mo: std.json.ObjectMap, pid: []const u8, prov_base: []const u8, key: []const u8) !bool {
+    const mid = Catalog.str(mo, "id") orelse return false;
+    const m_api = Catalog.str(mo, "api") orelse "openai-completions";
+    const m_base = Catalog.str(mo, "baseUrl") orelse prov_base;
+    if (m_base.len == 0) return false;
+    try cfg.models.append(.{
+        .provider = try alloc.dupe(u8, pid),
+        .id = try alloc.dupe(u8, mid),
+        .name = try alloc.dupe(u8, Catalog.str(mo, "name") orelse mid),
+        .base_url = try alloc.dupe(u8, m_base),
+        .api = try alloc.dupe(u8, m_api),
+        .api_key = try alloc.dupe(u8, key),
+        .context_window = @intCast(numIn(mo, "ctx") orelse 128000),
+        .max_tokens = @intCast(numIn(mo, "max") orelse 16384),
+        .reasoning = boolIn(mo, "reasoning", false),
+        .thinking_level = if (boolIn(mo, "reasoning", false)) ThinkingLevel.high else .off,
+        .thinking_format = blk_ctf: {
+            const tf = Catalog.str(mo, "tf") orelse break :blk_ctf .default;
+            if (std.mem.eql(u8, tf, "zai")) break :blk_ctf .zai;
+            if (std.mem.eql(u8, tf, "qwen")) break :blk_ctf .qwen;
+            if (std.mem.eql(u8, tf, "qwen-chat-template")) break :blk_ctf .qwen_chat_template;
+            break :blk_ctf .default;
+        },
+        .supports_images = boolIn(mo, "images", true),
+        .thinking_level_map = blk_cmap: {
+            var map = [6]?[]u8{null, null, null, null, null, null};
+            if (mo.get("map")) |tm| {
+                if (tm == .object) {
+                    for (&map, 0..) |*slot, li| {
+                        const lv_name = @as(ThinkingLevel, @enumFromInt(li)).name();
+                        if (tm.object.get(lv_name)) |v| {
+                            if (v == .string) slot.* = alloc.dupe(u8, v.string) catch null;
+                        }
+                    }
+                }
+            }
+            break :blk_cmap map;
+        },
+        // catalog.json stores rates flat (USD per million), unlike
+        // models.json's nested cost object.
+        .cost_input = floatIn(mo, "ci"),
+        .cost_output = floatIn(mo, "co"),
+        .cost_cache_read = floatIn(mo, "cr"),
+        .cost_cache_write = floatIn(mo, "cw"),
+    });
+    return true;
+}
+
+/// One row of the /login provider selector (pi OAuthSelectorComponent's
+/// provider options): id, display name, env var, default model id.
+pub const CatalogProvider = struct {
+    id: []u8,
+    name: []u8,
+    env: []u8,
+    default_model: []u8,
+};
+
+/// All built-in catalog providers, owned. null when the catalog is missing
+/// or unreadable (TUI falls back to cfg.models providers only).
+pub fn listCatalogProviders(alloc: std.mem.Allocator) ?[]CatalogProvider {
+    var cat = parseCatalog(alloc) orelse return null;
+    defer cat.parsed.deinit();
+    const arr = cat.providers() orelse return null;
+    var list = std.array_list.Managed(CatalogProvider).init(alloc);
+    errdefer {
+        for (list.items) |p| {
+            alloc.free(p.id);
+            alloc.free(p.name);
+            alloc.free(p.env);
+            alloc.free(p.default_model);
+        }
+        list.deinit();
+    }
+    for (arr.items) |item| {
+        const po = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const pid = Catalog.str(po, "id") orelse continue;
+        list.append(.{
+            .id = alloc.dupe(u8, pid) catch continue,
+            .name = alloc.dupe(u8, Catalog.str(po, "name") orelse pid) catch continue,
+            .env = alloc.dupe(u8, Catalog.str(po, "env") orelse "") catch continue,
+            .default_model = alloc.dupe(u8, Catalog.str(po, "defaultModel") orelse "") catch continue,
+        }) catch break;
+    }
+    return list.toOwnedSlice() catch null;
+}
+
+pub fn freeCatalogProviders(alloc: std.mem.Allocator, list: []CatalogProvider) void {
+    for (list) |p| {
+        alloc.free(p.id);
+        alloc.free(p.name);
+        alloc.free(p.env);
+        alloc.free(p.default_model);
+    }
+    alloc.free(list);
+}
+
+/// Load every catalog model of `provider_id` into cfg.models with `key` as
+/// the credential (pi completeProviderAuthentication: the freshly stored
+/// credential makes the provider's models available immediately). Models
+/// already present for the provider keep their entries (dedup on id).
+pub fn addProviderModels(alloc: std.mem.Allocator, cfg: *Config, provider_id: []const u8, key: []const u8) !usize {
+    var cat = parseCatalog(alloc) orelse return error.NoCatalog;
+    defer cat.parsed.deinit();
+    const po = cat.find(provider_id) orelse return error.UnknownProvider;
+    const prov_base = Catalog.str(po, "baseUrl") orelse "";
+    var n: usize = 0;
+    const mv = po.get("models") orelse return 0;
+    const marr = switch (mv) {
+        .array => |a| a,
+        else => return 0,
+    };
+    for (marr.items) |mi| {
+        const mo = switch (mi) {
+            .object => |o| o,
+            else => continue,
+        };
+        const mid = Catalog.str(mo, "id") orelse continue;
+        // Skip ids the provider already has (e.g. a synthesized settings
+        // default model from section 6 of loadConfig).
+        var dup = false;
+        for (cfg.models.items) |*m| {
+            if (std.mem.eql(u8, m.provider, provider_id) and std.mem.eql(u8, m.id, mid)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (try appendCatalogModel(alloc, cfg, mo, provider_id, prov_base, key)) n += 1;
+    }
+    return n;
 }
 
 fn freeDefaultTools(alloc: std.mem.Allocator, tools_list: []const []const u8) void {
