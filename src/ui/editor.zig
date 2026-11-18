@@ -18,6 +18,15 @@ const wmod = @import("width.zig");
 
 pub const EditorAction = enum { none, submit };
 
+// Whether the CURRENT thread already holds the editor mutex. The editor is
+// mutated by the main loop (key dispatch, no render_mutex) while the spinner
+// thread renders it (render/cursorVisualPos → wrappedView, under render_mutex).
+// wrappedView's non-atomic read-check-free-rebuild raced a concurrent mutation
+// and double-freed (crash during compaction, when the main loop is unblocked
+// polling compact_done). This flag makes the guard reentrant so a public
+// method may call another (handleKey → insertChar) without deadlocking.
+threadlocal var editor_guard_held: bool = false;
+
 /// A LOGICAL point in the editor: line = logical line index, col = byte
 /// offset within that line. Selections are stored in logical coordinates so
 /// they stay correct regardless of the wrap width used for rendering; the
@@ -54,9 +63,19 @@ pub const Editor = struct {
     wrap_cache_width: usize = 0,
     wrap_cache_gen: u64 = 0,
     wrap_gen: u64 = 0,
+    /// Serializes every access to the buffer + wrap cache + selection (see
+    /// the file-top comment for the race this closes). A spinlock (atomic
+    /// CAS) rather than std.Io.Mutex: a mutex needs the CALLING thread's io
+    /// for its futex, but the editor is touched from several threads (main
+    /// loop + spinner) that each own a different io — a spinlock has no io
+    /// dependency, and the critical sections are short (wrap rebuild / line
+    /// splice). Lock order: render_mutex → this lock.
+    lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Clear any active mouse selection.
     pub fn clearSelection(self: *Editor) void {
+        const lk = self.guard();
+        defer lk.unlock();
         self.sel_anchor = null;
         self.sel_focus = null;
     }
@@ -128,7 +147,35 @@ pub const Editor = struct {
         return e;
     }
 
+    /// RAII guard for the editor lock.
+    const Guard = struct {
+        e: *Editor,
+        acquired: bool,
+        fn unlock(g: Guard) void {
+            if (g.acquired) {
+                editor_guard_held = false;
+                g.e.lock.store(0, .release);
+            }
+        }
+    };
+
+    /// Take the editor lock for the duration of a public method. Reentrant
+    /// (a public method may call another, e.g. handleKey → insertChar) via
+    /// the threadlocal flag. Returns a guard; call `.unlock()` in a `defer`.
+    fn guard(self: *Editor) Guard {
+        if (editor_guard_held) return .{ .e = self, .acquired = false };
+        // Spin: the critical sections are short (a wrap rebuild or a line
+        // splice), so a brief spin is cheaper than a futex and needs no io.
+        while (self.lock.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+        editor_guard_held = true;
+        return .{ .e = self, .acquired = true };
+    }
+
     pub fn deinit(self: *Editor) void {
+        const lk = self.guard();
+        defer lk.unlock();
         self.invalidateWrapCache();
         self.freeLines(&self.lines);
         self.lines.deinit();
@@ -144,7 +191,9 @@ pub const Editor = struct {
     }
 
     /// The full text (lines joined with '\n'). Owned.
-    pub fn getText(self: *const Editor) ![]u8 {
+    pub fn getText(self: *Editor) ![]u8 {
+        const lk = self.guard();
+        defer lk.unlock();
         var total: usize = 0;
         for (self.lines.items) |l| total += l.len + 1;
         if (self.lines.items.len > 0) total -= 1;
@@ -161,19 +210,25 @@ pub const Editor = struct {
         return out;
     }
 
-    pub fn getTextLen(self: *const Editor) usize {
+    pub fn getTextLen(self: *Editor) usize {
+        const lk = self.guard();
+        defer lk.unlock();
         var total: usize = 0;
         for (self.lines.items) |l| total += l.len + 1;
         if (self.lines.items.len > 0) total -= 1;
         return total;
     }
 
-    pub fn isEmpty(self: *const Editor) bool {
+    pub fn isEmpty(self: *Editor) bool {
+        const lk = self.guard();
+        defer lk.unlock();
         return self.lines.items.len == 1 and self.lines.items[0].len == 0;
     }
 
     /// Reset the editor to a single empty line (and exit history browsing).
     pub fn clear(self: *Editor) !void {
+        const lk = self.guard();
+        defer lk.unlock();
         self.invalidateWrapCache();
         self.freeLines(&self.lines);
         self.lines.clearRetainingCapacity();
@@ -186,13 +241,17 @@ pub const Editor = struct {
     }
 
     /// Visual cursor position within the editor (0-based line and column).
-    pub fn cursorPos(self: *const Editor) struct { row: usize, col: usize } {
+    pub fn cursorPos(self: *Editor) struct { row: usize, col: usize } {
+        const lk = self.guard();
+        defer lk.unlock();
         return .{ .row = self.cursor_line, .col = self.cursor_col };
     }
 
     /// Borrow the text on the cursor's line before the cursor column
     /// (null when the cursor column is out of range for that line).
-    pub fn lineBeforeCursor(self: *const Editor) ?[]const u8 {
+    pub fn lineBeforeCursor(self: *Editor) ?[]const u8 {
+        const lk = self.guard();
+        defer lk.unlock();
         const line = self.lines.items[self.cursor_line];
         if (self.cursor_col > line.len) return null;
         return line[0..self.cursor_col];
@@ -201,6 +260,8 @@ pub const Editor = struct {
     /// Replace range [start, end) of the cursor's line with `insertion`
     /// and park the cursor after it (file-completion application).
     pub fn replaceRange(self: *Editor, start: usize, end: usize, insertion: []const u8) !void {
+        const lk = self.guard();
+        defer lk.unlock();
         self.invalidateWrapCache();
         const line = self.lines.items[self.cursor_line];
         if (end > line.len or start > end) return error.BadRange;
@@ -213,13 +274,17 @@ pub const Editor = struct {
     /// Visual column of the cursor (wide-char aware). `cursor_col` is a byte
     /// offset, but CJK chars occupy 2 columns, so the hardware cursor must be
     /// positioned by the visual width of the line prefix, not the byte count.
-    pub fn cursorVisualCol(self: *const Editor) u32 {
+    pub fn cursorVisualCol(self: *Editor) u32 {
+        const lk = self.guard();
+        defer lk.unlock();
         const line = self.lines.items[self.cursor_line];
         const end = if (self.cursor_col < line.len) self.cursor_col else line.len;
         return wmod.visualWidth(line[0..end]);
     }
 
-    pub fn lineCount(self: *const Editor) usize {
+    pub fn lineCount(self: *Editor) usize {
+        const lk = self.guard();
+        defer lk.unlock();
         return self.lines.items.len;
     }
 
@@ -228,6 +293,8 @@ pub const Editor = struct {
     /// Populates the wrap cache (render runs before every mouse gesture,
     /// so the gesture handlers hit the warm cache).
     pub fn render(self: *Editor, width: usize) !std.ArrayListUnmanaged([]u8) {
+        const lk = self.guard();
+        defer lk.unlock();
         var out: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
             for (out.items) |l| self.alloc.free(l);
@@ -246,7 +313,9 @@ pub const Editor = struct {
 
     /// The ordered selection bounds in logical coordinates, or null when
     /// empty.
-    pub fn selBounds(self: *const Editor) ?EditorSelBounds {
+    pub fn selBounds(self: *Editor) ?EditorSelBounds {
+        const lk = self.guard();
+        defer lk.unlock();
         const a = self.sel_anchor orelse return null;
         const f = self.sel_focus orelse return null;
         if (a.line == f.line and a.col == f.col) return null;
@@ -277,6 +346,8 @@ pub const Editor = struct {
     /// placement/selection; `width` MUST match the width the TUI rendered
     /// the editor at (the wrap boundary depends on it).
     pub fn visualToLogical(self: *Editor, vrow: usize, vcol: u32, width: usize) EditorSelPt {
+        const lk = self.guard();
+        defer lk.unlock();
         const wrapped = self.wrappedView(width) catch return .{ .line = 0, .col = 0 };
         if (vrow >= wrapped.len) {
             // Past the last visual line: park at the last line's end.
@@ -312,6 +383,8 @@ pub const Editor = struct {
     /// logical line) under the pointer. Word = [A-Za-z0-9_] run, or any
     /// multi-byte (CJK etc.) character run. `line` = true for triple click.
     pub fn selectWordOrLine(self: *Editor, vrow: usize, vcol: u32, width: usize, line: bool) void {
+        const lk = self.guard();
+        defer lk.unlock();
         const p = self.visualToLogical(vrow, vcol, width);
         if (p.line >= self.lines.items.len) return;
         if (line) {
@@ -353,12 +426,16 @@ pub const Editor = struct {
 
     /// Total wrapped visual line count at `width` (cache warm-up).
     pub fn visualLineCount(self: *Editor, width: usize) usize {
+        const lk = self.guard();
+        defer lk.unlock();
         const view = self.wrappedView(width) catch return 1;
         return @max(view.len, 1);
     }
 
     /// Place the cursor at a visual point (see visualToLogical).
     pub fn placeCursor(self: *Editor, vrow: usize, vcol: u32, width: usize) void {
+        const lk = self.guard();
+        defer lk.unlock();
         const p = self.visualToLogical(vrow, vcol, width);
         self.cursor_line = p.line;
         self.cursor_col = p.col;
@@ -366,7 +443,9 @@ pub const Editor = struct {
 
     /// Plain text of the current selection (logical lines joined with \n),
     /// or null when empty. Owned.
-    pub fn selectionText(self: *const Editor) ?[]u8 {
+    pub fn selectionText(self: *Editor) ?[]u8 {
+        const lk = self.guard();
+        defer lk.unlock();
         const b = self.selBounds() orelse return null;
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.alloc);
@@ -400,6 +479,8 @@ pub const Editor = struct {
     }
 
     pub fn highlightSelection(self: *Editor, frame: *std.ArrayListUnmanaged([]u8), base: usize, count: usize, vis_top: usize, width: usize, alloc: std.mem.Allocator) void {
+        const lk = self.guard();
+        defer lk.unlock();
         const b = self.selBounds() orelse return;
         const wrapped = self.wrappedView(width) catch return;
         const rows = self.wrap_cache_rows orelse return;
@@ -430,6 +511,8 @@ pub const Editor = struct {
     /// The cursor's position in VISUAL (wrapped) coordinates: (row, col).
     /// row = the visual line the cursor is on; col = visual column within it.
     pub fn cursorVisualPos(self: *Editor, width: usize) struct { row: u32, col: u32 } {
+        const lk = self.guard();
+        defer lk.unlock();
         const wrapped = self.wrappedView(width) catch return .{ .row = 0, .col = 0 };
         const rows = self.wrap_cache_rows orelse return .{ .row = 0, .col = 0 };
         if (self.cursor_line >= rows.len) return .{ .row = 0, .col = 0 };
@@ -453,6 +536,8 @@ pub const Editor = struct {
 
     /// Handle a key. Returns `.submit` if the user pressed Enter to submit.
     pub fn handleKey(self: *Editor, key: keys.Key, io: std.Io) !EditorAction {
+        const lk = self.guard();
+        defer lk.unlock();
         _ = io; // file completion lives in the TUI's file menu now
         // NB: no blanket clearSelection() here — only TEXT-CHANGING actions
         // drop the selection (standard editor behavior: typing/backspace
@@ -530,6 +615,8 @@ pub const Editor = struct {
 
     /// Add a submitted prompt to history (most recent first, no consecutive dups).
     pub fn addToHistory(self: *Editor, text: []const u8) void {
+        const lk = self.guard();
+        defer lk.unlock();
         const trimmed = std.mem.trim(u8, text, " \t\n");
         if (trimmed.len == 0) return;
         if (self.history.items.len > 0 and std.mem.eql(u8, self.history.items[0], trimmed)) return;
@@ -595,11 +682,15 @@ pub const Editor = struct {
     }
 
     pub fn clearSelectionAndSetText(self: *Editor, text: []const u8) !void {
+        const lk = self.guard();
+        defer lk.unlock();
         self.clearSelection();
         return self.setText(text);
     }
 
     pub fn setText(self: *Editor, text: []const u8) !void {
+        const lk = self.guard();
+        defer lk.unlock();
         self.invalidateWrapCache();
         self.freeLines(&self.lines);
         self.lines.clearRetainingCapacity();
@@ -613,6 +704,8 @@ pub const Editor = struct {
     }
 
     pub fn insertChar(self: *Editor, c: u8) !void {
+        const lk = self.guard();
+        defer lk.unlock();
         self.invalidateWrapCache();
         // Defensive: never let control characters (ESC, CSI fragments from torn
         // mouse sequences, etc.) into the buffer.
@@ -639,6 +732,8 @@ pub const Editor = struct {
 
     /// Insert a multi-byte UTF-8 sequence (CJK, emoji) at the cursor.
     pub fn insertBytes(self: *Editor, bytes: []const u8) !void {
+        const lk = self.guard();
+        defer lk.unlock();
         for (bytes) |b| {
             if (b < 0x20 and b != '\n') return;
             if (b == 0x7f) return;
@@ -667,6 +762,8 @@ pub const Editor = struct {
     /// single-line text inserts at the cursor, multi-line text is split on
     /// \n and spliced into the buffer. Trailing \r (CRLF paste) is dropped.
     pub fn pasteText(self: *Editor, text: []const u8) !void {
+        const lk = self.guard();
+        defer lk.unlock();
         self.invalidateWrapCache();
         const body = if (std.mem.endsWith(u8, text, "\n") and text.len > 0) text[0 .. text.len - 1] else text;
         var count: usize = 1;
@@ -901,6 +998,8 @@ pub const Editor = struct {
     }
 
     pub fn newLine(self: *Editor) !void {
+        const lk = self.guard();
+        defer lk.unlock();
         self.invalidateWrapCache();
         const line = self.lines.items[self.cursor_line];
         const after = line[self.cursor_col..];
@@ -1117,4 +1216,53 @@ test "editor deleteToLineEnd" {
     const text = e.getText() catch unreachable;
     defer alloc.free(text);
     try std.testing.expectEqualStrings("a", text);
+}
+
+// The compaction crash: the spinner thread rendered the editor (render /
+// cursorVisualPos → wrappedView, which frees and rebuilds the wrap cache)
+// while the main loop mutated the buffer from key dispatch. Without the
+// internal mutex the two raced on wrap_cache and double-freed
+// (malloc: POINTER BEING FREED WAS NOT ALLOCATED). This test reproduces the
+// exact thread topology and must stay crash-free under the allocator.
+fn renderHammer(e: *Editor, stop: *std.atomic.Value(bool)) void {
+    var w: usize = 20;
+    while (!stop.load(.acquire)) {
+        var v = e.render(w) catch continue;
+        _ = e.cursorVisualPos(w);
+        for (v.items) |l| e.alloc.free(l);
+        v.deinit(e.alloc);
+        w += 1; // force a cache rebuild on nearly every frame
+        if (w > 60) w = 20;
+    }
+}
+
+test "editor: concurrent render and mutation do not corrupt the wrap cache" {
+    // smp_allocator is thread-safe (SafeAllocator is not: two threads
+    // allocating/freing concurrently would corrupt its bookkeeping).
+    const alloc = std.heap.smp_allocator;
+    var e = Editor.init(alloc);
+    defer e.deinit();
+    e.setText("the quick brown fox jumps over the lazy dog") catch unreachable;
+    var stop = std.atomic.Value(bool).init(false);
+    const t = std.Thread.spawn(.{}, renderHammer, .{ &e, &stop }) catch return;
+    // The main thread types, backspaces and clears — the exact key-dispatch
+    // mutations that raced the spinner's wrappedView during compaction. Only
+    // PUBLIC methods are used (they take the lock); handleKey is the entry
+    // point the TUI's key dispatch uses.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var i: u32 = 0;
+    while (i < 2000) : (i += 1) {
+        _ = e.handleKey(.{ .char = .{ .ctrl = false, .alt = false, .c = 'x' } }, io) catch break;
+        if (i % 7 == 0) _ = e.handleKey(.backspace, io) catch break;
+        if (i % 50 == 0) {
+            e.clear() catch break;
+            e.setText("line one\nline two is a bit longer") catch break;
+        }
+    }
+    stop.store(true, .release);
+    t.join();
+    // The buffer must still be intact (no torn reads / double frees).
+    const text = e.getText() catch unreachable;
+    defer alloc.free(text);
+    try std.testing.expect(text.len > 0);
 }
