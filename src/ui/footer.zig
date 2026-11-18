@@ -102,7 +102,18 @@ pub fn statsLine(alloc: std.mem.Allocator, stats: Stats, model: Model, width: us
     const ctx_color: []const u8 = if (percent > 90) FG_ERROR else if (percent > 70) FG_WARNING else "";
 
     // The model, with the provider when there is room for it.
-    const left_w = wmod.visualWidth(left.items) + wmod.visualWidth(ctx);
+    // On a narrow terminal the LEFT side itself can exceed the width — the
+    // row would then autowrap and shift every chained frame row down one
+    // screen row (the diff renderer desyncs). Truncate left, then ctx.
+    var left_text: []const u8 = left.items;
+    var ctx_text: []const u8 = ctx;
+    var left_w: usize = wmod.visualWidth(left_text);
+    if (left_w > width) {
+        left_text = truncateColumns(left_text, width);
+        left_w = width;
+    }
+    const room_ctx = width - left_w;
+    if (wmod.visualWidth(ctx_text) > room_ctx) ctx_text = truncateColumns(ctx_text, room_ctx);
     const plain_right = try rightSide(alloc, model, false);
     defer alloc.free(plain_right);
     var right: []const u8 = plain_right;
@@ -110,28 +121,34 @@ pub fn statsLine(alloc: std.mem.Allocator, stats: Stats, model: Model, width: us
     defer if (with_provider) |r| alloc.free(r);
     if (model.provider != null) {
         with_provider = try rightSide(alloc, model, true);
-        if (left_w + MIN_PADDING + wmod.visualWidth(with_provider.?) <= width) right = with_provider.?;
+        if (left_w + wmod.visualWidth(ctx_text) + MIN_PADDING + wmod.visualWidth(with_provider.?) <= width) right = with_provider.?;
     }
     // Not enough room: cut the model short, or drop it.
-    if (left_w + MIN_PADDING + wmod.visualWidth(right) > width) {
-        const room = if (width > left_w + MIN_PADDING) width - left_w - MIN_PADDING else 0;
+    if (left_w + wmod.visualWidth(ctx_text) + MIN_PADDING + wmod.visualWidth(right) > width) {
+        const room = if (width > left_w + wmod.visualWidth(ctx_text) + MIN_PADDING)
+            width - left_w - wmod.visualWidth(ctx_text) - MIN_PADDING
+        else
+            0;
         right = truncateColumns(right, room);
     }
     const right_w = wmod.visualWidth(right);
-    const padding = if (width > left_w + right_w) width - left_w - right_w else 0;
+    const padding = if (width > left_w + wmod.visualWidth(ctx_text) + right_w)
+        width - left_w - wmod.visualWidth(ctx_text) - right_w
+    else
+        0;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, FG_DIM);
-    try out.appendSlice(alloc, left.items);
+    try out.appendSlice(alloc, left_text);
     if (ctx_color.len > 0) {
         // The color's reset ends the dim as well; start it again after.
         try out.appendSlice(alloc, ctx_color);
-        try out.appendSlice(alloc, ctx);
+        try out.appendSlice(alloc, ctx_text);
         try out.appendSlice(alloc, RESET);
         try out.appendSlice(alloc, FG_DIM);
     } else {
-        try out.appendSlice(alloc, ctx);
+        try out.appendSlice(alloc, ctx_text);
     }
     try out.appendNTimes(alloc, ' ', padding);
     try out.appendSlice(alloc, right);

@@ -1272,3 +1272,210 @@ test "frame: the painted frame always fills the full terminal height" {
     }
     try std.testing.expectEqual(n + (t.height - n), clears);
 }
+
+// ---- Regression: the 2026-11 "squeezed borders / missing bottom border /
+// stranded stale row" corruption ----
+
+/// Largest CUP row (`ESC[<row>;<col>H`) referenced by a frame's byte stream.
+/// Painting past the terminal's last row clamps onto it and chained \r\n
+/// from there scrolls the whole screen — the diff model desyncs permanently.
+fn maxCupRow(bytes: []const u8) usize {
+    var max_row: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, bytes, i, 0x1b)) |p| {
+        i = p + 1;
+        if (i >= bytes.len or bytes[i] != '[') continue;
+        i += 1;
+        var row: usize = 0;
+        var saw_digit = false;
+        while (i < bytes.len and bytes[i] >= '0' and bytes[i] <= '9') : (i += 1) {
+            row = row * 10 + (bytes[i] - '0');
+            saw_digit = true;
+        }
+        if (saw_digit and i < bytes.len and bytes[i] == ';') max_row = @max(max_row, row);
+    }
+    return max_row;
+}
+
+fn frameRowWidth(s: []const u8) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b) {
+            i += 1;
+            if (i >= s.len) break;
+            if (s[i] == '[') {
+                i += 1;
+                while (i < s.len and !(s[i] >= 0x40 and s[i] <= 0x7E)) i += 1;
+                i = @min(i + 1, s.len);
+            } else if (s[i] == ']') {
+                i += 1;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] == 0x07) {
+                        i += 1;
+                        break;
+                    }
+                    if (s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '\\') {
+                        i += 2;
+                        break;
+                    }
+                }
+            } else i += 1;
+            continue;
+        }
+        const end = width.nextCharEnd(s, i);
+        total += width.visualWidth(s[i..end]);
+        i = end;
+    }
+    return total;
+}
+
+test "frame: every row fits the width in every layout state (no terminal autowrap)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+
+    t.editor.setText("你好世界 hello\n\n这是一段比较长的中文输入用来测试自动换行在编辑器宽度边界附近的行为是否正确") catch unreachable;
+    t.addMessage("# 中文标题\n\n---\n\n- 列表项一 带有很长的中文描述文字用来测试换行行为\n");
+    try t.compact_queue.append(.{ .text = try alloc.dupe(u8, "压缩中的长消息\n第二行"), .mode = .steer });
+
+    var w: u16 = 12;
+    while (w <= 130) : (w += 1) {
+        t.width = w;
+        t.height = 24;
+
+        t.redraw();
+        for (t.prev_lines.items, 0..) |l, i| {
+            const fw = frameRowWidth(l);
+            if (fw > w) {
+                std.debug.print("\nwidth {d} row {d}: {d} > {d}: {s}", .{ w, i, fw, w, l[0..@min(l.len, 120)] });
+                return error.FrameRowTooWide;
+            }
+        }
+
+        t.working = true;
+        const q1 = try alloc.dupe(u8, "继续 修复一下 TUI 的 BUG");
+        try session.steering_queue.append(alloc, q1);
+        t.redraw();
+        for (t.prev_lines.items) |l| {
+            if (frameRowWidth(l) > w) return error.FrameRowTooWide;
+        }
+        session.steering_queue.clearRetainingCapacity();
+
+        const q2 = try alloc.dupe(u8, "压缩中的长消息\n第二行");
+        try t.compact_queue.append(.{ .text = q2, .mode = .steer });
+        t.compacting = true;
+        t.redraw();
+        for (t.prev_lines.items) |l| {
+            if (frameRowWidth(l) > w) return error.FrameRowTooWide;
+        }
+        t.compacting = false;
+        t.compact_queue.clearRetainingCapacity();
+        t.working = false;
+    }
+}
+
+test "diffRender: an over-tall frame is clamped, never painted past the last screen row" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+    t.width = 60;
+    t.height = 10;
+    t.redraw();
+
+    // A frame taller than the terminal (the queued-row race made these):
+    // the overflow rows must NOT be painted (a CUP onto the last row plus a
+    // chained \r\n would scroll the screen) and NOT adopted into the base.
+    var tall: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (tall.items) |l| alloc.free(l);
+        tall.deinit(alloc);
+    }
+    for (0..t.height + 3) |i| {
+        var buf: [16]u8 = undefined;
+        const l = try std.fmt.bufPrint(&buf, "row{d}", .{i});
+        try tall.append(alloc, try alloc.dupe(u8, l));
+    }
+    if (t.last_frame_bytes.len > 0) alloc.free(t.last_frame_bytes);
+    t.last_frame_bytes = &[_]u8{};
+    t.render_mutex.lock(t.io) catch {};
+    t.diffRender(&tall, 0, 1, false);
+    t.render_mutex.unlock(t.io);
+    try std.testing.expect(t.prev_lines.items.len <= t.height);
+    const over = maxCupRow(t.last_frame_bytes);
+    try std.testing.expect(over <= t.height);
+
+    // A normal frame afterwards repaints cleanly at legal rows.
+    var normal: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (normal.items) |l| alloc.free(l);
+        normal.deinit(alloc);
+    }
+    for (0..t.height) |i| {
+        var buf: [16]u8 = undefined;
+        const l = try std.fmt.bufPrint(&buf, "new{d}", .{i});
+        try normal.append(alloc, try alloc.dupe(u8, l));
+    }
+    if (t.last_frame_bytes.len > 0) alloc.free(t.last_frame_bytes);
+    t.last_frame_bytes = &[_]u8{};
+    t.render_mutex.lock(t.io) catch {};
+    t.diffRender(&normal, 0, 1, false);
+    t.render_mutex.unlock(t.io);
+    try std.testing.expectEqual(t.height, t.prev_lines.items.len);
+    try std.testing.expect(maxCupRow(t.last_frame_bytes) <= t.height);
+}
+
+test "editor geometry: the live queue shifts the editor rows and the cursor park" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+    t.width = 80;
+    t.height = 24;
+    t.working = true;
+    t.editor.setText("typed text") catch unreachable;
+    session.queueSteering("queued steering message");
+    t.redraw();
+    const qrows = t.session.queuedPeekRows(t.width);
+    try std.testing.expect(qrows >= 1);
+    // The editor's first row sits AFTER the live queue rows and the border.
+    try std.testing.expectEqual(t.transcript_h + qrows + 1, t.editor_frame_row);
+}

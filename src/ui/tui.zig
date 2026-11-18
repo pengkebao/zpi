@@ -3741,8 +3741,46 @@ pub const TUI = struct {
         // dim rows between the transcript and the editor border.
         // Pending rows WRAP to the width (appendPendingRows); the budget must
         // count the same wraps or long messages clip and the bottom goes off.
-        const live_q_h: usize = if (self.working and !self.compacting) self.session.queuedPeekRows(self.width) else 0;
-        const compact_q_h: usize = if (self.compacting) self.compactQueueRows() else 0;
+        // The rows are RENDERED once, here, and the budget counts the
+        // rendered rows. The old split (queuedPeekRows budget read at the
+        // top, renderLiveQueue's own queuedPeek at step 1.5) raced the main
+        // thread's queueSteering/queueFollowUp: a message queued mid-frame
+        // made the frame TALLER than the terminal, and diffRender painted
+        // past the bottom row — the chained \r\n on the last screen row
+        // scrolled the whole screen and permanently desynced the diff model
+        // (squeezed borders, missing bottom border, stranded stale rows).
+        // Snapshot-once makes an over-tall frame impossible.
+        var live_q_rows: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            // Rows NOT moved into the frame (early return, or the move below
+            // copies instead of transferring ownership) are freed here.
+            for (live_q_rows.items) |l| self.alloc.free(l);
+            live_q_rows.deinit(self.alloc);
+        }
+        if (self.working and !self.compacting) {
+            const queued = self.session.queuedPeek();
+            defer {
+                for (queued) |q| self.alloc.free(q.text);
+                self.alloc.free(queued);
+            }
+            for (queued) |q| {
+                const qmode: CompactQueueMode = switch (q.mode) {
+                    .steer => .steer,
+                    .followUp => .followUp,
+                };
+                self.appendPendingRows(&live_q_rows, q.text, qmode);
+            }
+        }
+        var compact_q_rows: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (compact_q_rows.items) |l| self.alloc.free(l);
+            compact_q_rows.deinit(self.alloc);
+        }
+        if (self.compacting) {
+            for (self.compact_queue.items) |e| self.appendPendingRows(&compact_q_rows, e.text, e.mode);
+        }
+        const live_q_h: usize = live_q_rows.items.len;
+        const compact_q_h: usize = compact_q_rows.items.len;
         const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h + compact_q_h + live_q_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
@@ -3824,10 +3862,24 @@ pub const TUI = struct {
         }
 
         // 1.5 Queued-message rows (pi pendingMessagesContainer: between the
-        // document and the editor's top border) — live steering/follow-up
-        // while the agent works, the compaction queue while it compacts.
-        if (self.compacting) self.renderCompactQueue(&frame);
-        if (self.working and !self.compacting) self.renderLiveQueue(&frame);
+        // transcript and the editor border). Rendered ONCE above so the
+        // budget and the frame can never disagree on the row count; copied
+        // into the frame here (the temp lists keep ownership, their defers
+        // free the originals).
+        for (compact_q_rows.items) |l| {
+            const dup = self.alloc.dupe(u8, l) catch return;
+            frame.append(self.alloc, dup) catch {
+                self.alloc.free(dup);
+                return;
+            };
+        }
+        for (live_q_rows.items) |l| {
+            const dup = self.alloc.dupe(u8, l) catch return;
+            frame.append(self.alloc, dup) catch {
+                self.alloc.free(dup);
+                return;
+            };
+        }
 
         // 2. Top border (shows spinner + "Working" when busy).
         const top_border = self.topBorderLine() catch return;
@@ -3865,17 +3917,23 @@ pub const TUI = struct {
         // Mouse hit-testing geometry: the editor window's first row in the
         // frame (transcript + compact-queue rows + top border) and its
         // visible height. screenToEditor maps screen cells into it.
-        self.editor_frame_row = transcript_h + compact_q_h + 1;
+        // The queue rows (compaction + live steering/follow-up) sit between
+        // the transcript and the top border; every editor-row geometry must
+        // count BOTH queues or the cursor parks on a transcript row and the
+        // mouse maps clicks to the wrong editor rows while a message is
+        // queued.
+        const q_h = compact_q_h + live_q_h;
+        self.editor_frame_row = transcript_h + q_h + 1;
         self.editor_vis_top = vis_top;
         self.editor_visible_rows = end - vis_top;
         self.editor_render_width = ed_width;
         // Invert-video the editor's mouse selection (editor lines are plain
         // text, so the highlight splices are safe here).
         if (!mcp_modal) {
-            const base = transcript_h + compact_q_h + 1;
+            const base = transcript_h + q_h + 1;
             self.editor.highlightSelection(&frame, base, end - vis_top, vis_top, ed_width, self.alloc);
         }
-        while (frame.items.len < transcript_h + 1 + editor_h) {
+        while (frame.items.len < transcript_h + q_h + 1 + editor_h) {
             const blank = self.alloc.dupe(u8, "") catch return;
             frame.append(self.alloc, blank) catch return;
         }
@@ -4028,7 +4086,7 @@ pub const TUI = struct {
         const cursor_row = if (mcp_modal)
             transcript_h + self.height // park off-frame (pi shows no cursor in the manager)
         else
-            transcript_h + compact_q_h + 1 + (cursor_vis.row - vis_top);
+            transcript_h + q_h + 1 + (cursor_vis.row - vis_top);
         const cursor_col: u16 = @intCast(if (1 + cursor_vis.col < self.width) 1 + cursor_vis.col else self.width);
         // The frame must be EXACTLY self.height rows: every layout branch
         // above budgets its rows against self.height, but a stale or
@@ -4074,48 +4132,59 @@ pub const TUI = struct {
 
     /// The top border. When working, shows `── {spinner} Working ────...` with
     /// the spinner in accent color and the label in muted (matches pi).
+    /// The line is capped to `width` columns: the Compacting label alone is
+    /// 43 columns, and on a narrower terminal an over-wide row autowraps in
+    /// the real terminal — shifting every chained row of the frame down one
+    /// screen row and desyncing the diff renderer (squeezed borders, a
+    /// stranded stale bottom border). The label truncates instead.
     fn topBorderLine(self: *TUI) ![]u8 {
         if (!self.working) return self.borderLine();
         // pi CompactionStatusIndicator: "Compacting context... (esc to cancel)"
         // rendered in the border while a manual /compact runs.
-        if (self.compacting) {
-            const frame = spinner.SPINNER_FRAMES[self.spinner_frame];
-            var abuf: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer abuf.deinit(self.alloc);
-            const bc = self.borderColor();
-            abuf.appendSlice(self.alloc, bc) catch return error.OutOfMemory;
-            abuf.appendSlice(self.alloc, "\u{2500}\u{2500} ") catch return error.OutOfMemory;
-            abuf.appendSlice(self.alloc, ACCENT) catch return error.OutOfMemory;
-            abuf.appendSlice(self.alloc, frame) catch return error.OutOfMemory;
-            abuf.appendSlice(self.alloc, MUTED) catch return error.OutOfMemory;
-            abuf.appendSlice(self.alloc, " Compacting context... (esc to cancel)") catch return error.OutOfMemory;
-            abuf.appendSlice(self.alloc, bc) catch return error.OutOfMemory;
-            abuf.append(self.alloc, ' ') catch return error.OutOfMemory;
-            // Used so far: 3 (bc+──) + 1 (space) + 38 (text) + 1 (space) = 43.
-            // One extra ─ here overflows the width, wraps to the next screen
-            // row and pushes the bottom border off-screen.
-            var i: u32 = 3 + 1 + 38 + 1;
-            while (i < self.width) : (i += 1) {
-                abuf.appendSlice(self.alloc, "\u{2500}") catch return error.OutOfMemory;
-            }
-            abuf.appendSlice(self.alloc, "\x1b[0m") catch return error.OutOfMemory;
-            return abuf.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
-        }
+        const label: []const u8 = if (self.compacting)
+            " Compacting context... (esc to cancel)"
+        else
+            " Working";
         const frame = spinner.SPINNER_FRAMES[self.spinner_frame];
         var abuf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer abuf.deinit(self.alloc);
         const bc = self.borderColor();
+        var cols: u32 = 0;
         abuf.appendSlice(self.alloc, bc) catch return error.OutOfMemory;
-        abuf.appendSlice(self.alloc, "\u{2500}\u{2500} ") catch return error.OutOfMemory; // ──
-        abuf.appendSlice(self.alloc, ACCENT) catch return error.OutOfMemory;
-        abuf.appendSlice(self.alloc, frame) catch return error.OutOfMemory; // spinner (1 col)
+        // "── " — the spinner sits right after it (the cap can bite below
+        // width 4; then the label carries the rest).
+        if (cols + 3 <= self.width) {
+            abuf.appendSlice(self.alloc, "\u{2500}\u{2500} ") catch return error.OutOfMemory;
+            cols += 3;
+        } else {
+            while (cols < self.width) : (cols += 1)
+                abuf.appendSlice(self.alloc, "\u{2500}") catch return error.OutOfMemory;
+            abuf.appendSlice(self.alloc, "\x1b[0m") catch return error.OutOfMemory;
+            return abuf.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
+        }
+        if (cols + 1 <= self.width) {
+            abuf.appendSlice(self.alloc, ACCENT) catch return error.OutOfMemory;
+            abuf.appendSlice(self.alloc, frame) catch return error.OutOfMemory; // spinner (1 col)
+            cols += 1;
+        }
         abuf.appendSlice(self.alloc, MUTED) catch return error.OutOfMemory;
-        abuf.appendSlice(self.alloc, " Working") catch return error.OutOfMemory; // 8 cols
+        // Label, capped to the remaining width (wide chars drop whole).
+        var it = std.unicode.Utf8View.initUnchecked(label).iterator();
+        while (it.nextCodepointSlice()) |cp| {
+            const cw = wmod.visualWidth(cp);
+            if (cols + cw > self.width) break;
+            abuf.appendSlice(self.alloc, cp) catch return error.OutOfMemory;
+            cols += cw;
+        }
+        // The separator space between the label and the fill (both variants
+        // count it in their prefix; kept for the exact idle-width output).
+        if (cols < self.width) {
+            abuf.append(self.alloc, ' ') catch return error.OutOfMemory;
+            cols += 1;
+        }
+        // Fill the rest with ─ in the border color.
         abuf.appendSlice(self.alloc, bc) catch return error.OutOfMemory;
-        abuf.append(self.alloc, ' ') catch return error.OutOfMemory; // 1 col
-        // Used so far: 3 + 1 + 8 + 1 = 13 visual cols. Fill the rest with ─.
-        var i: u32 = 13;
-        while (i < self.width) : (i += 1) {
+        while (cols < self.width) : (cols += 1) {
             abuf.appendSlice(self.alloc, "\u{2500}") catch return error.OutOfMemory;
         }
         abuf.appendSlice(self.alloc, "\x1b[0m") catch return error.OutOfMemory;
@@ -5301,6 +5370,15 @@ pub const TUI = struct {
         // marks its k revealed rows plus the overlay outliers; everything
         // else that changed is painted directly, chained with `\r\n` while
         // consecutive.
+        // HARD CLAMP: no row at or past the screen bottom is ever painted.
+        // A frame taller than the terminal (a racing layout budget) would
+        // otherwise CUP-clamp its overflow rows onto the last screen row and
+        // chain `\r\n` FROM the last row — the terminal scrolls the whole
+        // screen, and the model never learns: squeezed borders, a missing
+        // bottom border, stale rows stranded below the status. Overflow
+        // rows are dropped instead (and not adopted into prev_lines), so
+        // the next frame repaints whatever belongs on screen.
+        const paint_limit = @min(n, self.height);
         var shifted = false;
         var reveal_from: usize = 0;
         var reveal_to: usize = 0; // exclusive
@@ -5365,7 +5443,7 @@ pub const TUI = struct {
 
         var last_painted: ?usize = null;
         row = 0;
-        while (row < n) : (row += 1) {
+        while (row < paint_limit) : (row += 1) {
             const in_reveal = shifted and row >= reveal_from and row < reveal_to;
             var is_outlier = false;
             if (shifted and !in_reveal) {
@@ -5402,7 +5480,10 @@ pub const TUI = struct {
         // frame simply does not reach (frame shorter than the terminal — a
         // stale height or a short frame must not leave a previous frame's
         // footer row stranded at the bottom of the screen): clear them.
-        const clear_to = @max(self.prev_lines.items.len, self.height);
+        // Capped at the screen bottom for the same reason as the paint
+        // clamp above: a previous frame taller than the terminal never had
+        // real rows past it (CUP clamped), so there is nothing to clear.
+        const clear_to = self.height;
         row = n;
         while (row < clear_to) : (row += 1) {
             const chain = last_painted != null and last_painted.? + 1 == row;
@@ -5417,9 +5498,13 @@ pub const TUI = struct {
         // Adopt the frame's lines: they become the next diff base. The old
         // strings are freed; ownership of the new ones transfers wholesale —
         // no per-line dupe (pi keeps previousLines by reference too).
+        // Overflow rows past the screen bottom are freed, NOT adopted: the
+        // base must never describe rows the screen does not have.
         for (self.prev_lines.items) |l| self.alloc.free(l);
         self.prev_lines.clearRetainingCapacity();
-        self.prev_lines.appendSlice(new_lines) catch {};
+        const adopt = @min(n, self.height);
+        self.prev_lines.appendSlice(new_lines[0..adopt]) catch {};
+        for (new_lines[adopt..]) |l| self.alloc.free(l);
         frame.clearRetainingCapacity();
         self.prev_transcript_h = th;
         self.rendered_scroll_top = self.frame_scroll_top;
@@ -7714,15 +7799,27 @@ pub const TUI = struct {
             .followUp => "Follow-up: ",
         };
         const label_w: usize = wmod.visualWidth(label);
-        const w: usize = if (self.width > label_w) self.width - label_w else 1;
-        const rows = wrapPlain(self.alloc, text, w) catch return;
+        // Narrow-terminal cap: label + wrapped text must stay within the
+        // width, or the row autowraps and shifts every chained frame row one
+        // screen row down (the diff renderer desyncs). Below the label
+        // width the label itself truncates and continuation rows drop.
+        const avail: usize = if (self.width > label_w) self.width - label_w else 0;
+        const rows = wrapPlain(self.alloc, text, if (avail > 0) avail else 1) catch return;
         defer {
             for (rows) |r| self.alloc.free(r);
             self.alloc.free(rows);
         }
         for (rows, 0..) |r, i| {
+            if (i > 0 and avail == 0) break; // no room past the truncated label
             const prefix = if (i == 0) label else (SPACES48)[0..@min(label_w, 48)];
-            const line = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}{s}{s}", .{ prefix, r, ansi.RESET }) catch continue;
+            var owned_cut: ?[]u8 = null;
+            defer if (owned_cut) |c| self.alloc.free(c);
+            const shown = if (avail > 0 and wmod.visualWidth(r) > avail) cut: {
+                const cut = truncateToWidth(self.alloc, r, avail) catch break :cut r;
+                owned_cut = cut;
+                break :cut cut;
+            } else r;
+            const line = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}{s}{s}", .{ prefix, shown, ansi.RESET }) catch continue;
             frame.append(self.alloc, line) catch {};
         }
     }
