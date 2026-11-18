@@ -446,6 +446,12 @@ pub fn sliceByColumn(alloc: std.mem.Allocator, line: []const u8, start_col: usiz
 
     var cur: usize = 0; // current visual column
     var i: usize = 0;
+    // A wide char that straddles the END boundary is kept here and re-emitted
+    // after the loop: strict slicing would drop it, but the caller's next
+    // slice (starting at end_col) begins exactly at this char's start column
+    // and re-includes it — dropping it here would make the char vanish from
+    // a selection highlight / copied text (CJK: drag one cell past a char).
+    var dropped_wide: []const u8 = "";
     while (i < line.len) {
         if (line[i] == 0x1b) {
             const seq_end = escapeEnd(line, i);
@@ -466,12 +472,52 @@ pub fn sliceByColumn(alloc: std.mem.Allocator, line: []const u8, start_col: usiz
             try out.appendSlice(alloc, pending.items);
             pending.clearRetainingCapacity();
             try out.appendSlice(alloc, line[i..ce]);
+        } else if (w == 2 and cur >= start_col and cur < end_col and cur + w > end_col) {
+            // Wide char straddling the END boundary: remember it (see above).
+            dropped_wide = line[i..ce];
         }
+        // A wide char straddling the START boundary is genuinely half-out and
+        // stays dropped (the strict behavior), matching the `before` side.
         cur += w;
         i = ce;
         if (cur >= end_col) break;
     }
+    if (dropped_wide.len > 0) try out.appendSlice(alloc, dropped_wide);
     return out.toOwnedSlice(alloc);
+}
+
+test "sliceByColumn keeps a wide char straddling the end boundary" {
+    const alloc = std.heap.page_allocator;
+    // 主 occupies columns 0-1; the selection ends at column 1, i.e. the drag
+    // stopped one cell past the char's left column. The char must survive:
+    // before+sel+after together must contain it exactly once (it lands in the
+    // `after` slice at column 1, so the sel slice must not drop-and-vanish it).
+    const line = "主线"; // 主(0-1) 线(2-3)
+    const before = try sliceByColumn(alloc, line, 0, 1);
+    defer alloc.free(before);
+    const sel = try sliceByColumn(alloc, line, 1, 1);
+    defer alloc.free(sel);
+    const after = try sliceByColumn(alloc, line, 2, 1 << 30);
+    defer alloc.free(after);
+    var all: std.ArrayListUnmanaged(u8) = .empty;
+    defer all.deinit(alloc);
+    try all.appendSlice(alloc, before);
+    try all.appendSlice(alloc, sel);
+    try all.appendSlice(alloc, after);
+    // 主 must appear exactly once in the reassembled row.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, all.items, "主"));
+}
+
+test "sliceByColumn keeps a wide char straddling the end boundary (sel side)" {
+    const alloc = std.heap.page_allocator;
+    // Selection [0,2) over 主线: the 线 at columns 2-3 straddles the end
+    // boundary at column 2… no, 线 starts AT 2, so it is fully out. Use the
+    // real bug shape: selection [1,3) — 主 straddles the start (dropped,
+    // half-out), 线 straddles the end (kept).
+    const line = "主线";
+    const sel = try sliceByColumn(alloc, line, 1, 2);
+    defer alloc.free(sel);
+    try std.testing.expectEqualStrings("线", sel);
 }
 
 test "overlay splits a plain line" {
