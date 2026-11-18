@@ -16,6 +16,7 @@ const markdown = @import("src/ui/markdown.zig");
 const tool_block = @import("src/ui/tool_block.zig");
 const footer = @import("src/ui/footer.zig");
 const overlay = @import("src/ui/overlay.zig");
+const ansi = @import("src/ui/ansi.zig");
 comptime {
     _ = tool_search;
     _ = tui;
@@ -1197,4 +1198,77 @@ test "skill: trailing args render as a separate user message below the block" {
     try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "xlsx") != null);
     try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[0], "Body text here.") == null);
     try std.testing.expect(std.mem.indexOf(u8, t.scrollback.items[1], "make me a report") != null);
+}
+
+test "frame: the painted frame always fills the full terminal height" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+
+    t.width = 60;
+    t.height = 24;
+    t.addMessage("hello world");
+    // A multi-line queued message while compacting: the layout budget must
+    // count every wrapped row, and the frame must still fill the terminal.
+    const qtext = "first line\nsecond line that is long enough to wrap around the width of the box";
+    try t.compact_queue.append(.{ .text = try alloc.dupe(u8, qtext), .mode = .steer });
+    t.compacting = true;
+    t.redraw();
+
+    // The diff base is exactly one row per screen row: a short frame would
+    // leave the previous frame's last row (a stale footer line) stranded at
+    // the bottom of the screen.
+    try std.testing.expectEqual(t.height, t.prev_lines.items.len);
+
+    // Direct diffRender check: a frame SHORTER than the terminal (a stale
+    // height or a mis-counted layout budget) must still clear every row it
+    // does not reach — a previous frame's bottom row (a stale footer line)
+    // may never survive. With an empty previous frame the byte stream is
+    // exactly n frame paints + (height - n) tail clears, so the tail clears
+    // are counted precisely. The old shrink-clear ran only to
+    // prev_lines.len (0 here) and left the bottom rows untouched.
+    const n: usize = t.height - 2; // new frame: 22 of 24 rows
+    for (t.prev_lines.items) |l| alloc.free(l);
+    t.prev_lines.clearRetainingCapacity();
+    var short: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (short.items) |l| alloc.free(l);
+        short.deinit(alloc);
+    }
+    for (0..n) |_| try short.append(alloc, try alloc.dupe(u8, "x"));
+    // Disable the scrollbar post-pass so the byte stream is exactly the
+    // content diff (it repaints cells in the transcript region too).
+    const saved_th = t.transcript_h;
+    t.transcript_h = 0;
+    if (t.last_frame_bytes.len > 0) alloc.free(t.last_frame_bytes);
+    t.last_frame_bytes = &[_]u8{};
+    t.render_mutex.lock(t.io) catch {};
+    t.diffRender(&short, 0, 1, false);
+    t.render_mutex.unlock(t.io);
+    t.transcript_h = saved_th;
+    try std.testing.expectEqual(n, t.prev_lines.items.len);
+    // The two rows the frame does not reach must carry a clear-to-end-of-line
+    // on top of the n frame paints — the tail clears.
+    const lf = t.last_frame_bytes;
+    try std.testing.expect(lf.len > 0);
+    var clears: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, lf, i, ansi.CLEAR_EOL)) |p| {
+        clears += 1;
+        i = p + ansi.CLEAR_EOL.len;
+    }
+    try std.testing.expectEqual(n + (t.height - n), clears);
 }

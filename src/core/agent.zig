@@ -349,6 +349,7 @@ pub const Session = struct {
                     var cw_sum: usize = 0;
                     var last_space: ?usize = null;
                     while (end < s.len) {
+                        if (s[end] == '\n') break; // explicit newline always breaks
                         const ce = wmod.nextCharEnd(s, end);
                         const cw = wmod.visualWidth(s[end..ce]);
                         if (cw_sum + cw > w) break;
@@ -357,7 +358,9 @@ pub const Session = struct {
                         end = ce;
                     }
                     var brk: usize = 0;
-                    if (end < s.len and last_space != null and last_space.? > start) {
+                    if (end < s.len and s[end] == '\n') {
+                        brk = end + 1; // consume the newline
+                    } else if (end < s.len and last_space != null and last_space.? > start) {
                         brk = last_space.? + 1;
                     } else {
                         brk = end;

@@ -392,6 +392,10 @@ pub const TUI = struct {
     last_tick_ns: u64 = 0,
     bash_mode: bool = false,
     render_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    /// The bytes of the most recent frame write (tests assert on the tail
+    /// clears; production ignores it). Guarded by render_mutex.
+    last_frame_bytes: []const u8 = &[_]u8{},
+
     /// Guards ONLY the streaming buffers (stream_text/stream_thinking): the
     /// network thread takes it per SSE delta, and must never queue behind a
     /// frame write — render_mutex contention here backpressured the token
@@ -3438,6 +3442,8 @@ pub const TUI = struct {
             self.invalidateLiveToolRowsLocked();
         }
         if (self.flash_msg) |m| self.alloc.free(m);
+        if (self.last_frame_bytes.len > 0) self.alloc.free(self.last_frame_bytes);
+        self.last_frame_bytes = &[_]u8{};
         for (self.tool_calls.items) |*e| e.deinit(self.session.alloc);
         self.tool_calls.deinit(self.session.alloc);
         for (self.skill_invocations.items) |*e| e.deinit(self.session.alloc);
@@ -3528,12 +3534,18 @@ pub const TUI = struct {
         stdout.writeStreamingAll(self.io, "\r\n") catch {};
     }
 
-    /// Query the real terminal size via TIOCGWINSZ. On failure (stdin is
+    /// Query the real terminal size via TIOCGWINSZ. On failure (the fd is
     /// not a tty, e.g. piped) the previous size is kept — the winsize struct
-    /// would otherwise carry garbage into width/height.
+    /// would otherwise carry garbage into width/height. stdout is queried
+    /// first: it is the fd the terminal is attached to, so it reports the
+    /// true size even when stdin is redirected (a stale height left a frame
+    /// one row short of the terminal, and diffRender's shrink-clear only ran
+    /// to the previous frame's length — a stale footer row survived at the
+    /// bottom of the screen).
     fn measureSize(self: *TUI) void {
         var ws: std.posix.winsize = undefined;
-        const rc = std.c.ioctl(0, @as(i32, TIOCGWINSZ), &ws);
+        var rc = std.c.ioctl(1, @as(i32, TIOCGWINSZ), &ws);
+        if (rc != 0) rc = std.c.ioctl(0, @as(i32, TIOCGWINSZ), &ws);
         if (rc != 0) return;
         if (ws.col >= 2) self.width = ws.col;
         if (ws.row >= 3) self.height = ws.row;
@@ -4018,6 +4030,16 @@ pub const TUI = struct {
         else
             transcript_h + compact_q_h + 1 + (cursor_vis.row - vis_top);
         const cursor_col: u16 = @intCast(if (1 + cursor_vis.col < self.width) 1 + cursor_vis.col else self.width);
+        // The frame must be EXACTLY self.height rows: every layout branch
+        // above budgets its rows against self.height, but a stale or
+        // mis-counted budget (queue rows, menu chrome, ...) can leave the
+        // frame one row short — the old last screen row (a previous footer
+        // line) then survives at the bottom of the screen. Pad with blanks
+        // so the invariant holds regardless of which branch undercounted.
+        while (frame.items.len < self.height) {
+            const blank = self.alloc.dupe(u8, "") catch return;
+            frame.append(self.alloc, blank) catch return;
+        }
         // diffRender adopts the frame's lines (they become the next diff
         // base); afterwards only the array itself needs releasing.
         self.diffRender(&frame, cursor_row, cursor_col, mcp_modal);
@@ -5236,7 +5258,7 @@ pub const TUI = struct {
     /// and only the revealed rows are painted. Owns the frame's lines on
     /// return: they move into `prev_lines` (freed when no longer needed), so
     /// the caller must not free them.
-    fn diffRender(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), cursor_row: usize, cursor_col: u16, cursor_hidden: bool) void {
+    pub fn diffRender(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), cursor_row: usize, cursor_col: u16, cursor_hidden: bool) void {
         const new_lines = frame.items;
         // The whole frame goes out as ONE write (inside synchronized output):
         // fewer syscalls, and the terminal never shows a half-applied frame.
@@ -5376,9 +5398,13 @@ pub const TUI = struct {
                 self.scroll_glyphs[row] = 255;
             last_painted = row;
         }
-        // Rows that existed before but not now (frame shrank): clear them.
+        // Rows that existed before but not now (frame shrank) OR that the
+        // frame simply does not reach (frame shorter than the terminal — a
+        // stale height or a short frame must not leave a previous frame's
+        // footer row stranded at the bottom of the screen): clear them.
+        const clear_to = @max(self.prev_lines.items.len, self.height);
         row = n;
-        while (row < self.prev_lines.items.len) : (row += 1) {
+        while (row < clear_to) : (row += 1) {
             const chain = last_painted != null and last_painted.? + 1 == row;
             self.paintRow(&frame_out, row, "", chain);
             if (row < self.scroll_glyphs.len) self.scroll_glyphs[row] = 255;
@@ -5445,6 +5471,8 @@ pub const TUI = struct {
         out.appendSlice(self.alloc, "\x1b[?2026h") catch return;
         out.appendSlice(self.alloc, body.items) catch return;
         out.appendSlice(self.alloc, "\x1b[?2026l") catch return;
+        if (self.last_frame_bytes.len > 0) self.alloc.free(self.last_frame_bytes);
+        self.last_frame_bytes = self.alloc.dupe(u8, out.items) catch return;
         self.writeRaw(out.items);
     }
 
@@ -7737,6 +7765,7 @@ pub const TUI = struct {
                     var cw_sum: usize = 0;
                     var last_space: ?usize = null;
                     while (end < s.len) {
+                        if (s[end] == '\n') break; // explicit newline always breaks
                         const ce = wmod.nextCharEnd(s, end);
                         const cw = wmod.visualWidth(s[end..ce]);
                         if (cw_sum + cw > w) break;
@@ -7745,7 +7774,9 @@ pub const TUI = struct {
                         end = ce;
                     }
                     var brk: usize = 0;
-                    if (end < s.len and last_space != null and last_space.? > start) {
+                    if (end < s.len and s[end] == '\n') {
+                        brk = end + 1; // consume the newline
+                    } else if (end < s.len and last_space != null and last_space.? > start) {
                         brk = last_space.? + 1;
                     } else {
                         brk = end;
