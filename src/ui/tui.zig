@@ -45,6 +45,12 @@ const tools_test = if (builtin.is_test) @import("../tools/registry.zig") else st
 
 const TIOCGWINSZ: u32 = if (builtin.os.tag == .linux) 0x5413 else 0x40087468;
 
+/// libc tcflush is not exposed by Zig 0.17's std.c: flush pending INPUT
+/// (TCIFLUSH) on teardown so an in-flight DSR reply (`ESC[<row>;<col>R`)
+/// cannot leak into the shell prompt as visible garbage.
+extern "c" fn tcflush(fd: c_int, queue_selector: c_int) c_int;
+const TCIFLUSH: c_int = 0;
+
 /// Reasoning/thinking level — drives the editor border color (matches pi's theme).
 const ThinkingLevel = config.ThinkingLevel;
 
@@ -661,6 +667,11 @@ pub const TUI = struct {
     cpr_in_flight: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cpr_expect: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // (row<<16)|col, 1-based
     cpr_age: u32 = 0, // frames since the query (render_mutex held)
+    /// This terminal actually answered a DSR at least once. Gates the
+    /// teardown wait: a CPR-less terminal must exit without any pause.
+    /// Plain atomic is fine — a torn first reply only risks one extra
+    /// (harmless, bounded) wait at exit.
+    cpr_ever: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Main-loop wheel frame pacing (same idea as the watcher's throttle):
     /// a frame per wheel event costs one terminal round trip per line, which
     /// over a slow pipe makes fast pulls freeze, then burst.
@@ -3594,9 +3605,49 @@ pub const TUI = struct {
 
     fn restoreTerminal(self: *TUI) void {
         if (self.term_restored) return;
-        std.posix.tcsetattr(0, .NOW, self.old_termios) catch {};
-        self.term_restored = true;
+        // Drop any unread terminal replies (a DSR cursor report racing the
+        // exit). Raw mode is still on: nothing echoes yet.
+        _ = tcflush(0, TCIFLUSH);
+        // A query may still be unanswered: the reply can land LONG after
+        // the last frame (a busy/background window answers late; the
+        // foreground answers in <1 ms). While a query is in flight, READ
+        // the reply off the tty — raw mode is still on, so cooked echo can
+        // never see it — and end the wait the moment it arrives. Bounded
+        // at ~720 ms: 24 × 30 ms polls; every gap flushes too, so a reply
+        // that slips past is dropped, not echoed. Gated on cpr_ever: a
+        // terminal that never answered a DSR exits with zero pause. A
+        // dropped stale CPR is harmless (the app is exiting; nobody
+        // compares it against a parked cursor anymore).
+        if (self.cpr_ever.load(.acquire)) {
+            var waits: u32 = 0;
+            while (self.cpr_in_flight.load(.acquire) and waits < 24) : (waits += 1) {
+                var fds: [1]std.posix.pollfd = .{.{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 }};
+                const ready = std.posix.poll(&fds, 28) catch break;
+                if (ready == 0) {
+                    _ = tcflush(0, TCIFLUSH);
+                    continue;
+                }
+                if (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
+                if (fds[0].revents & std.posix.POLL.IN == 0) break;
+                var buf: [64]u8 = undefined;
+                const n = std.posix.read(0, &buf) catch break;
+                if (n == 0) break; // EOF: nothing more will ever arrive
+                // A CPR ends the wait; anything else (paste tails, other
+                // replies) is discarded and the wait continues.
+                if (keys.parseCpr(buf[0..n]) != null) break;
+            }
+        }
+        // Reset the pending-reply bookkeeping: no query is ever "in flight"
+        // without a reader once teardown started.
+        self.cpr_in_flight.store(false, .release);
+        self.cpr_age = 0;
         const stdout = std.Io.File.stdout();
+        // Tear down the screen BEFORE leaving raw mode. The ordering is the
+        // leak fix: everything that could still trigger a terminal reply
+        // (exiting the alt screen, disabling modes) is emitted and its
+        // answer window waited out while ECHO is off. Restoring cooked mode
+        // is the LAST tty action except the trailing flushes, so no reply
+        // can ever be echoed onto the prompt.
         stdout.writeStreamingAll(self.io, ansi.SHOW_CURSOR) catch {};
         if (self.modify_other_keys) {
             stdout.writeStreamingAll(self.io, "\x1b[>4;0m") catch {};
@@ -3607,6 +3658,37 @@ pub const TUI = struct {
         stdout.writeStreamingAll(self.io, "\x1b[<u") catch {}; // disable Kitty keyboard protocol
         stdout.writeStreamingAll(self.io, "\x1b[?1049l") catch {}; // exit alt-screen
         stdout.writeStreamingAll(self.io, "\r\n") catch {};
+        // Post-screen-teardown replies (the ?1049l/\x1b[<u window can ack
+        // late in backgrounded terminals): still raw — flush + short
+        // grace-drain with echo off, then the final flush.
+        _ = tcflush(0, TCIFLUSH);
+        drainInputGrace();
+        _ = tcflush(0, TCIFLUSH);
+        // Cooked mode LAST: from here the tty belongs to the shell.
+        std.posix.tcsetattr(0, .NOW, self.old_termios) catch {};
+        self.term_restored = true;
+    }
+
+    /// Grace-drain stdin while STILL in raw mode (echo off): a DSR/Kitty
+    /// reply still in flight when teardown runs lands on the tty milliseconds
+    /// later — after process exit these bytes reach the shell's line buffer
+    /// (the leaked `ESC[<row>;<col>R` at the prompt). Read and discard
+    /// whatever arrives; 20 ms of silence ends it. The ≤70 ms pause is
+    /// imperceptible.
+    fn drainInputGrace() void {
+        var buf: [256]u8 = undefined;
+        var fds: [1]std.posix.pollfd = .{.{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 }};
+        // The first wait covers a reply still in flight (terminals answer
+        // a DSR in well under 20 ms; allow slack for a loaded machine).
+        var ready = std.posix.poll(&fds, 50) catch return;
+        while (ready != 0) {
+            if (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) return;
+            if (fds[0].revents & std.posix.POLL.IN == 0) break;
+            const n = std.posix.read(0, &buf) catch return;
+            if (n == 0) return; // EOF: nothing more will ever arrive
+            // Bursts keep draining; the quiet window ends the drain.
+            ready = std.posix.poll(&fds, 20) catch return;
+        }
     }
 
     /// Query the real terminal size via TIOCGWINSZ. On failure (the fd is
@@ -8724,6 +8806,7 @@ pub const TUI = struct {
                 self.key_reader.cpr_reply = null;
                 self.cpr_in_flight.store(false, .release);
                 self.cpr_age = 0;
+                self.cpr_ever.store(true, .release);
                 const expect = self.cpr_expect.load(.acquire);
                 const exp_row: u16 = @intCast(expect >> 16);
                 const exp_col: u16 = @intCast(expect & 0xFFFF);
