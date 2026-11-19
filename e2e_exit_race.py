@@ -71,7 +71,12 @@ while time.time() < deadline:
     chunk = read_fd(master_fd, 0.02)
     if chunk:
         buf += chunk
-        if quit_sent and b"\x1b[?1049l" in chunk and not injected:
+        # Teardown marker: fullscreen exits the alt screen (?1049l); regular
+        # mode has no alt screen — its teardown starts with the mouse-off
+        # burst (?1000l). Either marks "process alive, mid-teardown":
+        # inject the late DSR reply now.
+        teardown = b"\x1b[?1049l" in chunk or b"\x1b[?1000l" in chunk
+        if quit_sent and teardown and not injected:
             # Process is alive and mid-teardown: the terminal's answer to
             # the last frame's DSR lands right now.
             injected = True

@@ -83,6 +83,11 @@ pub const DefaultProjectTrust = enum { ask, always, never };
 
 pub const ScrollbarMode = enum { auto, always, hidden };
 
+/// Which renderer the TUI uses (settings.json "tuiMode", pi default
+/// "fullscreen"). "fullscreen" = alt-screen; "regular" = the terminal's
+/// native main screen + scrollback (pi TuiMainScreen semantics).
+pub const TuiMode = enum { regular, fullscreen };
+
 pub const Config = struct {
     base_dir: []u8,
     models: std.array_list.Managed(Model),
@@ -97,6 +102,9 @@ pub const Config = struct {
     /// settings.json "fullscreenWheelScrollLines": a fixed line count per
     /// wheel event; null = "auto" (velocity-based, pi's default).
     fullscreen_wheel_lines: ?u32 = null,
+    /// settings.json "tuiMode" (pi): "fullscreen" (default, alt-screen) or
+    /// "regular" (native main screen + terminal scrollback).
+    tui_mode: TuiMode = .fullscreen,
     /// settings.json "defaultProjectTrust" (pi): "ask" (default) | "always" |
     /// "never" — what to do when a project has trust-gated resources and no
     /// saved decision.
@@ -391,6 +399,12 @@ pub const Config = struct {
                 self.fullscreen_wheel_lines = null;
             }
         }
+        // Renderer: "fullscreen" (alt-screen, pi default) | "regular"
+        // (native main screen + scrollback).
+        if (strIn(root, "tuiMode")) |m| {
+            if (std.mem.eql(u8, m, "regular")) self.tui_mode = .regular;
+            if (std.mem.eql(u8, m, "fullscreen")) self.tui_mode = .fullscreen;
+        }
         // defaultProjectTrust: "ask" (default) | "always" | "never".
         if (strIn(root, "defaultProjectTrust")) |t| {
             if (std.mem.eql(u8, t, "always")) self.default_project_trust = .always;
@@ -568,6 +582,10 @@ pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, 
             for (pats) |pat| arr.append(.{ .string = pat }) catch {};
             try root.object.put(arena, "enabledModels", .{ .array = arr });
         }
+        try root.object.put(arena, "tuiMode", .{ .string = switch (self.tui_mode) {
+            .regular => "regular",
+            .fullscreen => "fullscreen",
+        } });
 
         const json_text = try std.json.Stringify.valueAlloc(arena, root, .{});
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json_text });

@@ -456,6 +456,22 @@ pub const TUI = struct {
     /// "end"). Guarded by render_mutex: the main loop, the spinner and the
     /// stdin watcher all scroll or render under it.
     sv: scroll_view.ScrollView = scroll_view.ScrollView.init(true, .auto),
+    /// Regular mode (settings "tuiMode": "regular"): no alt-screen — the
+    /// bottom chrome (menu/editor/status) is redrawn in place and the
+    /// transcript flows into the terminal's native scrollback (pi
+    /// TuiMainScreen semantics).
+    regular: bool = false,
+    /// Regular-mode render state: the previous bottom-chrome lines (the
+    /// diff base) and the screen row of the last chrome line's tail
+    /// (hardwareCursorRow). When content shrinks, the clear pass may
+    /// leave this behind the actual end — synced up in diffChrome.
+    /// Regular mode: the screen-protocol setup (mouse/bracketed paste/
+    /// kitty + scrolling-region reservation) is deferred to the first
+    /// frame, once the terminal height is measured.
+    regular_needs_setup: bool = false,
+    /// Regular mode: mouse/IME protocols are enabled. Both threads flip
+    /// this via setupTerminal/restoreTerminal; runs under render_mutex.
+    regular_setup_done: bool = false,
     /// Wheel events to line counts (pi: WheelScrollAccelerator). Only one
     /// input thread is active at a time (the watcher is joined before the
     /// main loop resumes), so no locking beyond the shared redraw.
@@ -2290,7 +2306,10 @@ pub const TUI = struct {
             .tree_filter => "all",
             .warnings => "true",
             .model_thinking => "none",
-            .tui_mode => "fullscreen",
+            .tui_mode => if (cfg) |c| switch (c.tui_mode) {
+                .regular => "regular",
+                .fullscreen => "fullscreen",
+            } else "fullscreen",
             .fs_exit_output => "transcript",
             .fs_scrollbar => if (cfg) |c| switch (c.fullscreen_scrollbar) {
                 .auto => "auto",
@@ -2371,7 +2390,41 @@ pub const TUI = struct {
                     c.fullscreen_wheel_lines = if (std.mem.eql(u8, next, "auto")) null else std.fmt.parseInt(u16, next, 10) catch null;
                 }
             },
-            // tui_mode/theme/etc: zpi cannot back these yet.
+            .tui_mode => {
+                if (cfg) |c| {
+                    const want_regular = std.mem.eql(u8, next, "regular");
+                    if ((c.tui_mode == .regular) != want_regular) {
+                        c.tui_mode = if (want_regular) .regular else .fullscreen;
+                        // LIVE screen-protocol swap (both directions go
+                        // through the full teardown/setup so the alt screen,
+                        // mouse modes and the scroll region are torn down in
+                        // the right order): teardown writes the EXIT
+                        // sequences for the OLD mode, setup re-arms for the
+                        // new one. flushTerminal writes synchronously (the
+                        // renders below must not interleave).
+                        self.restoreTerminal();
+                        self.regular = want_regular;
+                        self.regular_needs_setup = want_regular;
+                        self.regular_setup_done = false;
+                        self.setupTerminal();
+                        // The other renderer's diff state is meaningless:
+                        // rebuild from a clean slate, like a resize.
+                        for (self.prev_lines.items) |l| self.alloc.free(l);
+                        self.prev_lines.clearRetainingCapacity();
+                        self.prev_transcript_h = 0;
+                        self.rendered_scroll_top = null;
+                        if (self.scroll_glyphs.len > 0) {
+                            self.alloc.free(self.scroll_glyphs);
+                            self.scroll_glyphs = &.{};
+                        }
+                        self.force_full_repaint = true;
+                        // render_mutex is held here (the run loop's key
+                        // handling); redrawLocked renders + flushes inline.
+                        self.redrawLocked();
+                    }
+                }
+            },
+            // theme/etc: zpi cannot back these yet.
             else => return false,
         }
         if (cfg) |c| c.persistSettings(self.alloc, self.io) catch {};
@@ -3895,7 +3948,9 @@ pub const TUI = struct {
             };
             if (c.fullscreen_wheel_lines) |n| wheel.lines = .{ .fixed = n };
         }
-                var t: TUI = .{
+        var t: TUI = .{
+            .regular = if (cfg) |c| c.tui_mode == .regular else false,
+            .regular_needs_setup = if (cfg) |c| c.tui_mode == .regular else false,
             .io = io,
             .alloc = alloc,
             .session = session,
@@ -4047,17 +4102,42 @@ pub const TUI = struct {
         self.old_termios = old;
         self.term_restored = false;
         self.measureSize();
-        self.writeRaw("\x1b[?1049h"); // enter alt-screen
-        self.writeRaw(ansi.HIDE_CURSOR);
-        self.writeRaw("\x1b[2J\x1b[H"); // clear
+        if (!self.regular) {
+            self.writeRaw("\x1b[?1049h"); // enter alt-screen
+            self.writeRaw(ansi.HIDE_CURSOR);
+            self.writeRaw("\x1b[2J\x1b[H"); // clear
+        }
         // Enable mouse tracking (SGR). pi: ENABLE_ALL_MOTION_MOUSE for the
         // hover-revealed scrollbar and cursor; multiplexers lag on every
         // pointer move, so they get button-motion tracking instead.
-        const term = self.envTerm() orelse "";
+        // Regular mode: the FIRST setup pass also consumes the deferred
+        // one-shot (scrolling-region reservation). Teardown re-arms
+        // regular_needs_setup for re-entries (Ctrl+G external editor).
+        if (self.regular and self.regular_needs_setup) {
+            self.regular_needs_setup = false;
+            self.regular_setup_done = true;
+            // Reserve the whole screen as a scrolling region (pi:
+            // "reserve"): the shift-scroll repaint moves whole rows through
+            // the screen end into the terminal's native scrollback.
+            var rbuf: [16]u8 = undefined;
+            const rl = ansi.setScrollRegion(&rbuf, 1, @intCast(self.height));
+            self.writeRaw(rbuf[0..rl]);
+        }
+        {
+            const term = self.envTerm() orelse "";
         const multiplexer = self.envGet("TMUX") != null or
             self.envGet("ZELLIJ") != null or self.envGet("STY") != null or
             std.mem.startsWith(u8, term, "tmux") or std.mem.startsWith(u8, term, "screen");
-        if (multiplexer) {
+        // Regular mode: NO mouse reporting at all (pi TuiMainScreen — the
+        // mouse sequences live only in TuiAltScreen). Un-grabbing the wheel
+        // is the POINT of the mode: the terminal scrolls its native
+        // scrollback and the whole UI (chrome included) rides up with the
+        // history. Sending ?1000h here would make regular behave exactly
+        // like fullscreen (app-interpreted wheel, chrome pinned).
+        if (self.regular) {
+            // (focus reporting ?1004h stays: it is not a wheel grab.)
+            self.writeRaw("\x1b[?1004h");
+        } else if (multiplexer) {
             self.writeRaw("\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h");
         } else {
             self.writeRaw("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h");
@@ -4073,6 +4153,7 @@ pub const TUI = struct {
         // sends shift+enter as `ESC [ 13 ; 2 u`); when flags == 0 or only DA
         // answers, we fall back to modifyOtherKeys (see the run loop).
         self.writeRaw("\x1b[>7u\x1b[?u\x1b[c");
+        }
         // Terminal resizes must reach the run loop even while it blocks on
         // input (pi: process.stdout.on("resize") → requestRender).
         keys.installWinchHandler();
@@ -4131,8 +4212,9 @@ pub const TUI = struct {
         stdout.writeStreamingAll(self.io, "\x1b[?2004l") catch {}; // disable bracketed paste
         stdout.writeStreamingAll(self.io, "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l") catch {}; // disable mouse
         stdout.writeStreamingAll(self.io, "\x1b[<u") catch {}; // disable Kitty keyboard protocol
-        stdout.writeStreamingAll(self.io, "\x1b[?1049l") catch {}; // exit alt-screen
+        if (!self.regular) stdout.writeStreamingAll(self.io, "\x1b[?1049l") catch {}; // exit alt-screen
         stdout.writeStreamingAll(self.io, "\r\n") catch {};
+        self.regular_setup_done = false;
         // Post-screen-teardown replies (the ?1049l/\x1b[<u window can ack
         // late in backgrounded terminals): still raw — flush + short
         // grace-drain with echo off, then the final flush.
@@ -4307,7 +4389,7 @@ pub const TUI = struct {
             for (self.prev_lines.items) |l| self.alloc.free(l);
             self.prev_lines.clearRetainingCapacity();
             self.prev_transcript_h = 0;
-            self.writeRaw("\x1b[2J");
+            _ = self.writeRaw("\x1b[2J");
         }
         _ = self.refreshSize();
 
@@ -4780,6 +4862,11 @@ pub const TUI = struct {
         else
             transcript_h + q_h + 1 + (cursor_vis.row - vis_top);
         const cursor_col: u16 = @intCast(if (1 + cursor_vis.col < self.width) 1 + cursor_vis.col else self.width);
+        // Regular mode: the SAME full-frame diff as fullscreen — frame =
+        // transcript window + bottom chrome, height rows. Differences are in
+        // diffRender (no alt screen; full-screen scroll region so rows
+        // shifted out land in the native scrollback) and setupTerminal (no
+        // ?1049h). pi TuiMainScreen: one document, viewport = last h lines.
         // The frame must be EXACTLY self.height rows: every layout branch
         // above budgets its rows against self.height, but a stale or
         // mis-counted budget (queue rows, menu chrome, ...) can leave the
@@ -6049,6 +6136,13 @@ pub const TUI = struct {
         // Nothing changed: the frame's lines are freed, the previous frame
         // stays on screen (and as the next diff base).
         if (first_changed == null) {
+            if (self.regular) {
+                // The regular renderer never painted these rows; free them
+                // and leave the screen alone.
+                for (new_lines) |l| self.alloc.free(l);
+                frame.clearRetainingCapacity();
+                return;
+            }
             self.paintScrollbarLocked(&frame_out, new_lines);
             for (new_lines) |l| self.alloc.free(l);
             frame.clearRetainingCapacity();
@@ -6084,15 +6178,24 @@ pub const TUI = struct {
             else
                 null;
             if (detectShift(self.prev_lines.items, new_lines, th, first_changed.?, scroll_delta, &outlier_rows)) |s| {
-                // DECSTBM over the transcript region, native scroll by k,
-                // region reset. Setting either bounds homes the cursor; the
-                // paints below reposition absolutely anyway.
+                // DECSTBM over the scroll region, native scroll by k, region
+                // reset. Setting either bounds homes the cursor; the paints
+                // below reposition absolutely anyway. Regular mode (main
+                // screen): the region is the FULL screen — rows scrolled off
+                // the top land in the terminal's native scrollback (the
+                // whole point of the mode); the chrome rows at the bottom
+                // shift through untouched. Fullscreen keeps the transcript
+                // region (the chrome must not move on screen).
+                const region_bottom: u16 = if (self.regular)
+                    @intCast(self.height)
+                else
+                    @intCast(th);
                 var rbuf: [16]u8 = undefined;
-                const rl = ansi.setScrollRegion(&rbuf, 1, @intCast(th));
+                const rl = ansi.setScrollRegion(&rbuf, 1, region_bottom);
                 frame_out.appendSlice(self.alloc, rbuf[0..rl]) catch return;
                 var mv: [16]u8 = undefined;
                 if (s.up) {
-                    const ml = ansi.moveTo(&mv, @intCast(th), 1);
+                    const ml = ansi.moveTo(&mv, @intCast(region_bottom), 1);
                     frame_out.appendSlice(self.alloc, mv[0..ml]) catch return;
                     var left = s.k;
                     while (left > 0) : (left -= 1)
@@ -6149,8 +6252,15 @@ pub const TUI = struct {
             // Rows the native scroll already moved into place (verified
             // band) are on screen: inside the region only the revealed band
             // and the outliers need painting; below it, the plain diff.
+            // Regular mode: the scroll region is the FULL screen, so the
+            // native scroll moved the chrome rows too — every row at or
+            // below the transcript is on-screen garbage now and must be
+            // repainted (the text diff sees "unchanged" and would skip it,
+            // leaving the chrome stranded mid-screen or off-screen).
             const need = if (shifted and row < th)
                 (in_reveal or is_outlier)
+            else if (shifted)
+                true
             else
                 (row >= first_changed.? and row <= last_changed and
                     (row >= self.prev_lines.items.len or
@@ -6214,6 +6324,16 @@ pub const TUI = struct {
         }
     }
 
+    /// Regular mode (tuiMode: "regular", pi TuiMainScreen semantics): the
+    /// transcript content flows into the terminal's NATIVE scrollback — we
+    /// do not own the viewport, the terminal does. The bottom chrome (menus,
+    /// editor, status) is re-rendered in place on the last `chrome.len`
+    /// rows (never below the last row: content taller than the screen
+    /// scrolls the terminal and is lost into scrollback, which is exactly
+    /// how pi behaves here). The editor cursor lands by relative moves;
+    /// the transcript's history is left untouched.
+    /// Owns the transcript lines (frees them; they were never on-screen
+    /// rows in this mode).
     /// Park the hardware cursor where it belongs after a frame: hidden while
     /// the agent works (it would flash at stray spots), otherwise at the
     /// editor's cursor (pi: the cursor is positioned as the last write).
