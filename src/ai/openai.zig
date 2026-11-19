@@ -102,6 +102,20 @@ pub const OpenAiProvider = struct {
 
     const max_retries: usize = 3;
 
+        /// Emit a retry notice through the session's output callback (TUI
+        /// shows it in the scrollback; print mode ignores tool_info).
+        fn notifyRetry(self: *OpenAiProvider, session: anytype, attempt: usize, outcome: StreamOutcome) void {
+            _ = self;
+            const what = switch (outcome) {
+                .transport_error => "transport error",
+                .retryable_status => "retryable status",
+                else => "error",
+            };
+            var buf: [96]u8 = undefined;
+            const m = std.fmt.bufPrint(&buf, "\n[connection lost ({s}) — retrying {d}/{d}]\n", .{ what, attempt, max_retries - 1 }) catch return;
+            session.emit(.tool_info, m);
+        }
+
     fn hasStreamedOutput(self: *OpenAiProvider, session: anytype) bool {
         _ = self;
         return session.stream_text.items.len > 0 or
@@ -160,9 +174,25 @@ pub const OpenAiProvider = struct {
             const retryable = outcome == .transport_error or
                 (outcome == .retryable_status and !had_output);
             if (!retryable) return error.HttpError;
-            // Exponential backoff: 250ms, 500ms (abort-aware)
-            const delay_ms: i64 = 250 * @as(i64, @intCast(std.math.pow(u64, 2, attempt - 1)));
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(delay_ms), .real) catch {};
+            // pi onRetryableError: surface the retry so a mid-turn stall is
+            // never a silent pause ("Working" with nothing happening).
+            self.notifyRetry(session, attempt, outcome);
+            // Discard the failed attempt's partial output: a retry appends
+            // deltas to whatever is still in the stream buffers, which
+            // duplicated text and misaligned tool-argument JSON after a
+            // mid-stream drop.
+            session.resetStream();
+            // Exponential backoff: 1s, 2s, 4s (abort-aware) — 250/500ms
+            // re-hit the same gateway the moment it blips; a real stall
+            // needs a beat before the next attempt.
+            const delay_ms: i64 = 1000 * @as(i64, @intCast(std.math.pow(u64, 2, attempt - 1)));
+            var slept: i64 = 0;
+            while (slept < delay_ms) {
+                if (session.isAborted()) return error.Aborted;
+                const step: i64 = @min(200, delay_ms - slept);
+                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(step), .real) catch break;
+                slept += step;
+            }
         }
     }
 

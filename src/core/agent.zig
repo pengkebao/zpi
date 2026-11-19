@@ -519,13 +519,35 @@ pub const Session = struct {
         } });
     }
 
+    /// Provider-layer retry hook: discard everything the failed attempt
+    /// streamed so the retry starts from a clean slate. Without this, a
+    /// mid-stream transport failure followed by a retry would APPEND the
+    /// retry's deltas to the truncated attempt's output (duplicated text,
+    /// misaligned tool-call argument JSON). The TUI's live preview resets
+    /// with the buffers (streamHasContent goes false, the next delta
+    /// repaints from zero).
+    pub fn resetStream(self: *Session) void {
+        self.stream_text.clearRetainingCapacity();
+        self.stream_thinking.clearRetainingCapacity();
+        for (self.stream_tools.items) |*tc| {
+            self.alloc.free(tc.id);
+            self.alloc.free(tc.name);
+            self.alloc.free(tc.arguments);
+        }
+        self.stream_tools.clearRetainingCapacity();
+        self.stream_usage = null;
+        self.stream_finish = null;
+        self.tool_args_last_ms = 0;
+        self.tool_args_last_len = 0;
+    }
+
     pub fn isAborted(self: *Session) bool {
         _ = self;
         return g_abort.load(.acquire);
     }
 
     /// Route session output by kind and mode.
-    fn emit(self: *Session, kind: OutputKind, text: []const u8) void {
+    pub fn emit(self: *Session, kind: OutputKind, text: []const u8) void {
         if (self.output_cb) |oc| {
             oc.fn_ptr(oc.user_data, kind, text);
             return;

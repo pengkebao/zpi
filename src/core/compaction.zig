@@ -476,6 +476,29 @@ const SummarySession = struct {
         return if (self.abort_check) |c| c() else false;
     }
 
+    /// Retry notices from the provider layer: a compaction summary retry is
+    /// not user-visible output — swallow (the agent Session.emit routes its
+    /// own; this struct only needs the method to exist for anytype).
+    pub fn emit(self: *SummarySession, kind: anytype, text: []const u8) void {
+        _ = self;
+        _ = kind;
+        _ = text;
+    }
+
+    /// Provider-layer retry hook (duck-typed): clear the mock's buffers so
+    /// a retried summary attempt does not append to the failed one.
+    pub fn resetStream(self: *SummarySession) void {
+        self.stream_text.clearRetainingCapacity();
+        self.stream_thinking.clearRetainingCapacity();
+        for (self.stream_tools.items) |*tc| {
+            self.alloc.free(tc.id);
+            self.alloc.free(tc.name);
+            self.alloc.free(tc.arguments);
+        }
+        self.stream_tools.clearRetainingCapacity();
+        self.stream_usage = null;
+    }
+
     pub fn onStreamEvent(self: *SummarySession, event: ai.StreamEvent) void {
         switch (event) {
             .text_delta => |t| self.stream_text.appendSlice(t) catch {},

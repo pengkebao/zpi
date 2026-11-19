@@ -60,6 +60,22 @@ pub const ResponsesProvider = struct {
 
     const max_retries: usize = 3;
 
+
+        /// Emit a retry notice through the session's output callback (TUI
+        /// shows it in the scrollback; print mode ignores tool_info). Best
+        /// effort — a notification failure must never break the retry.
+        fn notifyRetry(self: *ResponsesProvider, session: anytype, attempt: usize, outcome: sse.SseOutcome) void {
+            _ = self;
+            const what = switch (outcome) {
+                .transport_error => "transport error",
+                .retryable_status => "retryable status",
+                else => "error",
+            };
+            var buf: [96]u8 = undefined;
+            const note = std.fmt.bufPrint(&buf, "\n[connection lost ({s}) — retrying {d}/{d}]\n", .{ what, attempt, max_retries - 1 }) catch return;
+            session.emit(.tool_info, note);
+        }
+
     fn hasStreamedOutput(self: *ResponsesProvider, session: anytype) bool {
         _ = self;
         return session.stream_text.items.len > 0 or
@@ -106,9 +122,27 @@ pub const ResponsesProvider = struct {
             if (attempt >= max_retries) return error.HttpError;
             const retryable = outcome == .transport_error or
                 (outcome == .retryable_status and !had_output);
+            // pi onRetryableError: surface the retry so a mid-turn stall is
+            // never a silent pause ("Working" with nothing happening).
+            self.notifyRetry(session, attempt, outcome);
+            // Discard the failed attempt's partial output: a retry appends
+            // deltas to whatever is still in the stream buffers, which
+            // duplicated text and misaligned tool-argument JSON after a
+            // mid-stream drop.
+            session.resetStream();
+
             if (!retryable) return error.HttpError;
-            const delay_ms: i64 = 250 * @as(i64, @intCast(std.math.pow(u64, 2, attempt - 1)));
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(delay_ms), .real) catch {};
+            // Exponential backoff: 1s, 2s, 4s (abort-aware) — 250/500ms
+            // re-hit the same gateway the moment it blips; a real stall
+            // needs a beat before the next attempt (pi: backoff, abortable).
+            const delay_ms: i64 = 1000 * @as(i64, @intCast(std.math.pow(u64, 2, attempt - 1)));
+            var slept: i64 = 0;
+            while (slept < delay_ms) {
+                if (session.isAborted()) return error.Aborted;
+                const step: i64 = @min(200, delay_ms - slept);
+                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(step), .real) catch break;
+                slept += step;
+            }
         }
     }
 
