@@ -178,15 +178,41 @@ pub const TUI = struct {
     /// same ids/labels/descriptions/values. Items zpi cannot back yet render
     /// their default and say so on Enter (settingsApply returns false).
     const SettingKind = enum {
-        autocompact, show_images, image_width, auto_resize_images, block_images,
-        skill_commands, show_hardware_cursor, editor_padding, output_padding,
-        autocomplete_max, clear_on_shrink, terminal_progress, steering_mode,
-        follow_up_mode, transport, share_destination, http_idle_timeout,
-        cache_warming, hide_thinking, mermaid, cache_miss_notices,
-        collapse_changelog, quiet_startup, install_telemetry,
-        default_project_trust, double_escape, tree_filter, warnings,
-        model_thinking, tui_mode, fs_exit_output, fs_scrollbar,
-        fs_copy_on_select, fs_wheel_lines, theme,
+        autocompact,
+        show_images,
+        image_width,
+        auto_resize_images,
+        block_images,
+        skill_commands,
+        show_hardware_cursor,
+        editor_padding,
+        output_padding,
+        autocomplete_max,
+        clear_on_shrink,
+        terminal_progress,
+        steering_mode,
+        follow_up_mode,
+        transport,
+        share_destination,
+        http_idle_timeout,
+        cache_warming,
+        hide_thinking,
+        mermaid,
+        cache_miss_notices,
+        collapse_changelog,
+        quiet_startup,
+        install_telemetry,
+        default_project_trust,
+        double_escape,
+        tree_filter,
+        warnings,
+        model_thinking,
+        tui_mode,
+        fs_exit_output,
+        fs_scrollbar,
+        fs_copy_on_select,
+        fs_wheel_lines,
+        theme,
     };
     const SettingDef = struct {
         kind: SettingKind,
@@ -1156,9 +1182,9 @@ pub const TUI = struct {
             const lead = s[i];
             const n: usize = if (lead < 0x80) 1 else wmod.utf8Len(lead);
             if (i + n > s.len) break;
-            const cw = wmod.visualWidth(s[i..i + n]);
+            const cw = wmod.visualWidth(s[i .. i + n]);
             if (w + cw > max_w) break;
-            @memcpy(buf[i..i + n], s[i..i + n]);
+            @memcpy(buf[i .. i + n], s[i .. i + n]);
             i += n;
             w += cw;
         }
@@ -1695,7 +1721,7 @@ pub const TUI = struct {
                 muted, if (self.ms_scope_all) accent else muted, reset, if (self.ms_scope_all) accent else muted, reset, muted, reset, muted, muted, reset,
             }) catch return;
             frame.append(self.alloc, line) catch return;
-            const hint = std.fmt.allocPrint(self.alloc, "  {s}tab (all/scoped){s}", .{muted, reset}) catch return;
+            const hint = std.fmt.allocPrint(self.alloc, "  {s}tab (all/scoped){s}", .{ muted, reset }) catch return;
             frame.append(self.alloc, hint) catch return;
         } else {
             const line = std.fmt.allocPrint(self.alloc, "{s}Only showing models from configured providers. Use /login to add providers.{s}", .{ warn, reset }) catch return;
@@ -2832,7 +2858,6 @@ pub const TUI = struct {
     }
 
     /// Add an owned one-line note to the scrollback, then free it.
-
     /// Switch the active model (creates a provider, swaps into the session).
     fn switchModel(self: *TUI, idx: usize) !void {
         const cfg = self.cfg orelse return error.NoConfig;
@@ -2964,7 +2989,7 @@ pub const TUI = struct {
         var n: usize = 0;
         const all = [_]config.ThinkingLevel{ .off, .low, .medium, .high, .xhigh, .max };
         for (all) |lvl| {
-            const i = @intFromEnum(lvl);
+            const i = @backingInt(lvl);
             if (i >= 4) { // xhigh/max: only when the model maps them
                 if (m.thinking_level_map[i]) |_| {
                     S.buf[n] = lvl;
@@ -3092,7 +3117,7 @@ pub const TUI = struct {
         const m = &cfg.models.items[idx];
         const is_default = self.isDefaultModel(idx);
         return std.fmt.bufPrint(buf, "{s} {s}/{s} {s} {s}{s}", .{
-            m.provider, m.provider, m.id, m.provider, m.id,
+            m.provider,                         m.provider, m.id, m.provider, m.id,
             if (is_default) " default" else "",
         }) catch "";
     }
@@ -4135,34 +4160,34 @@ pub const TUI = struct {
         }
         {
             const term = self.envTerm() orelse "";
-        const multiplexer = self.envGet("TMUX") != null or
-            self.envGet("ZELLIJ") != null or self.envGet("STY") != null or
-            std.mem.startsWith(u8, term, "tmux") or std.mem.startsWith(u8, term, "screen");
-        // Regular mode: NO mouse reporting at all (pi TuiMainScreen — the
-        // mouse sequences live only in TuiAltScreen). Un-grabbing the wheel
-        // is the POINT of the mode: the terminal scrolls its native
-        // scrollback and the whole UI (chrome included) rides up with the
-        // history. Sending ?1000h here would make regular behave exactly
-        // like fullscreen (app-interpreted wheel, chrome pinned).
-        if (self.regular) {
-            // (focus reporting ?1004h stays: it is not a wheel grab.)
-            self.writeRaw("\x1b[?1004h");
-        } else if (multiplexer) {
-            self.writeRaw("\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h");
-        } else {
-            self.writeRaw("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h");
-        }
-        // Bracketed paste (pi: it is always enabled): multi-line terminal
-        // pastes arrive as one ESC[200~ ... ESC[201~ chunk instead of Enter
-        // presses that would submit the buffer line by line.
-        self.writeRaw("\x1b[?2004h");
-        // Kitty keyboard protocol negotiation (pi-exact): push flags=7
-        // (disambiguate + event types + alternate keys), query the resulting
-        // flags, and DA1 as the no-support sentinel. The replies are consumed
-        // by key_reader; when flags != 0 the protocol is active (Ghostty then
-        // sends shift+enter as `ESC [ 13 ; 2 u`); when flags == 0 or only DA
-        // answers, we fall back to modifyOtherKeys (see the run loop).
-        self.writeRaw("\x1b[>7u\x1b[?u\x1b[c");
+            const multiplexer = self.envGet("TMUX") != null or
+                self.envGet("ZELLIJ") != null or self.envGet("STY") != null or
+                std.mem.startsWith(u8, term, "tmux") or std.mem.startsWith(u8, term, "screen");
+            // Regular mode: NO mouse reporting at all (pi TuiMainScreen — the
+            // mouse sequences live only in TuiAltScreen). Un-grabbing the wheel
+            // is the POINT of the mode: the terminal scrolls its native
+            // scrollback and the whole UI (chrome included) rides up with the
+            // history. Sending ?1000h here would make regular behave exactly
+            // like fullscreen (app-interpreted wheel, chrome pinned).
+            if (self.regular) {
+                // (focus reporting ?1004h stays: it is not a wheel grab.)
+                self.writeRaw("\x1b[?1004h");
+            } else if (multiplexer) {
+                self.writeRaw("\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h");
+            } else {
+                self.writeRaw("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h");
+            }
+            // Bracketed paste (pi: it is always enabled): multi-line terminal
+            // pastes arrive as one ESC[200~ ... ESC[201~ chunk instead of Enter
+            // presses that would submit the buffer line by line.
+            self.writeRaw("\x1b[?2004h");
+            // Kitty keyboard protocol negotiation (pi-exact): push flags=7
+            // (disambiguate + event types + alternate keys), query the resulting
+            // flags, and DA1 as the no-support sentinel. The replies are consumed
+            // by key_reader; when flags != 0 the protocol is active (Ghostty then
+            // sends shift+enter as `ESC [ 13 ; 2 u`); when flags == 0 or only DA
+            // answers, we fall back to modifyOtherKeys (see the run loop).
+            self.writeRaw("\x1b[>7u\x1b[?u\x1b[c");
         }
         // Terminal resizes must reach the run loop even while it blocks on
         // input (pi: process.stdout.on("resize") → requestRender).
@@ -4886,6 +4911,26 @@ pub const TUI = struct {
         while (frame.items.len < self.height) {
             const blank = self.alloc.dupe(u8, "") catch return;
             frame.append(self.alloc, blank) catch return;
+        }
+        // Last guard before the frame reaches the screen: every row must fit
+        // the terminal width. A row even one column wider AUTOWRAPS in the
+        // real terminal — every chained row below shifts one screen row down
+        // (or the screen scrolls when the shift happens on the last row) and
+        // the diff model never learns, which is exactly the "a line above the
+        // editor gets squeezed into the content, a re-refresh heals it"
+        // report. Individual generators cap most rows, but a dozen chrome
+        // branches (trust cwd, model-selector ids, MCP item rows, settings/
+        // login/scoped hint lines, welcome-header resource paths, ...) still
+        // format without a cap, and a new one would silently reintroduce the
+        // desync. One clamp here makes over-wide rows impossible regardless
+        // of which generator undercounted. Normal rows pay one cheap
+        // visualWidth scan; only genuinely over-wide rows pay the rebuild.
+        for (frame.items, 0..) |line, i| {
+            if (wmod.visibleWidthEsc(line) > self.width) {
+                const clamped = truncateToWidth(self.alloc, line, self.width) catch continue;
+                self.alloc.free(frame.items[i]);
+                frame.items[i] = clamped;
+            }
         }
         // diffRender adopts the frame's lines (they become the next diff
         // base); afterwards only the array itself needs releasing.
@@ -5870,7 +5915,7 @@ pub const TUI = struct {
                 const start = @min(seg.start_col, max_col);
                 const end = @min(seg.end_col, max_col);
                 if (end <= start) continue;
-                const highlighted = search.highlightLine(self.alloc, frame.items[@intCast(row)], &.{ .{ .start = start, .end = end, .current = mi == s.selected } }) catch continue;
+                const highlighted = search.highlightLine(self.alloc, frame.items[@intCast(row)], &.{.{ .start = start, .end = end, .current = mi == s.selected }}) catch continue;
                 self.alloc.free(frame.items[@intCast(row)]);
                 frame.items[@intCast(row)] = highlighted;
             }
@@ -6783,9 +6828,7 @@ pub const TUI = struct {
             defer markdown.freeLines(self.alloc, rendered);
             for (rendered) |row| self.appendBgRow(block, row, CUSTOM_MSG_BG);
         } else {
-            const line = std.fmt.allocPrint(self.alloc,
-                "{s}\x1b[1m[skill]\x1b[22m {s}{s} (\x1b[2mctrl+o\x1b[0m to expand)",
-                .{ CUSTOM_MSG_BG, FG_MUTED, e.name }) catch return;
+            const line = std.fmt.allocPrint(self.alloc, "{s}\x1b[1m[skill]\x1b[22m {s}{s} (\x1b[2mctrl+o\x1b[0m to expand)", .{ CUSTOM_MSG_BG, FG_MUTED, e.name }) catch return;
             defer self.alloc.free(line);
             self.appendBgRow(block, line, CUSTOM_MSG_BG);
         }
@@ -7251,7 +7294,7 @@ pub const TUI = struct {
 
     /// Rebuild the header in place after a Ctrl+O toggle (pi re-renders the
     /// BuiltInHeader from the same expanded flag that drives tool blocks).
-    fn refreshWelcomeHeader(self: *TUI) void {
+    pub fn refreshWelcomeHeader(self: *TUI) void {
         const idx = self.welcome_idx orelse return;
         const text = self.buildWelcomeHeader(self.tools_expanded) orelse return;
         self.render_mutex.lock(self.io) catch {
@@ -7299,9 +7342,8 @@ pub const TUI = struct {
             const logo = std.fmt.allocPrint(self.alloc,
                 // top: bg blue fg coral ▀, then coral ▀█, padded to 4 cells
                 "{s}{s}\u{2580}\x1b[0m{s}\u{2580}\u{2588}\x1b[0m {s}\n" ++
-                // bottom: blue █▀, space, yellow █
-                "{s}\u{2588}\u{2580}\x1b[0m {s}\u{2588} {s}",
-                .{ LOGO_BLUE_BG, LOGO_CORAL, LOGO_CORAL, version_line, LOGO_BLUE, LOGO_BLUE, LOGO_YELLOW }) catch return null;
+                    // bottom: blue █▀, space, yellow █
+                    "{s}\u{2588}\u{2580}\x1b[0m {s}\u{2588} {s}", .{ LOGO_BLUE_BG, LOGO_CORAL, LOGO_CORAL, version_line, LOGO_BLUE, LOGO_BLUE, LOGO_YELLOW }) catch return null;
             defer self.alloc.free(logo);
             w.appendSlice(self.alloc, logo) catch return null;
         }
@@ -7477,48 +7519,48 @@ pub const TUI = struct {
             switch (it) {
                 .compaction => |ci| self.addCompactionBlock(ci),
                 .message => |m| {
-            switch (m.role) {
-                .system => {},
-                .user => {
-                    var buf: std.ArrayListUnmanaged(u8) = .empty;
-                    defer buf.deinit(alloc);
-                    for (m.blocks.items) |b| switch (b) {
-                        .text => |t| {
-                            if (buf.items.len > 0) buf.appendSlice(alloc, "\n\n") catch {};
-                            buf.appendSlice(alloc, t) catch {};
+                    switch (m.role) {
+                        .system => {},
+                        .user => {
+                            var buf: std.ArrayListUnmanaged(u8) = .empty;
+                            defer buf.deinit(alloc);
+                            for (m.blocks.items) |b| switch (b) {
+                                .text => |t| {
+                                    if (buf.items.len > 0) buf.appendSlice(alloc, "\n\n") catch {};
+                                    buf.appendSlice(alloc, t) catch {};
+                                },
+                                else => {},
+                            };
+                            // A persisted `<skill>` block replays as a collapsed
+                            // skill block (pi parseSkillBlock in renderSessionItems).
+                            if (buf.items.len > 0) self.addSubmittedMessage(buf.items);
                         },
-                        else => {},
-                    };
-                    // A persisted `<skill>` block replays as a collapsed
-                    // skill block (pi parseSkillBlock in renderSessionItems).
-                    if (buf.items.len > 0) self.addSubmittedMessage(buf.items);
-                },
-                .assistant => {
-                    for (m.blocks.items) |b| switch (b) {
-                        .thinking => |t| self.addThinkingBlock(t),
-                        .text => |t| self.addAssistantMessage(t),
-                        .tool_call => |tc| self.replayToolCall(tc),
-                        else => {},
-                    };
-                },
-                .tool => {
-                    for (m.blocks.items) |b| switch (b) {
-                        .tool_result => |tr| self.replayToolResult(tr),
-                        else => {},
-                    };
-                },
-                .bash_execution => {
-                    const cmd = m.bash_command orelse "";
-                    const out_text = if (m.blocks.items.len > 0) blk: {
-                        for (m.blocks.items) |b| switch (b) {
-                            .text => |t| break :blk t,
-                            else => {},
-                        };
-                        break :blk "";
-                    } else "";
-                    self.addBashBlock(cmd, out_text, m.bash_exit_code, m.bash_exclude);
-                },
-            }
+                        .assistant => {
+                            for (m.blocks.items) |b| switch (b) {
+                                .thinking => |t| self.addThinkingBlock(t),
+                                .text => |t| self.addAssistantMessage(t),
+                                .tool_call => |tc| self.replayToolCall(tc),
+                                else => {},
+                            };
+                        },
+                        .tool => {
+                            for (m.blocks.items) |b| switch (b) {
+                                .tool_result => |tr| self.replayToolResult(tr),
+                                else => {},
+                            };
+                        },
+                        .bash_execution => {
+                            const cmd = m.bash_command orelse "";
+                            const out_text = if (m.blocks.items.len > 0) blk: {
+                                for (m.blocks.items) |b| switch (b) {
+                                    .text => |t| break :blk t,
+                                    else => {},
+                                };
+                                break :blk "";
+                            } else "";
+                            self.addBashBlock(cmd, out_text, m.bash_exit_code, m.bash_exclude);
+                        },
+                    }
                 },
             }
         }
@@ -7596,7 +7638,10 @@ pub const TUI = struct {
     }
 
     fn agent_dir_for_templates(self: *TUI) []const u8 {
-        return self.cfg.?.base_dir;
+        // Tests (and any future headless path) may run without a config; the
+        // caller handles a null result as "no templates".
+        const cfg = self.cfg orelse return "/nonexistent-agent-dir";
+        return cfg.base_dir;
     }
 
     /// Expand a `/skill:name [args]` submission (pi _expandSkillCommand). The
@@ -7951,7 +7996,9 @@ pub const TUI = struct {
         self.redraw();
     }
 
-    fn freeTrustPrompt(self: *TUI) void {
+    /// Free the trust prompt state (the cwd string). Public: the frame-width
+    /// regression test drives the trust view through beginTrustPrompt.
+    pub fn freeTrustPrompt(self: *TUI) void {
         if (self.trust_prompt) |*tp| {
             self.alloc.free(tp.cwd);
             self.trust_prompt = null;
@@ -8447,7 +8494,7 @@ pub const TUI = struct {
     }
 
     fn outputCallback(ctx: *anyopaque, kind: agent.OutputKind, text: []const u8) void {
-        const t: *TUI = @alignCast(@ptrCast(ctx));
+        const t: *TUI = @ptrCast(@alignCast(ctx));
         switch (kind) {
             .text, .thinking => {
                 // stream_mutex only: a delta must never queue behind a frame
@@ -8827,7 +8874,9 @@ pub const TUI = struct {
         return .{ .word = trimmed[0..split_at], .arg = std.mem.trim(u8, trimmed[split_at + 1 ..], " \t") };
     }
 
-    fn handleCommand(self: *TUI, cmd: []const u8) bool {
+    /// Dispatch one slash-command line (pi handleCommand). Public: the
+    /// frame-width regression test drives the selector UIs through it.
+    pub fn handleCommand(self: *TUI, cmd: []const u8) bool {
         const parsed = parseCmd(cmd);
         const word = parsed.word;
         const arg = parsed.arg;
@@ -8841,7 +8890,7 @@ pub const TUI = struct {
                 self.submitText(expanded);
                 return false;
             }
-            self.note("Unknown skill: {s}", .{ word[7..] });
+            self.note("Unknown skill: {s}", .{word[7..]});
             self.redraw();
             return false;
         }
@@ -8889,23 +8938,7 @@ pub const TUI = struct {
         }
 
         if (std.mem.eql(u8, word, "/help")) {
-            self.addMessage("Commands:\n"
-                ++ "  /exit          quit\n"
-                ++ "  /help          show this help\n"
-                ++ "  /clear         clear conversation\n"
-                ++ "  /model [name]  switch model (interactive selector)\n"
-                ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)\n"
-                ++ "  /session       show current session info\n"
-                ++ "  /name <name>   name this session\n"
-                ++ "  /new           start a new session\n"
-                ++ "  /tree          show session entry tree\n"
-                ++ "  /fork          fork current session into a new one\n"
-                ++ "  /resume <id>   resume a session by (partial) id\n"
-                ++ "  /export [path] export session to HTML (default: alongside)\n"
-                ++ "  /mcp           list MCP servers and their state\n"
-                ++ "  /compact [f]   compact the context now (optionally focused)\n"
-                ++ "  /copy          copy last assistant message to clipboard\n"
-                ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)");
+            self.addMessage("Commands:\n" ++ "  /exit          quit\n" ++ "  /help          show this help\n" ++ "  /clear         clear conversation\n" ++ "  /model [name]  switch model (interactive selector)\n" ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)\n" ++ "  /session       show current session info\n" ++ "  /name <name>   name this session\n" ++ "  /new           start a new session\n" ++ "  /tree          show session entry tree\n" ++ "  /fork          fork current session into a new one\n" ++ "  /resume <id>   resume a session by (partial) id\n" ++ "  /export [path] export session to HTML (default: alongside)\n" ++ "  /mcp           list MCP servers and their state\n" ++ "  /compact [f]   compact the context now (optionally focused)\n" ++ "  /copy          copy last assistant message to clipboard\n" ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)");
             self.redraw();
             return false;
         }
@@ -8924,7 +8957,7 @@ pub const TUI = struct {
             const lw = &aw.writer;
             lw.writeAll("Keybindings (keybindings.json):\n") catch {};
             inline for (0..keybindings.Action.count) |i| {
-                const action: keybindings.Action = @enumFromInt(i);
+                const action: keybindings.Action = @fromBackingInt(@intCast(i));
                 if (keybindings.actionLabel(self.alloc, &self.bindings, action) catch null) |label| {
                     defer self.alloc.free(label);
                     lw.print("  {s:<18} {s}\n", .{ action.name(), label }) catch {};
@@ -9283,7 +9316,6 @@ pub const TUI = struct {
     }
 
     /// Add an owned one-line note to the scrollback, then free it.
-
     fn noteOwned(self: *TUI, text: []const u8) void {
         self.addMessage(text);
         self.alloc.free(text);
@@ -9754,7 +9786,6 @@ pub const TUI = struct {
                 continue;
             }
             if (!modal_open and self.bindings.matches(key, .paste_clipboard)) {
-
                 self.handleClipboardPaste();
                 continue;
             }

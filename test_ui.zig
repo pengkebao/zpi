@@ -1479,3 +1479,90 @@ test "editor geometry: the live queue shifts the editor rows and the cursor park
     // The editor's first row sits AFTER the live queue rows and the border.
     try std.testing.expectEqual(t.transcript_h + qrows + 1, t.editor_frame_row);
 }
+
+test "frame: selector chrome rows never exceed the width (desync regression)" {
+    // The user-reported desync ("a line above the editor gets squeezed into
+    // the content, a re-refresh heals it") comes from a frame row wider than
+    // the terminal: the row autowraps, every chained row below shifts one
+    // screen row, and the diff model never learns. Several chrome branches
+    // formatted without a width cap (trust cwd, model-selector id/provider,
+    // MCP item rows, settings/login/scoped hint lines, welcome-header
+    // resource paths). The frame-level clamp in redrawLocked must keep every
+    // row within the width in every view.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "a-very-long-provider-name-that-alone-fills-rows"),
+        .id = try alloc.dupe(u8, "an-extremely-long-model-identifier-qwen3.8-27b-instruct-thinking-max"),
+        .name = try alloc.dupe(u8, "An Extremely Long Model Name For Clamping Tests"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+
+    // Transcript content with CJK + emoji (width math stress), plus a tool
+    // card and a queued steering row, so every layer is on screen at once.
+    t.addMessage("# 压力测试标题\n\n```zig\nconst s = \"很长的中文字符串用来测试折行行为是否正确🚀🚀\";\n```\n");
+    try t.compact_queue.append(.{ .text = try alloc.dupe(u8, "压缩队列里的一条很长的消息，包含中文与 emoji 🚀，用来撑满队列行的折行预算"), .mode = .steer });
+
+    // Drive every selector UI (the previously uncapped generators).
+    const commands = [_][]const u8{
+        "/model",
+        "/settings",
+        "/scoped-models",
+        "/login",
+        "/mcp",
+    };
+    var w: u16 = 12;
+    while (w <= 130) : (w += 1) {
+        t.width = w;
+        t.height = 20;
+
+        // Baseline chrome + transcript + queues.
+        t.redraw();
+        try expectFrameFits(&t, w);
+
+        for (commands) |cmd| {
+            _ = t.handleCommand(cmd);
+            t.redraw();
+            try expectFrameFits(&t, w);
+            // Escape closes the selector back to the plain chrome.
+            _ = try t.editor.setText("");
+            t.menu_mode = .hidden;
+            t.menu_len = 0;
+        }
+
+        // Trust prompt (public entry; long cwd used to overflow l2).
+        const long_cwd = try std.fmt.allocPrint(alloc, "/very/deeply/nested/path/structure/中文目录名/{d}/end", .{w});
+        defer alloc.free(long_cwd);
+        t.beginTrustPrompt(long_cwd, null, true);
+        t.redraw();
+        try expectFrameFits(&t, w);
+        t.menu_mode = .hidden;
+        t.freeTrustPrompt();
+        t.menu_len = 0;
+
+        // Welcome header (resource paths) at this width.
+        t.refreshWelcomeHeader();
+        t.redraw();
+        try expectFrameFits(&t, w);
+    }
+}
+
+fn expectFrameFits(t: *tui.TUI, w: u16) !void {
+    for (t.prev_lines.items, 0..) |l, i| {
+        const fw = frameRowWidth(l);
+        if (fw > w) {
+            std.debug.print("\nwidth {d} row {d}: {d} > {d}: {s}", .{ w, i, fw, w, l[0..@min(l.len, 120)] });
+            return error.FrameRowTooWide;
+        }
+    }
+    // The frame invariant: exactly one screen worth of rows.
+    if (t.prev_lines.items.len > t.height) return error.FrameTooTall;
+}
