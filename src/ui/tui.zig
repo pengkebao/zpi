@@ -732,6 +732,11 @@ pub const TUI = struct {
     /// over a slow pipe makes fast pulls freeze, then burst.
     last_wheel_frame_ms: i64 = 0,
     wheel_frame_pending: bool = false,
+    /// Selection-drag frame pacing (same throttle as the wheel): drag events
+    /// arrive at the terminal's motion-report rate; a full frame per event
+    /// floods the tty (every highlighted row rewrites) and stutters the drag.
+    last_drag_frame_ms: i64 = 0,
+    drag_frame_pending: bool = false,
 
     // ---- Completion menu state (G4) ----
     menu_mode: MenuMode = .hidden,
@@ -3846,8 +3851,9 @@ pub const TUI = struct {
                         switch (m.button & 3) {
                             0 => acted = self.handleDrag(m.col, m.row),
                             3 => {
-                                self.handleHover(m.col, m.row);
-                                acted = true;
+                                // Hover repaints only when the hover state
+                                // actually changed (scrollbar/search arrow).
+                                acted = self.handleHover(m.col, m.row);
                             },
                             else => {},
                         }
@@ -5641,7 +5647,7 @@ pub const TUI = struct {
             defer self.alloc.free(t);
             self.copyToClipboard(t);
             self.flash("Copied!");
-            self.redraw();
+            self.redrawCached();
         }
     }
 
@@ -5764,12 +5770,23 @@ pub const TUI = struct {
             // the first/last cell of the row).
             const cc = if (col < 1) 1 else @min(col, self.width -| 2);
             if (self.screenToEditor(cc, target_row)) |p| {
-                self.editor.sel_focus = self.editor.visualToLogical(p.vrow + self.editor_vis_top, p.vcol, self.editor_render_width);
+                const new_focus = self.editor.visualToLogical(p.vrow + self.editor_vis_top, p.vcol, self.editor_render_width);
+                // Report whether the focus MOVED: the pointer can emit many
+                // events per cell; each one used to cost a full frame.
+                const old = self.editor.sel_focus;
+                const moved = old == null or old.?.line != new_focus.line or old.?.col != new_focus.col;
+                self.editor.sel_focus = new_focus;
+                return moved;
             }
-            return true;
+            return false;
         }
-        if (self.screenToDoc(col, row)) |p| self.sel_focus = p;
-        return true;
+        if (self.screenToDoc(col, row)) |p| {
+            const old = self.sel_focus;
+            const moved = old == null or old.?.row != p.row or old.?.col != p.col;
+            self.sel_focus = p;
+            return moved;
+        }
+        return false;
     }
 
     /// Release: no movement = click (toggle the tool block under the
@@ -6253,14 +6270,14 @@ pub const TUI = struct {
 
     /// Pointer move without a button: the scrollbar hover reveal and the
     /// search box's navigation buttons (pi: handleSearchMouseEvent hover).
-    fn handleHover(self: *TUI, col: usize, row: usize) void {
+    fn handleHover(self: *TUI, col: usize, row: usize) bool {
         if (self.search) |*s| {
             if (s.contains(col, row)) {
                 s.hover_dir = s.navDirectionAt(row - search.Search.BOX_ROW, col - s.box_col);
-                return;
+                return true;
             }
         }
-        _ = self.scrollbarHover(col, row);
+        return self.scrollbarHover(col, row);
     }
 
     /// Jump to the previous (-1) or next (+1) user message (pi:
@@ -9760,7 +9777,7 @@ pub const TUI = struct {
             // While compaction runs the main loop must keep waking to poll
             // compact_done (the worker sets it from its own thread).
             self.key_reader.paste_alloc = self.alloc;
-            self.key_reader.poll = self.sv.hide_at_ms != null or self.flash_msg != null or self.wheel_frame_pending or self.compacting;
+            self.key_reader.poll = self.sv.hide_at_ms != null or self.flash_msg != null or self.wheel_frame_pending or self.drag_frame_pending or self.compacting;
             const key = self.key_reader.nextKey(0, self.io) catch break;
             // Compaction finished on its worker thread: render the result and
             // flush the queue (main thread only, like a normal turn end).
@@ -9809,7 +9826,9 @@ pub const TUI = struct {
                 const scrollbar_ticked = self.sv.tick(ss.nowMs(self.io));
                 const had_flash = self.flash_msg != null;
                 self.tickFlashLocked(ss.nowMs(self.io));
-                const need = self.wheel_frame_pending or scrollbar_ticked or
+                const drag_ticked = self.drag_frame_pending;
+                self.drag_frame_pending = false;
+                const need = drag_ticked or self.wheel_frame_pending or scrollbar_ticked or
                     (had_flash and self.flash_msg == null);
                 self.wheel_frame_pending = false;
                 if (need) self.redrawLocked();
@@ -9941,25 +9960,42 @@ pub const TUI = struct {
                     self.last_click_cell = click.cell;
                     const clicks = @max(click.clicks, self.click_streak);
                     _ = self.handlePress(click.cell.col, click.cell.row, clicks);
-                    self.redraw();
+                    self.redrawCached();
                     continue;
                 },
                 .mouse_move => |cell| {
                     // Buttonless motion while a drag is pending = the
                     // release happened outside the window: finalize.
                     self.abandonStaleDrag();
-                    self.handleHover(cell.col, cell.row);
-                    self.redraw();
+                    // Hover only repaints when something actually changed
+                    // (scrollbar hover state, search-box arrow) — with mouse
+                    // motion reporting on, every pointer move used to cost
+                    // a full frame.
+                    if (self.handleHover(cell.col, cell.row)) self.redrawCached();
                     continue;
                 },
                 .mouse_drag => |cell| {
-                    _ = self.handleDrag(cell.col, cell.row);
-                    self.redraw();
+                    // handleDrag reports whether the selection focus moved;
+                    // frames are paced like the wheel's (one per 50 ms with
+                    // a trailing flush) — per-event full frames flooded the
+                    // tty and stuttered the drag (every highlighted row
+                    // rewrites).
+                    const moved = self.handleDrag(cell.col, cell.row);
+                    const now = ss.nowMs(self.io);
+                    if (moved or self.drag_frame_pending) {
+                        if (now - self.last_drag_frame_ms >= watch_redraw_min_ms) {
+                            self.last_drag_frame_ms = now;
+                            self.drag_frame_pending = false;
+                            self.redrawCached();
+                        } else if (moved) {
+                            self.drag_frame_pending = true;
+                        }
+                    }
                     continue;
                 },
                 .mouse_release => |cell| {
                     _ = self.handleRelease(cell.col, cell.row);
-                    self.redraw();
+                    self.redrawCached();
                     continue;
                 },
                 else => {},
