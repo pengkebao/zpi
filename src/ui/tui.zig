@@ -634,6 +634,13 @@ pub const TUI = struct {
     multi_provider: bool = false,
     /// Background stdin watcher (Escape = abort) active while working.
     watch_thread: ?std.Thread = null,
+    /// One-shot ctrl+v clipboard reader (watcher-spawned); joined by stopWatch.
+    watch_paste_thread: ?std.Thread = null,
+    /// Set while the watcher/paste threads run handleCommand/switchModel or
+    /// paste handlers: their nested redraw() calls must not walk the session
+    /// (computeFooterStats races the agent thread's appends). Main thread and
+    /// spinner never set it.
+    watcher_redraw: bool = false,
     watch_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     watch_captured: std.ArrayListUnmanaged(u8) = .empty,
     watch_mutex: std.Io.Mutex = std.Io.Mutex.init,
@@ -3617,6 +3624,10 @@ pub const TUI = struct {
             t.join();
             self.watch_thread = null;
         }
+        if (self.watch_paste_thread) |t| {
+            t.join();
+            self.watch_paste_thread = null;
+        }
         self.watch_mutex.lock(self.io) catch {};
         defer self.watch_mutex.unlock(self.io);
         if (self.watch_captured.items.len > 0) {
@@ -3626,6 +3637,59 @@ pub const TUI = struct {
             self.key_reader.pending_len += cap;
             self.watch_captured.clearRetainingCapacity();
         }
+    }
+
+    /// Ctrl+V while working: read the clipboard on a helper thread (pbpaste
+    /// oscillates between ~50 ms and 1-2 s; on the watcher thread a slow read
+    /// would eat several poll timeouts and a stale lone-ESC check could abort
+    /// the turn). Only one instance at a time; stopWatch joins it.
+    fn watchPasteMain(self: *TUI) void {
+        self.watcher_redraw = true;
+        self.handleClipboardPaste();
+        self.watcher_redraw = false;
+        self.redrawCached();
+    }
+
+    /// handleCommand with the watcher thread's restrictions (pi: extension
+    /// commands run immediately, even while streaming). Commands that would
+    /// rebuild the turn's own data structures from under the running
+    /// runPrompt are deferred: they note and return (the user retries after
+    /// Esc, or at turn end). Session-name changes are serialized with the
+    /// main thread's store writes (the store has no internal lock; the
+    /// appendLine payload race stays window-tiny and name-only).
+    /// Returns the should_exit verdict (only /exit can be true here).
+    fn watchRunCommand(self: *TUI, cmd: []const u8) bool {
+        const parsed = parseCmd(cmd);
+        const word = parsed.word;
+        // pi handleCommand switch: session/tree surgery is unsafe mid-turn
+        // (it replaces session.store / rebuilds context — runPrompt reads
+        // both). Modal selectors (settings/mcp/trust/login/scoped) open
+        // dialogs the watcher cannot drive — defer those too.
+        const unsafe = std.mem.eql(u8, word, "/new") or
+            std.mem.eql(u8, word, "/resume") or
+            std.mem.eql(u8, word, "/fork") or
+            std.mem.eql(u8, word, "/clone") or
+            std.mem.eql(u8, word, "/import") or
+            std.mem.eql(u8, word, "/tree") or
+            std.mem.eql(u8, word, "/clear") or
+            std.mem.eql(u8, word, "/compact") or
+            std.mem.eql(u8, word, "/settings") or
+            std.mem.eql(u8, word, "/mcp") or
+            std.mem.eql(u8, word, "/trust") or
+            std.mem.eql(u8, word, "/login") or
+            std.mem.eql(u8, word, "/logout") or
+            std.mem.eql(u8, word, "/scoped-models");
+        if (unsafe) {
+            self.note("{s}: press Esc to stop the current turn first", .{word});
+            self.redrawCached();
+            return false;
+        }
+        // Store writes are serialized in appendLine itself; everything else
+        // (redraws via note/addMessage, settings persist, skill /reload) is
+        // the same work the steering path already does from this thread.
+        self.watcher_redraw = true;
+        defer self.watcher_redraw = false;
+        return self.handleCommand(cmd);
     }
 
     /// Watcher body: timed reads; a lone ESC aborts, anything else is captured
@@ -3725,6 +3789,36 @@ pub const TUI = struct {
                     }
                     continue;
                 }
+                // Terminal bracketed paste (Cmd+V): the chunk arrives whole
+                // (seqLenAt completes \x1b[200~...\x1b[201~ as one seq). Insert
+                // live — pi: the editor paste event carries the full text in
+                // every state. Bytes inside the body are literal payload; the
+                // terminator never reaches this loop as a separate seq.
+                if (seq.len >= 6 and std.mem.startsWith(u8, seq, "\x1b[200~")) {
+                    var body = seq[6..];
+                    if (std.mem.endsWith(u8, body, "\x1b[201~")) body = body[0 .. body.len - 6];
+                    self.render_mutex.lockUncancelable(self.io);
+                    self.editor.pasteText(body) catch {};
+                    self.render_mutex.unlock(self.io);
+                    acted = true;
+                    continue;
+                }
+                // Ctrl+V (pi app.clipboard.pasteImage): clipboard image →
+                // temp-file path at the cursor, or text fallback. Spawned on
+                // a helper thread — pbpaste/pbpaste oscillate between 50 ms
+                // and 1-2 s; a poll-timeout tick (100 ms) would otherwise be
+                // misread as a lone ESC and abort the running turn.
+                if (keys.parseSequence(seq, self.key_reader.kitty_active)) |k| {
+                    if (k == .char and k.char.ctrl and k.char.c == 'v') {
+                        if (self.watch_paste_thread == null) {
+                            if (std.Thread.spawn(.{}, watchPasteMain, .{self})) |t| {
+                                self.watch_paste_thread = t;
+                            } else |_| {}
+                        }
+                        acted = true;
+                        continue;
+                    }
+                }
                 if (std.mem.startsWith(u8, seq, "\x1b[<")) {
                     const m = keys.parseSgrMouse(seq) orelse continue;
                     if (m.button & 64 != 0) {
@@ -3806,6 +3900,174 @@ pub const TUI = struct {
                 // combos and keys we don't handle here keep the old capture
                 // and replay behavior below.
                 if (keys.parseSequence(seq, self.key_reader.kitty_active)) |k| {
+                    // The completion menu is open (slash menu from a "/"
+                    // typed mid-turn, or a modal the watcher opened via a
+                    // command like /model): drive it here — the main loop is
+                    // inside runPrompt and will not see these keys. Mirrors
+                    // the main loop's handling; redraws go through
+                    // redrawCached (cached footer stats; the main thread
+                    // walks the session and the agent thread is appending).
+                    if (self.menu_mode == .commands or self.menu_mode == .model_selector or self.menu_mode == .thinking_selector) {
+                        if (self.bindings.matches(k, .menu_up)) {
+                            if (self.menu_mode == .commands) {
+                                if (self.menu_len > 0) self.menu_selected = if (self.menu_selected == 0) self.menu_len - 1 else self.menu_selected - 1;
+                            } else if (self.menu_mode == .model_selector) {
+                                if (self.ms_sel > 0) self.ms_sel -= 1;
+                            } else {
+                                if (self.ts_sel > 0) self.ts_sel -= 1;
+                            }
+                            acted = true;
+                            continue;
+                        }
+                        if (self.bindings.matches(k, .menu_down)) {
+                            if (self.menu_mode == .commands) {
+                                if (self.menu_len > 0) self.menu_selected = if (self.menu_selected + 1 >= self.menu_len) 0 else self.menu_selected + 1;
+                            } else if (self.menu_mode == .model_selector) {
+                                if (self.ms_sel + 1 < self.ms_visible) self.ms_sel += 1;
+                            } else {
+                                if (self.ts_sel + 1 < self.ts_visible) self.ts_sel += 1;
+                            }
+                            acted = true;
+                            continue;
+                        }
+                        if (self.bindings.matches(k, .menu_close)) {
+                            self.render_mutex.lockUncancelable(self.io);
+                            if (self.menu_mode == .model_selector) {
+                                self.closeModelSelector();
+                            } else if (self.menu_mode == .thinking_selector) {
+                                self.menu_mode = .hidden;
+                                self.editor.clear() catch {};
+                            } else {
+                                self.menu_mode = .hidden;
+                                self.menu_len = 0;
+                                self.freeMenuTextCache();
+                            }
+                            self.render_mutex.unlock(self.io);
+                            acted = true;
+                            continue;
+                        }
+                        if (self.bindings.matches(k, .menu_tab) and self.menu_mode == .commands) {
+                            self.render_mutex.lockUncancelable(self.io);
+                            self.menuComplete();
+                            self.freeMenuTextCache();
+                            self.updateMenu();
+                            self.render_mutex.unlock(self.io);
+                            acted = true;
+                            continue;
+                        }
+                        if (self.bindings.matches(k, .menu_confirm)) {
+                            self.render_mutex.lockUncancelable(self.io);
+                            const sel = self.menu_selected;
+                            const ms_sel = self.ms_sel;
+                            const ms_vis = self.ms_visible;
+                            const ms_idx: usize = if (ms_vis > 0 and ms_sel < self.ms_filtered.items.len) self.ms_filtered.items[ms_sel] else 0;
+                            const ts_sel = self.ts_sel;
+                            const ts_vis = self.ts_visible;
+                            const ts_lvl: config.ThinkingLevel = if (ts_vis > 0 and ts_sel < self.ts_levels.len) self.ts_levels[ts_sel] else .off;
+                            var cmd_owned = false;
+                            const cmd: ?[]const u8 = if (self.menu_mode == .commands) blk: {
+                                if (sel >= self.menu_len) break :blk null;
+                                if (commandTakesArg(self.menu_items[sel].name)) {
+                                    // pi editor select.confirm: a "/"-prefix
+                                    // completion falls through to SUBMIT —
+                                    // fill "/name " then run it at once.
+                                    self.menuComplete();
+                                    self.menu_mode = .hidden;
+                                    self.menu_len = 0;
+                                    self.freeMenuTextCache();
+                                    // Owned text (editor.getText dupes).
+                                    cmd_owned = true;
+                                    break :blk self.editor.getText() catch null;
+                                }
+                                // Non-arg commands run by name (borrowed from
+                                // COMMANDS — static, no ownership).
+                                self.editor.clear() catch {};
+                                self.menu_mode = .hidden;
+                                self.menu_len = 0;
+                                self.freeMenuTextCache();
+                                break :blk self.menu_items[sel].name;
+                            } else null;
+                            if (self.menu_mode == .model_selector) {
+                                self.closeModelSelector();
+                            } else if (self.menu_mode == .thinking_selector) {
+                                self.menu_mode = .hidden;
+                                self.editor.clear() catch {};
+                            }
+                            self.render_mutex.unlock(self.io);
+                            if (self.menu_mode == .model_selector and ms_vis > 0) {
+                                // switchModel swaps the provider pointer — the
+                                // next LLM request reads it. Between rounds the
+                                // agent thread is idle (request/response fully
+                                // consumed before runPrompt returns), so the
+                                // swap is ordered. Its nested redraw() must use
+                                // the cached path (watcher thread).
+                                self.watcher_redraw = true;
+                                self.switchModel(ms_idx) catch |err| {
+                                    self.note("model switch failed: {s}", .{@errorName(err)});
+                                };
+                                self.watcher_redraw = false;
+                            } else if (self.menu_mode == .thinking_selector and ts_vis > 0) {
+                                self.session.thinking_level = ts_lvl;
+                                if (self.session.store) |st_t| st_t.recordThinkingLevel(ts_lvl.name());
+                                self.note("\x1b[90mThinking level set to {s}\x1b[0m", .{ts_lvl.name()});
+                            } else if (cmd) |c| {
+                                if (c.len > 0) {
+                                    if (self.watchRunCommand(c)) {
+                                        self.cmd_exit_requested = true;
+                                        agent.requestAbort();
+                                    }
+                                }
+                            }
+                            // Free the arg-completion text (owned copy from
+                            // editor.getText); the COMMANDS-name path is
+                            // borrowed static memory.
+                            if (cmd_owned) if (cmd) |c| self.alloc.free(@constCast(c));
+                            acted = true;
+                            continue;
+                        }
+                        // Search/filter editing while a watcher-opened modal
+                        // is up (menu_mode left .commands by the command
+                        // itself; /model's prefill keeps it open).
+                        if (self.menu_mode != .commands) {
+                            const editing: bool = switch (k) {
+                                .backspace, .space => true,
+                                .char => |ch| !ch.ctrl and !ch.alt,
+                                else => false,
+                            };
+                            if (editing) {
+                                self.render_mutex.lockUncancelable(self.io);
+                                if (k == .backspace) {
+                                    const t = self.editor.getText() catch "";
+                                    defer self.alloc.free(@constCast(t));
+                                    if (t.len > 0) self.editor.replaceRange(t.len - 1, t.len, "") catch {};
+                                } else {
+                                    _ = self.editor.handleKey(k, self.io) catch {};
+                                }
+                                if (self.menu_mode == .model_selector) {
+                                    self.ms_sel = 0;
+                                    self.modelSelectorRefilter();
+                                } else {
+                                    self.ts_sel = 0;
+                                    self.thinkingSelectorRefilter();
+                                }
+                                self.render_mutex.unlock(self.io);
+                                acted = true;
+                                continue;
+                            }
+                            continue; // swallow everything else while the modal is open
+                        }
+                    }
+                    // Slash menu navigation for .commands handled above; the
+                    // editor path below must not see menu_nav keys while the
+                    // commands menu is open.
+                    if (self.menu_mode == .commands) {
+                        const is_nav = self.bindings.matches(k, .menu_up) or self.bindings.matches(k, .menu_down) or
+                            self.bindings.matches(k, .menu_tab) or self.bindings.matches(k, .menu_close);
+                        if (is_nav) {
+                            acted = true; // handled in the block above
+                            continue;
+                        }
+                    }
                     const steering_key: bool = switch (k) {
                         .enter, .backspace, .space, .shift_enter, .left, .right, .up, .down, .home, .end, .delete => true,
                         .char => |ch| !ch.ctrl and !ch.alt,
@@ -3859,7 +4121,7 @@ pub const TUI = struct {
                                     // they never enter the steering queue
                                     // (the model would see the raw "/cmd"
                                     // text).
-                                    if (self.handleCommand(text)) {
+                                    if (self.watchRunCommand(text)) {
                                         self.cmd_exit_requested = true;
                                         agent.requestAbort();
                                     }
@@ -3877,6 +4139,12 @@ pub const TUI = struct {
                         }
                         self.render_mutex.lockUncancelable(self.io);
                         _ = self.editor.handleKey(k, self.io) catch {};
+                        // Slash autocomplete (pi editor.updateAutocomplete on
+                        // every change): the main loop is inside runPrompt,
+                        // so the menu is built here. Single-line "/query"
+                        // only — editor.handleKey already filtered Enter etc.
+                        self.freeMenuTextCache();
+                        self.updateMenu();
                         self.render_mutex.unlock(self.io);
                         acted = true;
                         continue;
@@ -4352,6 +4620,14 @@ pub const TUI = struct {
     /// the session, then renders under the render mutex (the spinner thread
     /// also redraws while working).
     pub fn redraw(self: *TUI) void {
+        // Watcher/paste threads: computeFooterStats walks the session while
+        // the agent thread appends to it — use the cached-stats path (this
+        // flag only wraps watcher-initiated handleCommand/switchModel/paste,
+        // never the spinner).
+        if (self.watcher_redraw) {
+            self.redrawCached();
+            return;
+        }
         const stats = self.computeFooterStats();
         self.render_mutex.lock(self.io) catch {};
         self.footer_stats = stats;
@@ -8228,14 +8504,20 @@ pub const TUI = struct {
                 self.note("{s}", .{"failed to write clipboard image"});
                 return;
             };
+            // The watcher spawns this on a helper thread; the editor may be
+            // mid-keystroke on the watcher thread — mutate under the lock.
+            self.render_mutex.lockUncancelable(self.io);
             self.editor.insertBytes(path) catch {};
+            self.render_mutex.unlock(self.io);
             alloc.free(path);
             self.redraw();
             return;
         }
         if (clipboard.readClipboardText(alloc, self.io, self.environ)) |text| {
             defer alloc.free(text);
+            self.render_mutex.lockUncancelable(self.io);
             self.editor.pasteText(text) catch {};
+            self.render_mutex.unlock(self.io);
             self.redraw();
             return;
         }

@@ -734,6 +734,10 @@ pub const Store = struct {
     leaf_id: ?[]u8 = null,
     entries: std.array_list.Managed(EntryRef),
     file_buf: std.array_list.Managed(u8),
+    /// Serializes appendLine (entries/file_buf/leaf_id mutation + persist)
+    /// between the main thread (agent messages) and the watcher thread
+    /// (slash commands like /name or /skill mid-turn).
+    persist_mutex: std.Io.Mutex = .init,
 
     /// Stack budget for the persist() tmp path (path + ".tmp." + pid).
     const PATH_TMP_MAX = 1024;
@@ -888,6 +892,8 @@ pub const Store = struct {
     }
 
     fn appendLine(self: *Store, entry_id: []u8, parent: ?[]u8, kind: EntryKind, line: []const u8) !void {
+        self.persist_mutex.lock(self.io) catch {};
+        defer self.persist_mutex.unlock(self.io);
         try self.file_buf.appendSlice(line);
         if (line.len == 0 or line[line.len - 1] != '\n') try self.file_buf.append('\n');
         try self.entries.append(.{
@@ -899,6 +905,12 @@ pub const Store = struct {
         if (self.leaf_id) |l| self.alloc.free(l);
         self.leaf_id = try self.alloc.dupe(u8, entry_id);
         self.persist();
+    }
+
+    /// Best-effort append for internal copies (fork/import): same lock, no
+    /// error propagation.
+    fn lockAppend(self: *Store, entry_id: []u8, parent: ?[]u8, kind: EntryKind, line: []const u8) void {
+        self.appendLine(entry_id, parent, kind, line) catch {};
     }
 
     /// Record one conversation message as a message entry (parent = leaf).
@@ -1175,7 +1187,7 @@ pub const Store = struct {
             if (e.kind == .compaction or e.kind == .branch_summary) continue;
             const eid = genEntryId(self.alloc, self.io);
             defer self.alloc.free(eid);
-            try st.appendLine(eid, st.leaf_id, e.kind, e.line);
+            st.lockAppend(eid, st.leaf_id, e.kind, e.line);
         }
         return st;
     }
@@ -1622,7 +1634,7 @@ pub const Store = struct {
             if (e.kind == .compaction or e.kind == .branch_summary) continue;
             const eid = genEntryId(self.alloc, self.io);
             defer self.alloc.free(eid);
-            try st.appendLine(eid, st.leaf_id, e.kind, e.line);
+            st.lockAppend(eid, st.leaf_id, e.kind, e.line);
         }
         return st;
     }
