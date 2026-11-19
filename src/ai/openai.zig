@@ -184,6 +184,11 @@ pub const OpenAiProvider = struct {
             .extra_headers = extra_headers.items,
             .keep_alive = false,
         }) catch return .transport_error;
+        // keep_alive=false, enforced: std only marks the connection closing
+        // after a successful receiveHead — a pre-head failure (watchdog
+        // shutdown / gateway reset) would otherwise release the shutdown
+        // socket back into the pool and poison every later request.
+        if (request.connection) |conn| conn.closing = true;
         defer request.deinit();
 
         // Debug: dump the outgoing body for inspection (ZPI_DEBUG_BODY=path,

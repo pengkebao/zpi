@@ -62,6 +62,14 @@ pub fn postSse(
         .extra_headers = headers.items,
         .keep_alive = false,
     }) catch return .transport_error;
+    // keep_alive=false promises a fresh connection per request — enforce it
+    // from the moment the request exists. std only sets closing=true inside
+    // receiveHead on success; a failure before head (watchdog shutdown during
+    // connect/send/head, gateway reset) leaves closing=false and deinit
+    // releases the SHUTDOWN socket back into the client's connection pool,
+    // where every later request finds it and fails instantly (observed: one
+    // 5-min idle timeout, then HttpError on every turn until restart).
+    if (request.connection) |conn| conn.closing = true;
     defer request.deinit();
 
     // The guard may now shut the socket down on abort/timeout; a tripped

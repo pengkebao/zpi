@@ -673,6 +673,10 @@ fn doHttpPost(self: *Server, uri: std.Uri, body: []const u8, id: u64) ![]u8 {
         .extra_headers = extra.items,
         .keep_alive = false,
     }) catch return error.HttpError;
+    // keep_alive=false, enforced: std marks the connection closing only on a
+    // successful receiveHead; a pre-head failure would release the dead
+    // socket back into the pool where every later request picks it up.
+    if (req.connection) |conn| conn.closing = true;
     defer req.deinit();
     req.sendBodyComplete(@constCast(body)) catch return error.HttpError;
     var response = req.receiveHead(&[_]u8{}) catch return error.HttpError;
@@ -708,6 +712,10 @@ fn doHttpPostRaw(self: *Server, uri: std.Uri, body: []const u8) !void {
         .extra_headers = extra.items,
         .keep_alive = false,
     }) catch return error.HttpError;
+    // keep_alive=false, enforced: std marks the connection closing only on a
+    // successful receiveHead; a pre-head failure would release the dead
+    // socket back into the pool where every later request picks it up.
+    if (req.connection) |conn| conn.closing = true;
     defer req.deinit();
     req.sendBodyComplete(@constCast(body)) catch return error.HttpError;
     var response = req.receiveHead(&[_]u8{}) catch return error.HttpError;
