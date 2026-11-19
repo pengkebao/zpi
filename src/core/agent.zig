@@ -1095,17 +1095,14 @@ pub const Session = struct {
                 break;
             }
 
-            // Announce tool calls in order
-            var call_idx: usize = 0;
+            // Announce tool calls via the structured turn events only — the
+            // TUI renders the pending card (name + args) from tool_start.
+            // The old text announce ([tool 1/1: bash] {...}) duplicated the
+            // card as a muted scrollback line (pi: ToolExecutionComponent
+            // only, no text echo).
             for (assistant_msg.blocks.items) |b| {
                 switch (b) {
-                    .tool_call => |tc| {
-                        var buf: [512]u8 = undefined;
-                        const s = std.fmt.bufPrint(&buf, "\n[tool {d}/{d}: {s}] {s}\n", .{ call_idx + 1, n_tool_calls, tc.name, tc.arguments }) catch "";
-                        self.emit(.tool_info, s);
-                        self.recordToolStart(tc);
-                        call_idx += 1;
-                    },
+                    .tool_call => |tc| self.recordToolStart(tc),
                     else => {},
                 }
             }
@@ -1122,8 +1119,10 @@ pub const Session = struct {
                     .tool_call => |tc| {
                         const result = results[res_idx];
                         res_idx += 1;
-                        self.emit(.tool_info, result.content);
-                        self.emit(.tool_info, "\n");
+                        // The structured tool_result event paints the output
+                        // into the card (expanded: full, collapsed: preview).
+                        // The raw-content echo here duplicated the card as a
+                        // muted scrollback line (pi: updateResult only).
                         // Before the content moves into the message below.
                         self.recordToolResult(tc.id, result.content, result.is_error, result.duration_ms);
 
