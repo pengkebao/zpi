@@ -1396,17 +1396,14 @@ pub fn main(init: std.process.Init) !void {
         if (store) |st| {
             session.store = st;
             // B3: replay the active branch into context
-            const branch = st.branchMessages(alloc) catch &.{};
-            defer {
-                for (branch) |m| m.deinit();
-                alloc.free(branch);
-            }
-            for (branch) |m| session.context.append(m) catch {};
+            const branch = st.branchMessages(alloc) catch ss.Store.BranchContext{ .messages = &.{}, .ids = &.{} };
+            defer branch.deinit(alloc);
+            for (branch.messages) |m| session.context.append(m) catch {};
             // Seed the footer's running totals from the replayed messages
             // (totals only accumulates live streams; without this a -c/
             // resume session starts at 0 tokens/$0 even though the store
             // holds the prior consumption).
-            for (branch) |m| {
+            for (branch.messages) |m| {
                 if (m.role != .assistant) continue;
                 if (m.usage) |u| session.totals.add(u);
             }

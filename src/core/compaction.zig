@@ -570,3 +570,147 @@ pub fn generateSummary(
     const text = try sess.stream_text.toOwnedSlice();
     return .{ .text = text, .usage = sess.stream_usage };
 }
+
+/// pi prepareBranchEntries token budget: walk the messages from NEWEST to
+/// OLDEST, keeping the most recent context when the branch is too long. The
+/// returned slice borrows `messages` (caller keeps ownership).
+pub fn budgetMessages(messages: []const msg.Message, token_budget: u64) []const msg.Message {
+    if (token_budget == 0) return messages;
+    var total: u64 = 0;
+    var i: usize = messages.len;
+    while (i > 0) {
+        i -= 1;
+        const t = estimateTokens(&messages[i]);
+        if (total + t > token_budget) break;
+        total += t;
+    }
+    return messages[i..];
+}
+
+// ── Context markers (pi messages.ts) ────────────────────────────────
+
+/// pi COMPACTION_SUMMARY_PREFIX/SUFFIX: wrap the compaction summary when it
+/// re-enters the LLM conversation as a synthetic user message.
+pub const COMPACTION_SUMMARY_PREFIX =
+    \\The conversation history before this point was compacted into the following summary:
+    \\
+    \\<summary>
+    \\
+
+;
+pub const COMPACTION_SUMMARY_SUFFIX =
+    \\
+    \\</summary>
+;
+
+/// pi BRANCH_SUMMARY_PREFIX/SUFFIX: wrap an abandoned-branch summary when it
+/// re-enters the LLM conversation.
+pub const BRANCH_SUMMARY_PREFIX =
+    \\The following is a summary of a branch that this conversation came back from:
+    \\
+    \\<summary>
+    \\
+
+;
+pub const BRANCH_SUMMARY_SUFFIX = "</summary>";
+
+// ── Branch summarization (pi branch-summarization.ts) ─────────────────
+
+pub const BRANCH_SUMMARY_PROMPT =
+    \\Create a structured summary of this conversation branch for context when returning later.
+    \\
+    \\Use this EXACT format:
+    \\
+    \\## Goal
+    \\[What was the user trying to accomplish in this branch?]
+    \\
+    \\## Constraints & Preferences
+    \\- [Any constraints, preferences, or requirements mentioned]
+    \\- [Or "(none)" if none were mentioned]
+    \\
+    \\## Progress
+    \\### Done
+    \\- [x] [Completed tasks/changes]
+    \\
+    \\### In Progress
+    \\- [ ] [Work that was started but not finished]
+    \\
+    \\### Blocked
+    \\- [Issues preventing progress, if any]
+    \\
+    \\## Key Decisions
+    \\- **[Decision]**: [Brief rationale]
+    \\
+    \\## Next Steps
+    \\1. [What should happen next to continue this work]
+    \\
+    \\Keep each section concise. Preserve exact file paths, function names, and error messages.
+;
+
+/// Prepended to every branch summary before it is persisted, so the summary
+/// reads as context when it later re-enters the LLM conversation (pi
+/// BRANCH_SUMMARY_PREAMBLE).
+pub const BRANCH_SUMMARY_PREAMBLE =
+    \\The user explored a different conversation branch before returning here.
+    \\Summary of that exploration:
+    \\
+
+;
+
+/// Generate the summary of an abandoned branch (pi generateBranchSummary).
+/// The LLM call is identical to generateSummary (same system prompt, no
+/// tools, no reasoning effort); only the user prompt differs.
+pub fn generateBranchSummary(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    provider: aiprovider.AnyProvider,
+    model_id: []const u8,
+    messages: []const msg.Message,
+    custom_instructions: ?[]const u8,
+    abort_check: ?*const fn () bool,
+    max_tokens: usize,
+) !SummaryResult {
+    _ = io; // reserved for abort-aware sleeps; provider handles retries
+    if (messages.len == 0) {
+        return .{ .text = alloc.dupe(u8, "No content to summarize") catch return error.OutOfMemory, .usage = null };
+    }
+    var prompt = std.array_list.Managed(u8).init(alloc);
+    defer prompt.deinit();
+    try prompt.appendSlice("<conversation>\n");
+    const convo = try serializeConversation(alloc, messages);
+    defer alloc.free(convo);
+    try prompt.appendSlice(convo);
+    try prompt.appendSlice("\n</conversation>\n\n");
+    try prompt.appendSlice(BRANCH_SUMMARY_PROMPT);
+    if (custom_instructions) |ci| {
+        try prompt.appendSlice("\n\nAdditional focus: ");
+        try prompt.appendSlice(ci);
+    }
+
+    var sys_blocks = std.array_list.Managed(msg.ContentBlock).init(alloc);
+    defer sys_blocks.deinit();
+    const sys_text = alloc.dupe(u8, SUMMARIZATION_SYSTEM_PROMPT) catch return error.OutOfMemory;
+    defer alloc.free(sys_text);
+    try sys_blocks.append(.{ .text = sys_text });
+
+    var user_blocks = std.array_list.Managed(msg.ContentBlock).init(alloc);
+    defer user_blocks.deinit();
+    const prompt_owned = try prompt.toOwnedSlice();
+    defer alloc.free(prompt_owned);
+    try user_blocks.append(.{ .text = prompt_owned });
+
+    var wire = std.array_list.Managed(ai.OpenAiProvider.ChatMessage).init(alloc);
+    defer wire.deinit();
+    try wire.append(.{ .role = .system, .blocks = sys_blocks.items });
+    try wire.append(.{ .role = .user, .blocks = user_blocks.items });
+
+    var sess = SummarySession.init(alloc, abort_check);
+    defer sess.deinit();
+    aiprovider.streamDispatch(provider, model_id, wire.items, "[]", true, config.ThinkingLevel.off, .{}, max_tokens, &sess) catch |e| {
+        if (e == error.Aborted) return e;
+        return e;
+    };
+
+    const text = try sess.stream_text.toOwnedSlice();
+    return .{ .text = text, .usage = sess.stream_usage };
+}

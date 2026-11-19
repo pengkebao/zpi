@@ -2671,24 +2671,40 @@ pub const TUI = struct {
             abandoned.deinit();
         }
         if (self.collectAbandonedMessages(cut_entry_id, &abandoned) and abandoned.items.len > 0) {
-            const res = compact.generateSummary(
+            // pi generateBranchSummary: budget = context window minus
+            // reserve_tokens; keep the most recent messages when the branch
+            // is longer than the budget.
+            const window: u64 = if (self.session.model.context_window > 0)
+                @as(u64, @intCast(self.session.model.context_window))
+            else
+                128000;
+            const reserve: u64 = @as(u64, @intCast(compact.DEFAULT_SETTINGS.reserve_tokens));
+            const budget: u64 = if (window > reserve) window - reserve else 0;
+            const to_summarize = compact.budgetMessages(abandoned.items, budget);
+            const res = compact.generateBranchSummary(
                 self.alloc,
                 self.io,
                 self.session.provider,
                 self.session.model.id,
-                abandoned.items,
-                null,
-                null,
-                null,
+                to_summarize,
+                null, // custom_instructions
+                agent.isAbortedGlobal,
                 self.session.model.max_tokens,
             ) catch null;
             if (res) |r| {
                 defer self.alloc.free(r.text);
-                st.branchAt(cut_entry_id, from_id, r.text);
-                self.switchToStoreLive();
-                self.addMessage(r.text);
-                self.note("\x1b[90mbranched from {s} · summary of the abandoned path above\x1b[0m", .{cut_entry_id});
-                return;
+                // pi: BRANCH_SUMMARY_PREAMBLE + summary is what gets
+                // persisted (and later re-wrapped in BRANCH_SUMMARY_PREFIX
+                // when it re-enters the LLM context).
+                const full = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ compact.BRANCH_SUMMARY_PREAMBLE, r.text }) catch null;
+                if (full) |f| {
+                    defer self.alloc.free(f);
+                    st.branchAt(cut_entry_id, from_id, f);
+                    self.switchToStoreLive();
+                    self.addMessage(f);
+                    self.note("\x1b[90mbranched from {s} · summary of the abandoned path above\x1b[0m", .{cut_entry_id});
+                    return;
+                }
             }
         }
         // No summary available (empty branch or LLM failure): cut only.
@@ -2700,23 +2716,17 @@ pub const TUI = struct {
     /// Messages on the leaf path strictly after `cut_entry_id`.
     fn collectAbandonedMessages(self: *TUI, cut_entry_id: []const u8, out: *std.array_list.Managed(cmsg.Message)) bool {
         const st = self.session.store orelse return false;
-        const all = st.branchMessages(self.alloc) catch return false;
-        defer {
-            for (all) |m| m.deinit();
-            self.alloc.free(all);
-        }
-        const ids = st.branchMessageIds(self.alloc) catch return false;
-        // The ids borrow the store's entries: free only the slice (same
-        // ownership as agent.zig's compaction usage).
-        defer self.alloc.free(ids);
-        // branchMessages and branchMessageIds are index-aligned.
+        const branch = st.branchMessages(self.alloc) catch return false;
+        defer branch.deinit(self.alloc);
+        // The ids are index-aligned with the messages (null for synthetic
+        // summary messages, which carry no store entry).
         var cut_idx: ?usize = null;
-        for (ids, 0..) |id, i| {
-            if (std.mem.eql(u8, id, cut_entry_id)) cut_idx = i;
+        for (branch.ids, 0..) |id, i| {
+            if (id != null and std.mem.eql(u8, id.?, cut_entry_id)) cut_idx = i;
         }
         const start = (cut_idx orelse return false) + 1;
-        if (start >= all.len) return false; // nothing to summarize
-        for (all[start..]) |m| {
+        if (start >= branch.messages.len) return false; // nothing to summarize
+        for (branch.messages[start..]) |m| {
             out.append(m.clone(self.alloc) catch return false) catch return false;
         }
         return true;

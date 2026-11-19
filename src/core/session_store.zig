@@ -1290,15 +1290,38 @@ pub const Store = struct {
     }
 
     /// Active-branch messages in conversation order, compaction-aware (pi:
-    /// buildContextEntries). If the leaf path has a compaction entry, the
-    /// result is [synthetic summary] + [kept messages from firstKeptEntryId]
-    /// + [messages after the compaction]. Caller owns the returned messages.
-    pub fn branchMessages(self: *Store, alloc: std.mem.Allocator) ![]msg.Message {
+    /// buildContextEntries + convertToLlm). If the leaf path has a
+    /// compaction entry, the result is [synthetic summary] + [kept messages
+    /// from firstKeptEntryId] + [messages after the compaction]. Branch
+    /// summary entries are injected as user messages wrapped in pi's
+    /// BRANCH_SUMMARY_PREFIX/SUFFIX (pi convertToLlm "branchSummary"), so
+    /// the LLM sees the abandoned-branch context. Caller owns the returned
+    /// messages and the id slice (free the slice with the same allocator;
+    /// the id strings borrow the store's entries).
+    pub const BranchContext = struct {
+        messages: []msg.Message,
+        /// Store entry id per message; null for synthetic summary messages
+        /// (the compaction summary has no store entry of its own). Index-
+        /// aligned with `messages` — unlike branchMessageIds, which lists
+        /// only real message entries.
+        ids: []?[]const u8,
+
+        pub fn deinit(self: BranchContext, alloc: std.mem.Allocator) void {
+            for (self.messages) |*m| m.deinit();
+            alloc.free(self.messages);
+            alloc.free(self.ids);
+        }
+    };
+
+    pub fn branchMessages(self: *Store, alloc: std.mem.Allocator) !BranchContext {
         var out = std.array_list.Managed(msg.Message).init(alloc);
+        var out_ids = std.array_list.Managed(?[]const u8).init(alloc);
         errdefer {
             for (out.items) |*m| m.deinit();
             out.deinit();
+            out_ids.deinit();
         }
+
         const path = try self.leafPath(alloc);
         defer path.deinit();
 
@@ -1309,11 +1332,11 @@ pub const Store = struct {
 
         if (compaction_idx) |cidx| {
             const ce_line = path.items[cidx].line;
-            var cparsed = std.json.parseFromSlice(std.json.Value, alloc, ce_line, .{}) catch return out.toOwnedSlice();
+            var cparsed = std.json.parseFromSlice(std.json.Value, alloc, ce_line, .{}) catch return emptyBranchContext(alloc);
             defer cparsed.deinit();
             const croot = switch (cparsed.value) {
                 .object => |o| o,
-                else => return out.toOwnedSlice(),
+                else => return emptyBranchContext(alloc),
             };
             const summary: []const u8 = if (croot.get("summary")) |sv| switch (sv) {
                 .string => |s| s,
@@ -1324,36 +1347,36 @@ pub const Store = struct {
                 else => "",
             } else "";
 
-            // Synthetic compaction summary as a user message.
+            // Synthetic compaction summary as a user message (pi
+            // COMPACTION_SUMMARY_PREFIX + summary + SUFFIX).
             if (summary.len > 0) {
-                var sm = msg.Message.init(alloc);
-                errdefer sm.deinit();
-                sm.role = .user;
-                const owned = try alloc.dupe(u8, summary);
-                errdefer alloc.free(owned);
-                try sm.blocks.append(.{ .text = owned });
-                try out.append(sm);
+                const wrapped = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ compact.COMPACTION_SUMMARY_PREFIX, summary, compact.COMPACTION_SUMMARY_SUFFIX }) catch return emptyBranchContext(alloc);
+                defer alloc.free(wrapped);
+                try pushSummaryMsg(&out, &out_ids, alloc, null, wrapped);
             }
-            // Kept messages before the compaction (from firstKeptEntryId onward).
+            // Kept messages before the compaction (from firstKeptEntryId
+            // onward), including branch summaries recorded along the way.
             var found_first = false;
             for (path.items[0..cidx]) |e| {
                 if (std.mem.eql(u8, e.id, first_kept)) found_first = true;
                 if (!found_first) continue;
-                if (e.kind != .message) continue;
-                if (Store.parseMessageEntry(alloc, e.line)) |m| try out.append(m);
+                try pushEntryMsg(&out, &out_ids, alloc, e);
             }
-            // Messages after the compaction.
+            // Messages after the compaction (branch summaries included).
             for (path.items[cidx + 1 ..]) |e| {
-                if (e.kind != .message) continue;
-                if (Store.parseMessageEntry(alloc, e.line)) |m| try out.append(m);
+                try pushEntryMsg(&out, &out_ids, alloc, e);
             }
         } else {
             for (path.items) |e| {
-                if (e.kind != .message) continue;
-                if (Store.parseMessageEntry(alloc, e.line)) |m| try out.append(m);
+                try pushEntryMsg(&out, &out_ids, alloc, e);
             }
         }
-        return out.toOwnedSlice();
+        return BranchContext{ .messages = try out.toOwnedSlice(), .ids = try out_ids.toOwnedSlice() };
+    }
+
+    fn emptyBranchContext(alloc: std.mem.Allocator) BranchContext {
+        _ = alloc;
+        return BranchContext{ .messages = &.{}, .ids = &.{} };
     }
 
     /// Full leaf-path transcript with NO compaction filtering (pi UI replay:
@@ -1384,6 +1407,37 @@ pub const Store = struct {
             if (e.kind == .compaction) n += 1;
         }
         return n;
+    }
+
+    /// The newest compaction entry's summary on the leaf path (owned copy,
+    /// caller frees), or null. Used as `previous_summary` for iterative
+    /// compaction (pi prepareCompaction: the previous summary is merged into
+    /// the next one instead of re-summarizing raw history).
+    pub fn lastCompactionSummary(self: *Store, alloc: std.mem.Allocator) ?[]u8 {
+        const path = self.leafPath(alloc) catch return null;
+        defer path.deinit();
+        var i: usize = path.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (path.items[i].kind != .compaction) continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, path.items[i].line, .{}) catch return null;
+            defer parsed.deinit();
+            const root = switch (parsed.value) {
+                .object => |o| o,
+                else => return null,
+            };
+            if (root.get("summary")) |sv| switch (sv) {
+                .string => |s| {
+                    // Empty summaries don't produce a synthetic context
+                    // message, so callers must not treat them as present.
+                    if (s.len == 0) return null;
+                    return alloc.dupe(u8, s) catch null;
+                },
+                else => {},
+            };
+            return null;
+        }
+        return null;
     }
 
     /// Parse one compaction entry's raw line (null on error).
@@ -1665,11 +1719,8 @@ pub const Store = struct {
         try appendHtmlEscaped(&out, title);
         try out.appendSlice("</h1>");
         const branch = try @constCast(self).branchMessages(alloc);
-        defer {
-            for (branch) |m| m.deinit();
-            alloc.free(branch);
-        }
-        for (branch) |m| {
+        defer branch.deinit(alloc);
+        for (branch.messages) |m| {
             const cls = switch (m.role) {
                 .user => "user",
                 .assistant => "assistant",
@@ -2000,4 +2051,35 @@ pub fn findById(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8, 
         }
     }
     return null;
+}
+
+/// One synthetic user message per summary text (pi convertToLlm).
+fn pushSummaryMsg(out: *std.array_list.Managed(msg.Message), ids: *std.array_list.Managed(?[]const u8), alloc: std.mem.Allocator, entry_id: ?[]const u8, text: []const u8) !void {
+    var sm = msg.Message.init(alloc);
+    errdefer sm.deinit();
+    sm.role = .user;
+    const owned = try alloc.dupe(u8, text);
+    errdefer alloc.free(owned);
+    try sm.blocks.append(.{ .text = owned });
+    try out.append(sm);
+    try ids.append(entry_id);
+}
+
+/// Append one leaf-path entry (message or branch_summary; other kinds
+/// skipped) to the branch context.
+fn pushEntryMsg(out: *std.array_list.Managed(msg.Message), ids: *std.array_list.Managed(?[]const u8), alloc: std.mem.Allocator, e: EntryRef) !void {
+    if (e.kind == .branch_summary) {
+        if (jsonStringField(alloc, e.line, "summary")) |bs| {
+            defer alloc.free(bs);
+            const wrapped = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ compact.BRANCH_SUMMARY_PREFIX, bs, compact.BRANCH_SUMMARY_SUFFIX }) catch return;
+            defer alloc.free(wrapped);
+            return pushSummaryMsg(out, ids, alloc, e.id, wrapped);
+        }
+        return;
+    }
+    if (e.kind != .message) return;
+    if (Store.parseMessageEntry(alloc, e.line)) |m| {
+        try out.append(m);
+        try ids.append(e.id);
+    }
 }

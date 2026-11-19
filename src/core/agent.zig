@@ -624,11 +624,8 @@ pub const Session = struct {
         self.context.messages.clearRetainingCapacity();
         self.store = st;
         const branch = st.branchMessages(self.alloc) catch return;
-        defer {
-            for (branch) |m| m.deinit();
-            self.alloc.free(branch);
-        }
-        for (branch) |m| try self.context.append(m);
+        defer branch.deinit(self.alloc);
+        for (branch.messages) |m| try self.context.append(m);
     }
 
     /// Rebuild the live context from the current store's active branch
@@ -638,11 +635,8 @@ pub const Session = struct {
         for (self.context.messages.items) |*m| m.deinit();
         self.context.messages.clearRetainingCapacity();
         const branch = try st.branchMessages(self.alloc);
-        defer {
-            for (branch) |m| m.deinit();
-            self.alloc.free(branch);
-        }
-        for (branch) |m| try self.context.append(m);
+        defer branch.deinit(self.alloc);
+        for (branch.messages) |m| try self.context.append(m);
     }
 
     /// Find the context index where retained messages begin (pi: findCutPoint).
@@ -700,16 +694,32 @@ pub const Session = struct {
         const L: usize = msgs.len;
         if (L < 2) return null;
 
-        const cut = self.findCutIndex();
-        if (cut == 0) return null; // nothing to summarize
+        // Iterative compaction (pi prepareCompaction): if the branch already
+        // has a compaction entry, the context starts with its synthetic
+        // summary message (index 0). The summary is passed as
+        // `previous_summary` so the new one merges with it, and the summary
+        // message itself is excluded from what gets re-summarized
+        // (pi: boundaryStart = prevCompactionIndex + 1).
+        const previous_summary: ?[]u8 = st.lastCompactionSummary(self.alloc);
+        defer if (previous_summary) |ps| self.alloc.free(ps);
+        const boundary: usize = if (previous_summary != null) 1 else 0;
 
-        // Map the first kept context message to its store entry id.
-        const all_ids = try st.branchMessageIds(self.alloc);
-        defer self.alloc.free(all_ids);
-        const M: usize = all_ids.len;
+        const cut = self.findCutIndex();
+        if (cut <= boundary) return null; // nothing to summarize
+
+        // Map the first kept context message to its store entry id. The
+        // live context is built from branchMessages in order, so its ids
+        // (null for synthetic summary messages) are index-aligned.
+        const branch = try st.branchMessages(self.alloc);
+        defer branch.deinit(self.alloc);
+        const ids = branch.ids;
+        const M: usize = ids.len;
         if (M < L or cut > L - 1) return null;
-        const offset = M - L;
-        const first_kept_id = all_ids[offset + cut];
+        // Walk back from the cut point to the nearest real entry id (the
+        // synthetic summary message has no store entry of its own).
+        var first_kept_idx = cut;
+        while (first_kept_idx > 0 and ids[first_kept_idx] == null) first_kept_idx -= 1;
+        const first_kept_id = ids[first_kept_idx] orelse return null;
 
         // File tracking across the whole conversation.
         var ops = compact.FileOps.init(self.alloc) catch return null;
@@ -723,14 +733,15 @@ pub const Session = struct {
 
         const tokens_before = compact.estimateContextTokens(msgs);
 
-        // Summarize the prefix that will be dropped.
+        // Summarize the prefix that will be dropped (excluding the
+        // previous synthetic summary, which is merged instead).
         const summary = compact.generateSummary(
             self.alloc,
             self.io,
             self.provider,
             self.model.id,
-            msgs[0..cut],
-            null,
+            msgs[boundary..cut],
+            previous_summary,
             custom,
             isAbortedGlobal,
             self.model.max_tokens,
