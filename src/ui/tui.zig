@@ -7512,12 +7512,16 @@ pub const TUI = struct {
         // ("✂ Context compacted …") at their position in the history.
         const items = st.branchReplayItems(alloc) catch return;
         defer {
-            for (items) |*it| it.deinit();
+            for (items) |*it| it.deinit(alloc);
             alloc.free(items);
         }
         for (items) |it| {
             switch (it) {
                 .compaction => |ci| self.addCompactionBlock(ci),
+                .error_text => |txt| {
+                    // Persisted turn failure: render like a live error line.
+                    self.addMessageFmt("{s}{s}{s}", .{ FG_ERROR, txt, ansi.RESET });
+                },
                 .message => |m| {
                     switch (m.role) {
                         .system => {},
@@ -8509,12 +8513,18 @@ pub const TUI = struct {
             // Tool activity is rendered from the structured turn events.
             .tool_info => {
                 // Recovery notices (empty-response retry, length-truncated
-                // compact-and-retry, thinking-only nudge): surface them as a
-                // transient flash so the user sees WHY the turn is pausing.
+                // compact-and-retry, thinking-only nudge, auto-compact):
+                // persist in the scrollback AND flash — these explain why a
+                // turn pauses (or silently died: a failed round followed by
+                // retries used to flash for 1.5 s and vanish, leaving a
+                // "Working" that just stopped with no trace). The flash
+                // keeps the immediate visibility; the scrollback keeps the
+                // record (it survives restarts via the transcript rebuild).
                 var s: []const u8 = text;
                 while (s.len > 0 and (s[0] == '\n' or s[0] == '\r')) s = s[1..];
                 while (s.len > 0 and (s[s.len - 1] == '\n' or s[s.len - 1] == '\r')) s = s[0 .. s.len - 1];
                 if (s.len == 0) return;
+                t.addMessageFmt("{s}· {s}{s}", .{ FG_MUTED, s, ansi.RESET });
                 t.flash(s);
                 t.redrawCached();
             },
@@ -10574,6 +10584,28 @@ pub const TUI = struct {
                     }
                     if (run_err) |e| {
                         self.addErrorLine(e);
+                        // Persist the failure so it survives restarts (pi keeps
+                        // agent errors in the session and replays them inline).
+                        if (self.session.store) |st| {
+                            var detail_buf: [2048]u8 = undefined;
+                            const detail = std.fmt.bufPrint(&detail_buf, "{s}", .{self.session.provider.lastErrorText()}) catch "";
+                            const detail_trim = std.mem.trim(u8, detail, " \t\r\n");
+                            var eb: [2048 + 64]u8 = undefined;
+                            const etext = if (detail_trim.len > 0)
+                                (std.fmt.bufPrint(&eb, "Error: {s}", .{detail_trim}) catch "Error")
+                            else
+                                (std.fmt.bufPrint(&eb, "Error: {s}", .{@errorName(e)}) catch "Error");
+                            st.recordError(etext);
+                        }
+                        // If the user is following the end, surface WHY the
+                        // turn stopped: jump so the error line is visible
+                        // (stuck at the bottom, it landed one row above the
+                        // fold — the "Working stopped, no message" report).
+                        if (self.sv.isFollowingEnd()) {
+                            self.render_mutex.lock(self.io) catch {};
+                            self.sv.scrollToEnd(ss.nowMs(self.io));
+                            self.render_mutex.unlock(self.io);
+                        }
                     }
                     // The turn ended without announcing the call (error /
                     // abort): the live preview would otherwise linger above

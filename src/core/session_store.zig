@@ -670,11 +670,15 @@ pub const CompactionInfo = struct {
 pub const ReplayItem = union(enum) {
     message: msg.Message,
     compaction: CompactionInfo,
+    /// Persisted turn-failure marker ("type":"custom", subtype error) —
+    /// pi shows agent failures inline and they survive restarts.
+    error_text: []u8,
 
-    pub fn deinit(self: ReplayItem) void {
+    pub fn deinit(self: ReplayItem, alloc: std.mem.Allocator) void {
         switch (self) {
             .message => |*m| m.deinit(),
             .compaction => {},
+            .error_text => |t| alloc.free(t),
         }
     }
 };
@@ -1035,6 +1039,29 @@ pub const Store = struct {
     }
 
     /// Record a thinking level change (pi v3: type "thinking_level_change").
+    /// Persist a turn failure (pi persists agent errors as custom entries so
+    /// they survive restarts and show inline on replay).
+    pub fn recordError(self: *Store, text: []const u8) void {
+        const id = genEntryId(self.alloc, self.io);
+        defer self.alloc.free(id);
+        var ts_buf: [40]u8 = undefined;
+        const iso = formatIso(nowMs(self.io), &ts_buf);
+        var line = std.array_list.Managed(u8).init(self.alloc);
+        defer line.deinit();
+        appendFmt(&line, self.alloc, "{{\"type\":\"custom\",\"id\":\"{s}\",\"parentId\":", .{id}) catch return;
+        if (self.leaf_id) |l| {
+            writeJsonStr(&line, l) catch return;
+        } else {
+            line.appendSlice("null") catch return;
+        }
+        line.appendSlice(",\"timestamp\":") catch return;
+        writeJsonStr(&line, iso) catch return;
+        line.appendSlice(",\"customType\":\"zpi-error\",\"subtype\":\"error\",\"text\":") catch return;
+        writeJsonStr(&line, text) catch return;
+        line.appendSlice("}\n") catch return;
+        self.appendLine(id, self.leaf_id, .custom, line.items) catch {};
+    }
+
     pub fn recordThinkingLevel(self: *Store, level: []const u8) void {
         const id = genEntryId(self.alloc, self.io);
         defer self.alloc.free(id);
@@ -1533,7 +1560,7 @@ pub const Store = struct {
     pub fn branchReplayItems(self: *Store, alloc: std.mem.Allocator) ![]ReplayItem {
         var out = std.array_list.Managed(ReplayItem).init(alloc);
         errdefer {
-            for (out.items) |*it| it.deinit();
+            for (out.items) |*it| it.deinit(alloc);
             out.deinit();
         }
         const path = try self.leafPath(alloc);
@@ -1545,6 +1572,18 @@ pub const Store = struct {
                 },
                 .compaction => {
                     if (parseCompactionEntry(alloc, e.line)) |ci| try out.append(.{ .compaction = ci });
+                },
+                .custom => {
+                    // Persisted turn-failure marker (recordError) — replay it
+                    // between the messages it happened between.
+                    if (jsonStringField(alloc, e.line, "subtype")) |sub| {
+                        defer alloc.free(sub);
+                        if (std.mem.eql(u8, sub, "error")) {
+                            if (jsonStringField(alloc, e.line, "text")) |txt| {
+                                try out.append(.{ .error_text = txt });
+                            }
+                        }
+                    }
                 },
                 else => {},
             }
