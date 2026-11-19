@@ -14,7 +14,9 @@ pub fn isRetryableStatus(status: u16) bool {
 
 /// POST `body` to `url` and pump SSE `data:` lines to ctx.parseSseData(data,
 /// session) — the same line-oriented streaming openai.zig uses (each line is
-/// yielded the moment it lands; deltas flow at packet cadence).
+/// yielded the moment it lands; deltas flow at packet cadence). Non-2xx
+/// responses are stored as "<status>: <body>" in err_buf (pi-ai
+/// formatProviderError shape; empty bodies keep the bare status).
 pub fn postSse(
     client: *std.http.Client,
     alloc: std.mem.Allocator,
@@ -22,7 +24,10 @@ pub fn postSse(
     bearer_key: []const u8,
     extra_headers: []const std.http.Header,
     body: []const u8,
+    /// Receives the formatted error text ("<status>: <body>"); the length is
+    /// written to err_len so the provider's lastErrorText() can expose it.
     err_buf: ?[]u8,
+    err_len: ?*usize,
     ctx: anytype,
     session: anytype,
 ) SseOutcome {
@@ -53,13 +58,17 @@ pub fn postSse(
         var reader = response.reader(&rbuf);
         var ebuf: [4096]u8 = undefined;
         const elen: usize = reader.readSliceShort(&ebuf) catch 0;
+        const status = @as(u16, @intFromEnum(response.head.status));
         if (err_buf) |eb| {
-            const n = @min(elen, eb.len);
-            @memcpy(eb[0..n], ebuf[0..n]);
+            const head = if (elen > 0) std.fmt.bufPrint(eb, "{d}: ", .{status}) catch "" else
+                std.fmt.bufPrint(eb, "HTTP {d}", .{status}) catch "";
+            const n = @min(elen, eb.len - head.len);
+            @memcpy(eb[head.len..head.len + n], ebuf[0..n]);
+            if (err_len) |len| len.* = head.len + n;
         }
-        std.debug.print("error: HTTP {d}\n", .{@as(u16, @intFromEnum(response.head.status))});
+        std.debug.print("error: HTTP {d}\n", .{status});
         if (elen > 0) std.debug.print("{s}\n", .{ebuf[0..elen]});
-        return if (isRetryableStatus(@intFromEnum(response.head.status))) .retryable_status else .fatal_status;
+        return if (isRetryableStatus(status)) .retryable_status else .fatal_status;
     }
 
     var rbuf: [16384]u8 = undefined;

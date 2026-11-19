@@ -45,6 +45,16 @@ pub const OpenAiProvider = struct {
         return self.last_error_buf[0..self.last_error_len];
     }
 
+    /// Store a mid-stream error message (pi: errorMessage from the SSE
+    /// error event); null clears.
+    pub fn storeErrorText(self: *OpenAiProvider, text: ?[]const u8) void {
+        if (text) |t| {
+            const n = @min(t.len, self.last_error_buf.len);
+            @memcpy(self.last_error_buf[0..n], t[0..n]);
+            self.last_error_len = n;
+        } else self.last_error_len = 0;
+    }
+
     pub fn init(alloc: std.mem.Allocator, io: std.Io, base_url: []const u8, api_key: []const u8) !OpenAiProvider {
         return .{
             .alloc = alloc,
@@ -197,16 +207,18 @@ pub const OpenAiProvider = struct {
             const elen: usize = reader.readSliceShort(&ebuf) catch 0;
             const err_body: []const u8 = self.alloc.dupe(u8, ebuf[0..elen]) catch &[_]u8{};
             defer if (err_body.len > 0) self.alloc.free(err_body);
-            // Keep the body for the agent's overflow detector.
-            self.last_error_len = @min(err_body.len, self.last_error_buf.len);
-            if (self.last_error_len > 0) {
-                @memcpy(self.last_error_buf[0..self.last_error_len], err_body[0..self.last_error_len]);
-            }
-            std.debug.print("error: HTTP {d}\n", .{@as(u16, @intFromEnum(response.head.status))});
+            // Keep "<status>: <body>" (pi-ai formatProviderError shape) for
+            // the agent's overflow detector and the TUI error line.
+            const status = @as(u16, @intFromEnum(response.head.status));
+            const head = if (err_body.len > 0) std.fmt.bufPrint(&self.last_error_buf, "{d}: ", .{status}) catch "" else
+                std.fmt.bufPrint(&self.last_error_buf, "HTTP {d}", .{status}) catch "";
+            const n = @min(err_body.len, self.last_error_buf.len - head.len);
+            @memcpy(self.last_error_buf[head.len..head.len + n], err_body[0..n]);
+            self.last_error_len = head.len + n;
+            std.debug.print("error: HTTP {d}\n", .{status});
             if (err_body.len > 0) {
                 std.debug.print("{s}\n", .{err_body});
             }
-            const status = @intFromEnum(response.head.status);
             const retryable = status == 408 or status == 429 or (status >= 500 and status <= 599);
             return if (retryable) .retryable_status else .fatal_status;
         }
@@ -555,7 +567,26 @@ fn parseChunk(self: *OpenAiProvider, data: []const u8, session: anytype) !void {
                         else => {},
                     }
                 }
-                const choices = obj.get("choices") orelse return;
+                const choices = obj.get("choices") orelse {
+                    // Mid-stream error chunk (some OpenAI-compatible servers
+                    // send {"error":{...}} instead of closing): capture the
+                    // message so the TUI can show it (pi: errorMessage).
+                    if (obj.get("error")) |ev| {
+                        switch (ev) {
+                            .object => |eo| {
+                                if (eo.get("message")) |mv| {
+                                    switch (mv) {
+                                        .string => |s| self.storeErrorText(s),
+                                        else => {},
+                                    }
+                                }
+                            },
+                            .string => |s| self.storeErrorText(s),
+                            else => {},
+                        }
+                    }
+                    return;
+                };
                 switch (choices) {
                     .array => |arr| {
                         for (arr.items) |choice| {

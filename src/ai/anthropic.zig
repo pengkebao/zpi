@@ -31,6 +31,16 @@ pub const AnthropicProvider = struct {
         return self.last_error_buf[0..self.last_error_len];
     }
 
+    /// Store a mid-stream error message (pi: errorMessage from the SSE
+    /// error event); null clears.
+    pub fn storeErrorText(self: *AnthropicProvider, text: ?[]const u8) void {
+        if (text) |t| {
+            const n = @min(t.len, self.last_error_buf.len);
+            @memcpy(self.last_error_buf[0..n], t[0..n]);
+            self.last_error_len = n;
+        } else self.last_error_len = 0;
+    }
+
     pub fn init(alloc: std.mem.Allocator, io: std.Io, base_url: []const u8, api_key: []const u8, max_tokens: usize) !AnthropicProvider {
         return .{
             .alloc = alloc,
@@ -88,6 +98,7 @@ pub const AnthropicProvider = struct {
                 },
                 body.items,
                 &self.last_error_buf,
+                &self.last_error_len,
                 self,
                 session,
             );
@@ -344,6 +355,9 @@ pub const AnthropicProvider = struct {
         const etype = strOf(obj, "type") orelse return;
         if (std.mem.eql(u8, etype, "message_stop")) self.stream_done = true;
         if (std.mem.eql(u8, etype, "error")) {
+            // Mid-stream error event (e.g. overloaded): capture the message
+            // so the TUI can show it (pi surfaces it as errorMessage).
+            if (strOf(obj, "message")) |m| self.storeErrorText(m);
             return error.StreamError;
         }
 

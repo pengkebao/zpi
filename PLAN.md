@@ -44,6 +44,7 @@ zpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | token 估算与上下文水位 | ✅ | ✅ | 页脚 `x.x%/窗口`（70%/90% 变色） |
 | provider 错误重试 | ✅ | ✅ | 429/408/5xx + 传输错误，250/500ms 指数退避，有输出不重试 |
 | 上下文溢出恢复（compact-and-retry） | ✅ | ✅ | provider 错误文本捕获 + 20 组溢出模式检测（pi OVERFLOW_PATTERNS 近似）→ 强制压缩 → 单次恢复重试；shouldCompact 小窗口下溢防护；单条消息超窗（cut=0）优雅报错 |
+| HTTP 错误详情展示（状态码+原始 body） | ✅ | ✅ | 对齐 pi-ai `formatProviderError`：四 provider 非 2xx 时 `last_error_buf` 存 `"<status>: <body>"`（SSE 泵 `sse.zig` 与 openai 自读路径同格式）；SSE 流内错误事件（anthropic/google/responses 的 `event:error`、openai 兼容服务器的 `{"error":{...}}` chunk）捕获 message 字段；传输层失败（无 HTTP 响应）agent 层补 `transport error: <name>`；每轮 LLM 前清残留（`setLastError(null)`）；TUI `addErrorLine` 红色（theme error 色）`Error: <detail>` 纯文本块（防原始 body 破坏 markdown 布局，按内容宽度 wrap，resize 保留），print 模式同详情走 stderr |
 | 并行工具执行 | ✅ | ✅ | Thread.spawn 并行 + 按 call id 重排 |
 
 ### 2. 上下文组装
@@ -99,11 +100,11 @@ zpi 扩展系统             →  src/ext/                   (扩展点、钩子
 |---|---|---|---|
 | 自动压缩：`context > window - reserveTokens(16k)` | ✅ | ✅ | `maybeAutoCompact` 每轮开头检查 |
 | keepRecentTokens(20k) 切点回溯 | ✅ | ✅ | `findCutIndex` snap 到 user/assistant 切点 |
-| 结构化摘要 prompt + 迭代式（带上次摘要） | ✅ | ⚠️ | 六段式 prompt 已实现；迭代式（带上次摘要）待做 |
+| 结构化摘要 prompt + 迭代式（带上次摘要） | ✅ | ✅ | 六段式 prompt + **迭代式**（pi prepareCompaction：`previous_summary` 合并进新摘要、上一摘要消息排除出再摘要范围） |
 | 文件操作累计跟踪 | ✅ | ✅ | `FileOps` read/write/edit → readFiles/modifiedFiles |
 | `/compact [instructions]` 手动 | ✅ | ✅ | TUI 命令 |
 | compaction.* 设置 + 溢出恢复联动 | ✅ | ✅ | settings.json `compaction.{enabled,reserveTokens,keepRecentTokens}` |
-| 分支切换摘要（branch summarization） | ✅ | ❌ | C5 留待 |
+| 分支切换摘要（branch summarization） | ✅ | ✅ | **C5**：`/tree` 选中非 leaf 分支 → `budgetMessages`（pi prepareBranchEntries：窗口-reserve 预算从新到旧保留）→ `generateBranchSummary`（BRANCH_SUMMARY_PROMPT 六段式）→ `BRANCH_SUMMARY_PREAMBLE+summary` 持久化 branch_summary entry（pi branchWithSummary）；`branchMessages` 返回 `BranchContext{messages, ids}`（ids 与消息索引对齐，合成摘要消息为 null），分支摘要以 `BRANCH_SUMMARY_PREFIX/SUFFIX` 包裹的 user 消息重入 LLM 上下文（pi convertToLlm branchSummary）；压缩摘要同以 `COMPACTION_SUMMARY_PREFIX/SUFFIX` 包裹 |
 
 ### 6. 模型与 Provider
 
@@ -228,12 +229,12 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 - [x] B6 `/export [path]`（HTML）、`/copy`（OSC 52 剪贴板）
 - 验证：zpi↔pi 双向读写会话文件；`/tree` 缩进树、`/fork` 继承 name+parent、`/export` 生成独立 HTML、`/resume` 上下文重放（模型回忆暗号）全部通过
 
-### Phase C — 压缩（~1k 行）✅ 核心完成（C1–C4，C5 分支摘要留待）
+### Phase C — 压缩（~1k 行）✅ 完成（C1–C5）
 - [x] C1 compaction 设置（reserveTokens/keepRecentTokens/enabled）→ `compaction.Settings` + settings.json 解析
 - [x] C2 自动压缩触发（每轮开头 `maybeAutoCompact`）+ 手动 `/compact [instructions]`（TUI）
 - [x] C3 结构化摘要 prompt（Goal/Constraints/Progress/Key Decisions/Next Steps/Critical Context）+ 文件跟踪（readFiles/modifiedFiles）
 - [x] C4 CompactionEntry 持久化（pi v3 JSONL）+ compaction-aware 上下文重建（`branchMessages`）
-- [ ] C5 分支摘要（/tree 离开分支时生成 branch summary）
+- [x] C5 分支摘要（/tree 离开分支时生成 branch summary）：`compaction.zig` 新增 `budgetMessages`（token 预算从新到旧保留）+ `COMPACTION_SUMMARY_PREFIX/SUFFIX`/`BRANCH_SUMMARY_PREFIX/SUFFIX`（pi messages.ts 原文）+ `BRANCH_SUMMARY_PROMPT`/`BRANCH_SUMMARY_PREAMBLE` + `generateBranchSummary`；`session_store.branchMessages` 改返回 `BranchContext{messages, ids}`（分支摘要 entry 以包裹 user 消息注入，合成摘要 id=null）；TUI /tree 路径 budget→生成→`preamble+summary` 落盘+渲染；**迭代式压缩**顺带落地（pi prepareCompaction）：`runCompaction` 读 `lastCompactionSummary` 作 `previous_summary` 合并进新摘要，上一摘要消息本体排除出再摘要范围（boundary=1），first_kept_id 从 cut 回溯到最近真实 entry id
 
 > **验证**：暗号召回 E2E（压缩后模型仍召回 `BLUE-FOX-42`）；文件跟踪（readFiles 正确记录 `marker.txt`）；JSONL 有效；压缩路径 0 泄漏。修复：`Message.clone` 未复制 `usage`（导致 `--continue` 后估算偏低）。
 
@@ -426,6 +427,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 - **`-c` 继续会话：模型恢复 + 消费数据播种**（用户反馈：`-c` 后模型回默认、历史消费数据不显示）：两处根因--① `store.recordModelChange` 存在但**从未被调用**，`-c`/resume 的恢复逻辑（`latestModelChange` 读 leaf 路径最后一条 model_change）永远落空；② `session.totals` 只在实时流式时累加（`totals.add(u)`），replay 加载后仍为零，footer 显示 0 tokens/$0。修复：`switchModel`（ctrl+p 循环 + /model 选择器共用路径）切模型后 `st.recordModelChange(provider, id)` 持久化；main.zig store 挂载后遍历 replayed branch 的 assistant 消息 `session.totals.add(m.usage)` 播种。验证：pty E2E 8/8（mock 双 provider mocka/a1+mockb/b2：`-c` 后 footer 显示历史 1.2k input → /model 切 Beta → model_change 条目落盘 + provider 重绑定后 beta-ok 响应 → 再 `-c` 模型恢复 Beta + footer 累计 2.4k）；全套件 611 过
 - **工具块 diff/长行渲染修复（CJK + ANSI 折行损坏）**（用户反馈截图：diff 视图行首漏出 `27m`/`[27m` 字面碎片、白底续行顶到第 0 列、CJK 变 `?` 菱形串）：两处根因都在 `tool_block.zig`——① `wrapSpans` 逐字符折行**不认识 ANSI 转义序列**：`\x1b[27m` 的 ESC 计 0 列但 `[27m` 计 4 列可见宽，行超宽时还能从序列**中间**断开（行尾悬半个 CSI → 终端把后续 `\n` 也吞进参数里，两行拼成一超长行——这正是续行顶到第 0 列的来源）。修复：循环里 ESC 序列整体跳过（`escapeEnd`），零宽原子单元；② `tokenizeWords`（word-diff 反色分词）按**字节**分词：CJK 行每字节一个 token，LCS 路径的反色区间（`ESC[7m…ESC[27m`）切进多字节字符中间 → 终端渲染 `?` 菱形。修复：多字节字符（`charLen`）整体一个 token，反色边界永不切字符。验证：tool_block 25 测试（+2：edit diff 管线断言无转义碎片/无 `?`/内容完整；wrapSpans 单测断言剥离转义后零残留且行宽 ≤ 上限）；pty E2E 4/4（mock 模型对中文 markdown 发 edit 调用：回合完成出 diff、无 `27m`/`[7m` 碎片、无 `?` 菱形、CJK 内容完整）；全套件 613 过
 - **Steering 队列行折行 + 压缩时光标错位**（用户反馈截图：① `Steering:` 后两行内容只显示一行；② 压缩时硬件光标停在 `Compacting context...` 边框行而非编辑框）：两处根因——① pending 行（`renderLiveQueue`/`renderCompactQueue`）把队列文本拼成单行后 `truncateToWidth` 硬截断，且布局预算按**消息条数**（`queuedPeekLen`/`compact_queue.items.len`）而非折行后行数计算。修复：`appendPendingRows` 用 `wrapPlain`（显式换行保留 + 空格断行 + CJK 宽度感知）折行，首行带 `Steering: `/`Follow-up: ` 标签、续行缩进对齐；预算改用 `session.queuedPeekRows(width)`（agent.zig 新增，按 label 宽度 10/11 扣减后数折行）与 `compactQueueRows()`；② `cursor_row = transcript_h + 1 + …` 漏了 `compact_q_h`——压缩时队列行插在 transcript 与顶边框之间，光标整体偏高。修复：`cursor_row` 补 `+ compact_q_h`。验证：test_pending 157（+1：长消息折行 >1 行、内容完整、预算==渲染行数、多行保留换行）；全套件 614 过；用户实机确认
+- **HTTP 错误详情展示（对齐 pi 的 `Error: <status>: <body>`）**（用户反馈：请求失败时 TUI 只显示笼统的 `[error: HttpError]`，无法诊断）：对照 pi-ai `error-body.js`/`formatProviderError` + `assistant-message.js`（红色 `theme.fg("error")` 纯文本）实现——① **provider 层**：四 provider 非 2xx 时 `last_error_buf` 写 `"<status>: <body>"`（`sse.zig postSse` 新增 `err_len` 参数同步长度，修复 SSE 系 provider `last_error_len` 从未更新导致 `lastErrorText()` 恒空的既有 bug；openai 自读路径同格式）；**SSE 流内错误**：anthropic/google/responses 的 `event:error` 与 openai 兼容服务器的 `{"error":{"message":...}}` chunk（choices 缺失分支）捕获 message 进 `storeErrorText`（`?[]const u8`，null 清空，pub 供 `AnyProvider` 分发）；② **agent 层**：每轮 LLM 前 `setLastError(null)` 清残留；传输失败（连 HTTP 响应都没有，buffer 为空）补 `transport error: <name>`（`setLastErrorIfEmpty`）；③ **TUI 层**：`addErrorLine` = 空行 + `Error: <detail>` 红色块（`FG_ERROR`），纯文本（`.plain` 源，防原始 HTTP body 破坏 markdown 布局）+ `wrapPlain` 按内容宽度折行 + 两侧 1 列 padding（`.plain` 在 resize 时保留原渲染，颜色不丢）；三处 `[error: {name}]` 调用点替换。验证：假 401 服务器（隔离 PI_CODING_AGENT_DIR + models.json 指向 127.0.0.1）`-p` 输出 `401: {"error": {"message": "Invalid API key provided: ..."}}` 全详情；全套件 644 过
 ### Phase H — 资源系统（~1.5k 行）
 - [x] H1 Skills：`skills.zig` 发现/解析/校验/去重 + 系统提示广告 + `/skill:name` + `/skill:<tab>` + 6 单测 + E2E（`15ade5a`）
 - [x] H2 Prompt templates：Phase D 完成（发现/$1/$@/默认值/未识别 slash 回退）

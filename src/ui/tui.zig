@@ -6645,6 +6645,43 @@ pub const TUI = struct {
         self.addMessage(text);
     }
 
+    /// Render a turn failure into the transcript the way pi's
+    /// AssistantMessageComponent does: a blank line, then the message in the
+    /// error color (theme.fg("error")). The detail is the provider's last
+    /// error text (pi-ai formatProviderError: "<status>: <body>" or the SSE
+    /// error message); with no detail we fall back to the Zig error name.
+    /// Rendered as plain (not markdown) so raw HTTP bodies can't break the
+    /// layout, and word-wrapped like a normal text block.
+    fn addErrorLine(self: *TUI, err: anyerror) void {
+        var detail_buf: [4096]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "{s}", .{self.session.provider.lastErrorText()}) catch "";
+        const trimmed_detail = std.mem.trim(u8, detail, " \t\r\n");
+        var msg_buf: [4096 + 64]u8 = undefined;
+        const msg = if (trimmed_detail.len > 0)
+            std.fmt.bufPrint(&msg_buf, "Error: {s}", .{trimmed_detail}) catch "Error"
+        else
+            std.fmt.bufPrint(&msg_buf, "Error: {s}", .{@errorName(err)}) catch "Error";
+        // Word-wrap at the content width (pi wraps the Text component at
+        // outputPad = width - 2); one column of padding on each side like
+        // the other transcript blocks.
+        const inner = if (self.width > 2) self.width - 2 else 1;
+        const rows = wrapPlain(self.alloc, msg, inner) catch return;
+        defer {
+            for (rows) |r| self.alloc.free(r);
+            self.alloc.free(rows);
+        }
+        var block: std.ArrayListUnmanaged(u8) = .empty;
+        defer block.deinit(self.alloc);
+        for (rows, 0..) |row, i| {
+            if (i > 0) block.append(self.alloc, '\n') catch return;
+            block.appendSlice(self.alloc, " ") catch return;
+            block.appendSlice(self.alloc, FG_ERROR) catch return;
+            block.appendSlice(self.alloc, row) catch return;
+            block.appendSlice(self.alloc, "\x1b[0m ") catch return;
+        }
+        self.finishBlock(&block, .plain);
+    }
+
     /// Append a rendered block plus how it re-renders on a resize. Owns the
     /// strings of `src` on success (frees them on failure). The spinner
     /// thread reads scrollback while working; guard the append.
@@ -8116,9 +8153,7 @@ pub const TUI = struct {
         const run_err: ?anyerror = if (self.session.runPrompt(text)) |_| null else |e| e;
         self.drainTurnEvents();
         if (run_err) |e| {
-            var err_buf: [256]u8 = undefined;
-            const err_msg = std.fmt.bufPrint(&err_buf, "[error: {s}]", .{@errorName(e)}) catch "error";
-            self.addAssistantMessage(err_msg);
+            self.addErrorLine(e);
         }
         // Same post-turn ceremony as the editor path.
         self.drainTurnEvents();
@@ -8599,9 +8634,7 @@ pub const TUI = struct {
             const run_err: ?anyerror = if (self.session.runPrompt(text)) |_| null else |e| e;
             self.drainTurnEvents();
             if (run_err) |e| {
-                var err_buf: [256]u8 = undefined;
-                const err_msg = std.fmt.bufPrint(&err_buf, "[error: {s}]", .{@errorName(e)}) catch "error";
-                self.addAssistantMessage(err_msg);
+                self.addErrorLine(e);
             }
             self.stopWatch();
             self.stopSpinner();
@@ -10509,9 +10542,7 @@ pub const TUI = struct {
                         }
                     }
                     if (run_err) |e| {
-                        var err_buf: [256]u8 = undefined;
-                        const err_msg = std.fmt.bufPrint(&err_buf, "[error: {s}]", .{@errorName(e)}) catch "error";
-                        self.addAssistantMessage(err_msg);
+                        self.addErrorLine(e);
                     }
                     // The turn ended without announcing the call (error /
                     // abort): the live preview would otherwise linger above

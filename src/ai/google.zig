@@ -37,6 +37,16 @@ pub const GoogleProvider = struct {
         return self.last_error_buf[0..self.last_error_len];
     }
 
+    /// Store a mid-stream error message (pi: errorMessage from the SSE
+    /// error event); null clears.
+    pub fn storeErrorText(self: *GoogleProvider, text: ?[]const u8) void {
+        if (text) |t| {
+            const n = @min(t.len, self.last_error_buf.len);
+            @memcpy(self.last_error_buf[0..n], t[0..n]);
+            self.last_error_len = n;
+        } else self.last_error_len = 0;
+    }
+
     pub fn init(alloc: std.mem.Allocator, io: std.Io, base_url: []const u8, api_key: []const u8, max_tokens: usize) !GoogleProvider {
         return .{
             .alloc = alloc,
@@ -119,6 +129,7 @@ pub const GoogleProvider = struct {
                 &.{.{ .name = "x-goog-api-key", .value = self.api_key }},
                 body.items,
                 &self.last_error_buf,
+                &self.last_error_len,
                 self,
                 session,
             );
@@ -349,7 +360,13 @@ pub const GoogleProvider = struct {
         };
 
         if (obj.get("error")) |ev| {
-            _ = ev;
+            // Mid-stream error event: capture the message for the TUI.
+            switch (ev) {
+                .object => |eo| {
+                    if (strOf(eo, "message")) |m| self.storeErrorText(m);
+                },
+                else => {},
+            }
             return error.StreamError;
         }
 

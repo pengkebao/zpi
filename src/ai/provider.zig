@@ -66,6 +66,21 @@ pub const AnyProvider = union(ApiKind) {
             inline else => |p| p.lastErrorText(),
         };
     }
+
+    /// Overwrite the stored error text (truncated to the provider's buffer);
+    /// null clears it. Used by the agent for transport failures that never
+    /// produced an HTTP response.
+    pub fn setLastError(self: *AnyProvider, text: ?[]const u8) void {
+        switch (self.*) {
+            inline else => |p| p.storeErrorText(text),
+        }
+    }
+
+    /// Fill the buffer only if it is still empty (transport failure: the
+    /// provider got no HTTP response, so it stored nothing).
+    pub fn setLastErrorIfEmpty(self: *AnyProvider, text: []const u8) void {
+        if (self.lastErrorText().len == 0) self.setLastError(text);
+    }
 };
 
 /// Build the right provider for a model (heap-allocated; the union owns the

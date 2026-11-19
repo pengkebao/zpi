@@ -887,6 +887,10 @@ pub const Session = struct {
 
             self.jsonEvent("{{\"type\":\"message_start\",\"message\":{{\"role\":\"assistant\"}}}}", .{});
 
+            // Fresh error text per round: a transport failure never fills the
+            // provider buffer, so clear any stale detail from a prior round.
+            self.provider.setLastError(null);
+
             // Call LLM (retries + abort-aware, see openai.zig)
             aiprovider.streamDispatch(
                 self.provider,
@@ -922,6 +926,11 @@ pub const Session = struct {
                     // Keep what streamed before the failure on screen.
                     self.recordText(.thinking, thinking_buf.items);
                     self.recordText(.text, text_buf.items);
+                    // Transport failure (no HTTP response at all): the
+                    // provider buffer is empty, so store a readable reason.
+                    var tb: [128]u8 = undefined;
+                    const tmsg = std.fmt.bufPrint(&tb, "transport error: {s}", .{@errorName(e)}) catch "transport error";
+                    self.provider.setLastErrorIfEmpty(tmsg);
                     const le = self.provider.lastErrorText();
                     if (le.len > 0) {
                         if (self.last_error_message) |old| self.alloc.free(old);

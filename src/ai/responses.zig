@@ -32,6 +32,16 @@ pub const ResponsesProvider = struct {
         return self.last_error_buf[0..self.last_error_len];
     }
 
+    /// Store a mid-stream error message (pi: errorMessage from the SSE
+    /// error event); null clears.
+    pub fn storeErrorText(self: *ResponsesProvider, text: ?[]const u8) void {
+        if (text) |t| {
+            const n = @min(t.len, self.last_error_buf.len);
+            @memcpy(self.last_error_buf[0..n], t[0..n]);
+            self.last_error_len = n;
+        } else self.last_error_len = 0;
+    }
+
     pub fn init(alloc: std.mem.Allocator, io: std.Io, base_url: []const u8, api_key: []const u8, max_tokens: usize) !ResponsesProvider {
         return .{
             .alloc = alloc,
@@ -87,6 +97,7 @@ pub const ResponsesProvider = struct {
                 &.{},
                 body.items,
                 &self.last_error_buf,
+                &self.last_error_len,
                 self,
                 session,
             );
@@ -301,6 +312,16 @@ pub const ResponsesProvider = struct {
         const etype = strOf(obj, "type") orelse return;
 
         if (std.mem.eql(u8, etype, "error") or std.mem.eql(u8, etype, "response.error")) {
+            // Mid-stream error event: capture the message for the TUI.
+            var t = strOf(obj, "message");
+            if (t == null) {
+                if (obj.get("error")) |ev| switch (ev) {
+                    .object => |eo| t = strOf(eo, "message"),
+                    .string => |s| t = s,
+                    else => {},
+                };
+            }
+            if (t) |m| self.storeErrorText(m);
             return error.StreamError;
         }
 
