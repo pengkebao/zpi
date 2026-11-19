@@ -2,7 +2,7 @@
 
 > 一个用纯 Zig 写的终端编程智能体 —— [pi](https://pi.dev) 1.5.0 的行为级重实现
 
-![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/tests-630%2B-brightgreen)
+![Zig](https://img.shields.io/badge/zig-0.17.0-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![Tests](https://img.shields.io/badge/tests-718%2B-brightgreen)
 
 **零第三方依赖 · 单二进制 · 与 pi 配置/会话双向兼容**
 
@@ -21,16 +21,18 @@ zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP
 - OpenAI 兼容 SSE 流式协议（text / thinking / tool_calls 增量；逐行解析，包级到达即渲染）
 - 四种线路协议：openai-completions / anthropic-messages / openai-responses / google-generative-ai
 - 工具：shell、read、edit（diff 预览）、glob 匹配、选区截断
-- 会话持久化（jsonl，pi 同格式）+ `-c`/`-r` 继续会话（模型上下文与 TUI 界面双恢复）
+- 会话持久化（jsonl，pi 同格式）+ `-c`/`-r` 继续会话（模型上下文与 TUI 界面双恢复）；**存储加固**：无效 UTF-8 工具输出清理为 U+FFFD（JSONL 不再因二进制字节损坏整行）、原子持久化（tmp + rename，写一半崩溃不截断会话文件）
 - 上下文压缩：手动 `/compact` + 阈值自动压缩，压缩摘要块入转写
 - 成本 / 缓存命中率 / token 统计（footer 实时显示）
 - **运行中可干预**（pi 同款 steering / follow-up）：流式期间 Enter 排入 steering（下个 LLM 请求前注入上下文）、alt+Enter 排入 follow-up（本回合结束后跑新回合），编辑器上方实时显示 `Steering: …` / `Follow-up: …` pending 行；ESC 中断时全部排队消息恢复回编辑器（不丢失）；`steeringMode` / `followUpMode` 设置（all / one-at-a-time）从 settings.json 读取
+- **运行中完整交互**（pi input in every state）：流式期间编辑器不只是能打字——`/` 补全菜单、`/model` `/thinking` 选择器、Cmd+V 整块粘贴、ctrl+v 剪贴板（图片→临时路径 / 文本直插）全部实时响应；会重建回合数据的命令（`/new` `/resume` `/fork` `/clear` `/compact` 等）会提示先按 Esc 而不是悄悄炸掉当前回合
 - **流式韧性**（对齐 pi 1.5.0 的 `http-dispatcher` / `retry` / `overflow` 三层防护）：
-  - **空闲看门狗**：SSE 读是阻塞 `read(2)`，看门狗线程轮询 abort 标志 + 空闲计时（默认 300s，`$ZPI_HTTP_IDLE_TIMEOUT_MS` 可调，`0` 关闭），超时或对 ESC 时 `shutdown(fd)` 解除阻塞——网关静默挂起不再卡死，ESC 即时响应
+  - **空闲看门狗**：网络读取是阻塞 `read(2)`，看门狗线程轮询 abort 标志 + 空闲计时（默认 300s，`$ZPI_HTTP_IDLE_TIMEOUT_MS` 可调，`0` 关闭），超时或对 ESC 时 `shutdown(fd)` 解除阻塞。看门狗从**建连/发送/等待响应头**阶段即启动（响应头到达后绑定 fd），覆盖请求全生命周期——网关静默挂起不再卡死，ESC 即时响应
   - **空响应自动重试**：网关偶发返回 200 但空/截断 SSE 体时，指数退避重试（默认 3 次，1s/2s/4s），不再静默 `EmptyResponse` 死回合
   - **长度截断恢复**（pi `isRecoverableLength`）：`finish_reason=length` 且 `output < max_tokens` 时判定上下文压力/网关截断，一次性压缩并重试
   - **纯思考回合轻推**：某轮只产出 thinking（无文本无工具调用）时注入一次 continue 提示，防止模型把输出预算耗在推理上后静默停滞
   - 工具轮次上限（默认 200）触顶时提示而非静默停止
+- **失败可见性**（不再静默死回合）：重试 / 自动压缩等恢复提示同时写入转写（灰色 `·` 行，不再 1.5 秒闪没）；回合失败时错误行自动滚入视口（钉底跟随），并持久化为会话条目——重启后红色内联重放，事后可追溯
 - MCP 客户端：stdio + HTTP 传输、OAuth 登录、工具注册与热重载、`zpi mcp add/remove/list` 全套管理
 - 技能（Skills）与提示模板（Prompts）：pi 同款发现机制与 `SKILL.md` 格式；`/skill:name` 调用时**完整技能体发给模型，但转写只占一行** `[skill] name (ctrl+o to expand)`——点击或 Ctrl+O 才展开正文（对齐 pi `SkillInvocationMessageComponent`，不再把整个 SKILL.md 刷屏）
 - 事件总线 + hooks.json 钩子（session_start / pre_tool_call / post_tool_call / compaction）
@@ -107,6 +109,7 @@ apiKey 支持 字面量 / `$ENV_VAR` / `!command` 三种写法；凭据回退顺
 | ctrl+l | 显示模型列表 |
 | ctrl+o | 工具输出 折叠/展开（同时切换启动头形态） |
 | ctrl+x | 复制选区（无选区时复制最后回复） |
+| ctrl+v | 剪贴板粘贴：图片→临时文件路径入编辑器，文本直插（**运行中同样可用**） |
 | ctrl+g | 用 $EDITOR 编辑当前输入 |
 | ctrl+↑ / ctrl+↓ | 上一条 / 下一条用户消息 |
 | ctrl+home / ctrl+end | 转写顶部 / 回到最新 |
@@ -144,15 +147,15 @@ src/
 ## 测试
 
 ```bash
-zig test test_ui.zig              # 238 个 UI/逻辑测试
-zig test leak_g2.zig              # 186 个泄漏回归测试（SafeAllocator 全路径）
-zig test src/ui/keys.zig          # 按键/鼠标序列解析（18）
-zig test src/ui/tool_block.zig    # 工具块渲染：diff/ANSI/CJK 折行（25）
-zig test test_openai.zig          # SSE 协议解析（10）
+zig test test_ui.zig              # 265 个 UI/逻辑测试
+zig test leak_g2.zig              # 195 个泄漏回归测试（SafeAllocator 全路径）
+zig test src/ui/keys.zig          # 按键/鼠标序列解析（19）
+zig test src/ui/tool_block.zig    # 工具块渲染：diff/ANSI/CJK 折行（26）
+zig test test_openai.zig          # SSE 协议解析（11）
 zig test test_mcp.zig             # MCP 客户端单测（9）
 zig test test_pt.zig              # bracketed paste（4）
 zig test test_clip.zig            # 剪贴板（2）
-zig test test_pending.zig         # steering/follow-up 队列（含传递依赖共 156）
+zig test test_pending.zig         # steering/follow-up 队列（含传递依赖共 187）
 zig run bench_scroll.zig    # 滚动帧基准
 zig run bench_stream.zig    # 流式帧基准
 zig run bench_markdown.zig  # markdown 渲染基准
@@ -172,7 +175,7 @@ zig run bench_markdown.zig  # markdown 渲染基准
 
 ## Roadmap
 
-- [ ] 图片输入（粘贴 / 拖放）
+- [ ] 图片输入（拖放；ctrl+v 粘贴图片已支持）
 - [ ] 会话分享 / 导出
 - [ ] 主题体系（多主题选择器）
 - [ ] Windows 终端支持
