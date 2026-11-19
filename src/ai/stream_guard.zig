@@ -124,6 +124,10 @@ pub fn Guard(Sess: type) type {
         }
 
         fn shutdownFd(fd: std.posix.fd_t) void {
+            // fd 0 = "no socket yet" (the guard starts before the connection
+            // opens, the fd is patched in later): shutdown(0) would hit
+            // stdin — never do that.
+            if (fd == 0) return;
             _ = std.c.shutdown(fd, @intCast(std.posix.SHUT.RDWR));
         }
     };

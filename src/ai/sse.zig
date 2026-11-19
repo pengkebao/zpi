@@ -43,12 +43,30 @@ pub fn postSse(
     headers.appendSlice(extra_headers) catch return .transport_error;
     headers.append(.{ .name = "Accept", .value = "text/event-stream" }) catch return .transport_error;
 
+    // Start the watchdog BEFORE the connection opens, not after receiveHead:
+    // sendBodyComplete (a large context upload) and receiveHead (waiting for
+    // the response head) are plain blocking socket writes/reads too — a
+    // gateway that accepts the body and never answers left the process
+    // blocked BEFORE the guard existed (observed 2026-11-19 20:02: tool
+    // result logged, then 59 min of silence, no error, no UI change). Both
+    // phases also need ESC aborts, which only the guard can deliver while
+    // the main thread sits inside a blocking read. One guard now covers
+    // connect → send → receiveHead → SSE body; stop() runs at scope end.
+    const Guard = stream_guard.Guard(@TypeOf(session));
+    var guard: Guard = .{};
+    guard.start(session, 0, client.io, stream_guard.idle_timeout_ms, stream_guard.data_timeout_ms);
+    defer guard.stop();
+
     var request = client.request(.POST, uri, .{
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .extra_headers = headers.items,
         .keep_alive = false,
     }) catch return .transport_error;
     defer request.deinit();
+
+    // The guard may now shut the socket down on abort/timeout; a tripped
+    // shutdown surfaces here as a transport error (retry loop takes over).
+    if (request.connection) |conn| guard.fd = conn.stream_reader.stream.socket.handle;
 
     request.sendBodyComplete(@constCast(body)) catch return .transport_error;
     var response = request.receiveHead(&[_]u8{}) catch return .transport_error;
@@ -73,16 +91,12 @@ pub fn postSse(
 
     var rbuf: [16384]u8 = undefined;
     var reader = response.reader(&rbuf);
-    // Watchdog (openai.zig): the read below blocks the process, so abort and
-    // the idle timeout need a second thread to shut the socket down.
-    const Guard = stream_guard.Guard(@TypeOf(session));
-    var guard: Guard = .{};
-    var guard_active = false;
-    if (request.connection) |conn| {
-        guard.start(session, conn.stream_reader.stream.socket.handle, client.io, stream_guard.idle_timeout_ms, stream_guard.data_timeout_ms);
-        guard_active = guard.thread != null;
+    // Watchdog already running from before the request was sent (covers
+    // connect + send + receiveHead + body). fd is refreshed per connection.
+    const guard_active = guard.thread != null;
+    if (guard_active) {
+        if (request.connection) |conn| guard.fd = conn.stream_reader.stream.socket.handle;
     }
-    errdefer if (guard_active) guard.stop();
     // A clean end is [DONE] / a terminal SSE event; a connection that just
     // drops (EndOfStream/ReadFailed without either) is a TRANSPORT error —
     // returning .ok here made truncated responses look like success and the
@@ -111,7 +125,7 @@ pub fn postSse(
         if (guard_active) guard.noteData();
         ctx.parseSseData(data, session) catch continue;
     }
-    if (guard_active) guard.stop();
+    // (guard.stop() runs via defer — one owner, no double-join)
     if (session.isAborted()) return .ok;
     if (!done_cleanly) {
         // Protocols without [DONE] (anthropic/google/responses) signal the

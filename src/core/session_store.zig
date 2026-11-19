@@ -87,6 +87,28 @@ fn genEntryId(alloc: std.mem.Allocator, io: std.Io) []u8 {
 
 fn writeJsonStr(out: *std.array_list.Managed(u8), s: []const u8) !void {
     try out.append('"');
+    // Sanitize first: tool output (bash stderr, binary files) can carry raw
+    // invalid UTF-8, and this file IS the session — one bad byte made the
+    // whole line unparseable on reload (observed: a `file` command output
+    // containing Mach-O magic bytes landed raw and the record was lost).
+    // Valid UTF-8 passes through untouched; invalid bytes become U+FFFD.
+    if (!std.unicode.utf8ValidateSlice(s)) {
+        const clean = sanitizeUtf8(out.allocator, s) catch {
+            // OOM: fall back to the raw slice rather than lose the record.
+            try writeJsonStrInner(out, s);
+            try out.append('"');
+            return;
+        };
+        try writeJsonStrInner(out, clean);
+        out.allocator.free(clean);
+        try out.append('"');
+        return;
+    }
+    try writeJsonStrInner(out, s);
+    try out.append('"');
+}
+
+fn writeJsonStrInner(out: *std.array_list.Managed(u8), s: []const u8) !void {
     for (s) |c| {
         switch (c) {
             '"' => try out.appendSlice("\\\""),
@@ -105,7 +127,29 @@ fn writeJsonStr(out: *std.array_list.Managed(u8), s: []const u8) !void {
             },
         }
     }
-    try out.append('"');
+}
+
+/// Copy `s` with every invalid UTF-8 byte replaced by U+FFFD (EF BF BD).
+/// Byte-level: valid sequences pass through byte-identical.
+fn sanitizeUtf8(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    var i: usize = 0;
+    while (i < s.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+            try buf.appendSlice(alloc, "\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > s.len or !std.unicode.utf8ValidateSlice(s[i .. i + seq_len])) {
+            try buf.appendSlice(alloc, "\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        }
+        try buf.appendSlice(alloc, s[i .. i + seq_len]);
+        i += seq_len;
+    }
+    return buf.toOwnedSlice(alloc);
 }
 
 fn writeJsonValue(out: *std.array_list.Managed(u8), v: std.json.Value) anyerror!void {
@@ -687,6 +731,9 @@ pub const Store = struct {
     entries: std.array_list.Managed(EntryRef),
     file_buf: std.array_list.Managed(u8),
 
+    /// Stack budget for the persist() tmp path (path + ".tmp." + pid).
+    const PATH_TMP_MAX = 1024;
+
     /// --mode json: write the session header entry (the store file's first
     /// line) to `out`. pi json mode starts its stream with the header.
     pub fn emitHeader(self: *Store, out: std.Io.File, io: std.Io) !void {
@@ -814,7 +861,26 @@ pub const Store = struct {
     }
 
     fn persist(self: *Store) void {
-        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.path, .data = self.file_buf.items }) catch {};
+        // Write to a sibling temp file, then rename over the target: a
+        // crash mid-write can no longer leave a truncated/corrupt session
+        // file behind (rename is atomic on POSIX). The tmp name includes
+        // the pid so concurrent zpi instances never collide.
+        var tmp_buf: [PATH_TMP_MAX]u8 = undefined;
+        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp.{d}", .{ self.path, std.c.getpid() }) catch {
+            // Path too long for the stack buffer: fall back to direct write.
+            std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.path, .data = self.file_buf.items }) catch {};
+            return;
+        };
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = tmp, .data = self.file_buf.items }) catch {
+            std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.path, .data = self.file_buf.items }) catch {};
+            return;
+        };
+        const cwd = std.Io.Dir.cwd();
+        std.Io.Dir.rename(cwd, tmp, cwd, self.path, self.io) catch {
+            // Rename unsupported/failed: at least the direct write matches
+            // the old behavior.
+            std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.path, .data = self.file_buf.items }) catch {};
+        };
     }
 
     fn appendLine(self: *Store, entry_id: []u8, parent: ?[]u8, kind: EntryKind, line: []const u8) !void {
@@ -2082,4 +2148,34 @@ fn pushEntryMsg(out: *std.array_list.Managed(msg.Message), ids: *std.array_list.
         try out.append(m);
         try ids.append(e.id);
     }
+}
+
+test "writeJsonStr escapes invalid UTF-8 instead of emitting it" {
+    const alloc = std.testing.allocator;
+    // The observed corruption: `file` output with Mach-O magic (CF FA ED FE)
+    // landed in the session JSONL raw and the whole line failed to parse on
+    // reload. Every byte of that output must be sanitized to valid UTF-8.
+    var out = std.array_list.Managed(u8).init(alloc);
+    defer out.deinit();
+    try writeJsonStr(&out, "before\xcf\xfa\xed\xfe\xff\x80after\n\x01\"q\"");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out.items));
+    // The line must round-trip through a JSON parser.
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("before\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}after\n\u{01}\"q\"", parsed.value.string);
+}
+
+test "writeJsonStr passes valid UTF-8 through byte-identical" {
+    const alloc = std.testing.allocator;
+    var out = std.array_list.Managed(u8).init(alloc);
+    defer out.deinit();
+    try writeJsonStr(&out, "中文 emoji 🎉 \"quote\" \\ back");
+    try std.testing.expectEqualStrings("\"中文 emoji 🎉 \\\"quote\\\" \\\\ back\"", out.items);
+}
+
+test "sanitizeUtf8 keeps valid sequences intact" {
+    const alloc = std.testing.allocator;
+    const clean = try sanitizeUtf8(alloc, "ab\xc3\xa9\xf0\x9f\x8e\x89");
+    defer alloc.free(clean);
+    try std.testing.expectEqualStrings("abé🎉", clean);
 }
