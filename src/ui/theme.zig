@@ -641,15 +641,10 @@ pub fn setActive(t: *const Theme) void {
     active_sgr = SgrSet.compute(t);
 }
 
-/// The name of the active theme (for settings persistence + the ✓ marker).
-/// Defaults to "dark".
+/// The name of the active theme (for the ✓ marker + the /settings row).
+/// The TUI points this at the cfg-owned theme string on load/switch. Defaults
+/// to "dark".
 pub var active_name: []const u8 = "dark";
-
-/// Set the active theme AND record its name (pi settings "theme").
-pub fn setActiveNamed(t: *const Theme, name: []const u8) void {
-    setActive(t);
-    active_name = name;
-}
 
 pub fn resetActive() void {
     active_ptr = null;

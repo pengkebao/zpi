@@ -375,7 +375,7 @@ pub const TUI = struct {
         .{ .kind = .fs_scrollbar, .label = "Fullscreen scrollbar", .desc = "Scrollbar behavior in fullscreen mode; has no effect in regular mode", .values = &.{ "auto", "always", "hidden" } },
         .{ .kind = .fs_copy_on_select, .label = "Fullscreen copy on select", .desc = "Automatically copy selected text in fullscreen mode; disable to copy selections with Ctrl+X", .values = &.{ "true", "false" } },
         .{ .kind = .fs_wheel_lines, .label = "Fullscreen wheel scrolling", .desc = "Lines per mouse-wheel event in fullscreen mode; 'auto' speeds up fast wheel spins where the terminal does not", .values = &.{ "auto", "1", "2", "3", "5", "10" } },
-        .{ .kind = .theme, .label = "Theme", .desc = "Color theme for the interface", .values = &.{"dark"} },
+        .{ .kind = .theme, .label = "Theme", .desc = "Color theme for the interface (dark / light; custom themes via /themes)", .values = &.{ "dark", "light" } },
     };
     /// Selector row capacity (sessions/tree/fork pickers).
     const SEL_MAX = 64;
@@ -2511,7 +2511,7 @@ pub const TUI = struct {
                 }
                 break :blk_wl "auto";
             },
-            .theme => "dark",
+            .theme => theme.active_name,
         };
     }
 
@@ -2610,7 +2610,12 @@ pub const TUI = struct {
                     }
                 }
             },
-            // theme/etc: zpi cannot back these yet.
+            .theme => {
+                // Activate the builtin (custom themes are chosen via /themes,
+                // which the cycle cannot enumerate). Persist below.
+                if (!self.setThemeActive(next)) return false;
+            },
+            // etc: zpi cannot back these yet.
             else => return false,
         }
         if (cfg) |c| c.persistSettings(self.alloc, self.io) catch {};
@@ -3322,18 +3327,7 @@ pub const TUI = struct {
     pub fn applyThemeFromSettings(self: *TUI) void {
         const cfg = self.cfg orelse return;
         const name = cfg.theme_name orelse return;
-        if (std.mem.eql(u8, name, "dark")) {
-            theme.setActiveNamed(&theme.builtin_dark, "dark");
-            return;
-        }
-        if (std.mem.eql(u8, name, "light")) {
-            theme.setActiveNamed(&theme.builtin_light, "light");
-            return;
-        }
-        const themes_dir = std.fmt.allocPrint(self.alloc, "{s}/themes", .{cfg.base_dir}) catch return;
-        defer self.alloc.free(themes_dir);
-        const t = theme.loadCustomTheme(self.alloc, self.io, themes_dir, name);
-        if (t) |th| theme.setActive(th);
+        _ = self.setThemeActive(name);
     }
 
     fn openThemesSelector(self: *TUI) void {
@@ -3410,33 +3404,38 @@ pub const TUI = struct {
         frame.append(self.alloc, hint) catch return;
     }
 
-    /// Apply the selected theme by name: builtin dark/light or a custom JSON
-    /// from the themes dir. Marks the new theme active, persists the choice to
-    /// settings.json (pi settings "theme"), and redraws.
-    fn applyThemeByName(self: *TUI, name: []const u8) void {
-        var ok = false;
+    /// Activate a theme by name (builtin dark/light or a custom JSON from the
+    /// themes dir) and record its name in cfg + the global active_name (so the
+    /// ✓ marker and /settings row stay correct, including for custom themes).
+    /// Returns false when a custom theme file is missing.
+    fn setThemeActive(self: *TUI, name: []const u8) bool {
         if (std.mem.eql(u8, name, "dark")) {
-            theme.setActiveNamed(&theme.builtin_dark, "dark");
-            ok = true;
+            theme.setActive(&theme.builtin_dark);
         } else if (std.mem.eql(u8, name, "light")) {
-            theme.setActiveNamed(&theme.builtin_light, "light");
-            ok = true;
+            theme.setActive(&theme.builtin_light);
         } else if (self.cfg) |cfg| {
-            const themes_dir = std.fmt.allocPrint(self.alloc, "{s}/themes", .{cfg.base_dir}) catch return;
+            const themes_dir = std.fmt.allocPrint(self.alloc, "{s}/themes", .{cfg.base_dir}) catch return false;
             defer self.alloc.free(themes_dir);
-            const t = theme.loadCustomTheme(self.alloc, self.io, themes_dir, name);
-            if (t) |th| {
-                theme.setActive(th);
-                ok = true;
-            }
+            const t = theme.loadCustomTheme(self.alloc, self.io, themes_dir, name) orelse return false;
+            theme.setActive(t);
+        } else {
+            return false;
         }
-        if (ok) {
-            // Persist (pi: settings theme is saved on switch).
-            if (self.cfg) |cfg| {
-                if (cfg.theme_name) |old| self.alloc.free(old);
-                cfg.theme_name = self.alloc.dupe(u8, name) catch null;
-                cfg.persistSettings(self.alloc, self.io) catch {};
-            }
+        // Point the global name at the cfg-owned string (stable for the app
+        // lifetime) so the ✓ marker and /settings row can compare against it.
+        if (self.cfg) |cfg| {
+            if (cfg.theme_name) |old| self.alloc.free(old);
+            cfg.theme_name = self.alloc.dupe(u8, name) catch null;
+            if (cfg.theme_name) |owned| theme.active_name = owned;
+        }
+        return true;
+    }
+
+    /// Apply the selected theme by name (from /themes or /settings): activate,
+    /// persist to settings.json (pi settings "theme"), and redraw.
+    fn applyThemeByName(self: *TUI, name: []const u8) void {
+        if (self.setThemeActive(name)) {
+            if (self.cfg) |cfg| cfg.persistSettings(self.alloc, self.io) catch {};
             self.note("\x1b[90mTheme set to {s}\x1b[0m", .{name});
         } else {
             self.note("theme load failed: {s}", .{name});
