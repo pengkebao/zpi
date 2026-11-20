@@ -104,26 +104,92 @@ pub const Theme = struct {
     }
 
     /// Foreground SGR prefix, e.g. "\x1b[38;2;r;g;bm". Terminal default returns
-    /// "\x1b[39m".
+    /// "\x1b[39m". Built with manual digit assembly (no std.fmt) so it is cheap
+    /// at comptime (used to seed the global SgrSet).
     pub fn fgSgr(self: *const Theme, t: Token, buf: *[48]u8) []const u8 {
-        return switch (self.get(t)) {
-            .terminal => "\x1b[39m",
-            .rgb => |c| std.fmt.bufPrint(buf, "\x1b[38;2;{d};{d};{d}m", .{ c.r, c.g, c.b }) catch "\x1b[0m",
-            .indexed => |i| std.fmt.bufPrint(buf, "\x1b[38;5;{d}m", .{i}) catch "\x1b[0m",
-        };
+        return sgrPrefix(buf, 38, self.get(t));
     }
 
     /// Background SGR prefix, e.g. "\x1b[48;2;r;g;bm".
     pub fn bgSgr(self: *const Theme, t: Token, buf: *[48]u8) []const u8 {
-        return switch (self.get(t)) {
-            .terminal => "\x1b[49m",
-            .rgb => |c| std.fmt.bufPrint(buf, "\x1b[48;2;{d};{d};{d}m", .{ c.r, c.g, c.b }) catch "\x1b[0m",
-            .indexed => |i| std.fmt.bufPrint(buf, "\x1b[48;5;{d}m", .{i}) catch "\x1b[0m",
-        };
+        return sgrPrefix(buf, 48, self.get(t));
     }
 
     pub const RESET = "\x1b[0m";
 };
+
+/// Append a decimal value (0-255) to buf at position `pos`, returning the new
+/// length. Manual digit assembly (comptime-cheap, no std.fmt).
+fn appendDec(buf: []u8, start: usize, val: u8) usize {
+    var pos = start;
+    var v = val;
+    if (v >= 100) {
+        buf[pos] = v / 100 + '0';
+        pos += 1;
+        v = v % 100;
+        buf[pos] = v / 10 + '0';
+        pos += 1;
+        v = v % 10;
+    } else if (v >= 10) {
+        buf[pos] = v / 10 + '0';
+        pos += 1;
+        v = v % 10;
+    }
+    buf[pos] = v + '0';
+    return pos + 1;
+}
+
+/// Build an SGR color prefix into `buf` for `mode` (38 = foreground, 48 =
+/// background) and a resolved color value. Returns the written slice.
+fn sgrPrefix(buf: *[48]u8, mode: u8, v: Value) []const u8 {
+    var s: [48]u8 = undefined;
+    var n: usize = 0;
+    s[n] = 0x1b;
+    n += 1;
+    s[n] = '[';
+    n += 1;
+    switch (v) {
+        .terminal => {
+            // default fg = 39, default bg = 49
+            s[n] = @as(u8, mode + 1) + '0';
+            n += 1;
+            s[n] = 'm';
+            n += 1;
+        },
+        .indexed => |i| {
+            n = appendDec(s[0..], n, mode);
+            s[n] = ';';
+            n += 1;
+            s[n] = '5';
+            n += 1;
+            s[n] = ';';
+            n += 1;
+            n = appendDec(s[0..], n, @intCast(i));
+            s[n] = 'm';
+            n += 1;
+        },
+        .rgb => |c| {
+            n = appendDec(s[0..], n, mode);
+            s[n] = ';';
+            n += 1;
+            s[n] = '2';
+            n += 1;
+            s[n] = ';';
+            n += 1;
+            n = appendDec(s[0..], n, c.r);
+            s[n] = ';';
+            n += 1;
+            n = appendDec(s[0..], n, c.g);
+            s[n] = ';';
+            n += 1;
+            n = appendDec(s[0..], n, c.b);
+            s[n] = 'm';
+            n += 1;
+        },
+    }
+    @memcpy(buf[0..n], s[0..n]);
+    return buf[0..n];
+}
 
 // ---------------------------------------------------------------------------
 // Color value parsing (a single scalar: "" / hex / okhsl / oklch / int)
@@ -519,30 +585,122 @@ fn builtinLight() Theme {
 pub const builtin_dark = builtinDark();
 pub const builtin_light = builtinLight();
 
+/// Pre-computed SGR prefix strings for every token, so the render path takes
+/// a `[]const u8` with no scratch buffer. Recomputed when the active theme
+/// changes (rare) — rendering is the hot path.
+pub const SgrSet = struct {
+    const N = @typeInfo(Token).@"enum".field_names.len;
+    fg: [N][48]u8 = undefined,
+    fg_len: [N]usize = undefined,
+    bg: [N][48]u8 = undefined,
+    bg_len: [N]usize = undefined,
+
+    pub fn compute(theme: *const Theme) SgrSet {
+        var s: SgrSet = undefined;
+        for (0..N) |i| {
+            const tok = @as(Token, @enumFromInt(i));
+            const f = theme.fgSgr(tok, &s.fg[i]);
+            s.fg_len[i] = f.len;
+            const b = theme.bgSgr(tok, &s.bg[i]);
+            s.bg_len[i] = b.len;
+        }
+        return s;
+    }
+
+    pub fn fgStr(self: *const SgrSet, t: Token) []const u8 {
+        const i = @intFromEnum(t);
+        return self.fg[i][0..self.fg_len[i]];
+    }
+
+    pub fn bgStr(self: *const SgrSet, t: Token) []const u8 {
+        const i = @intFromEnum(t);
+        return self.bg[i][0..self.bg_len[i]];
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Active theme (runtime). The TUI sets this on load / on /themes switch.
+// Rendering files read it via `active()` so a theme change is picked up on
+// the next frame without threading a pointer through every render call.
+// Defaults to the built-in dark theme (byte-identical to the previous
+// hard-coded palette), so un-themed code paths render unchanged.
+// ---------------------------------------------------------------------------
+
+var active_ptr: ?*const Theme = null;
+
+/// The currently active theme, or the built-in dark theme when none is set.
+pub fn active() *const Theme {
+    return active_ptr orelse &builtin_dark;
+}
+
+/// Pre-computed SGR strings for the active theme. Recomputed on setActive.
+var active_sgr: SgrSet = SgrSet.compute(&builtin_dark);
+
+pub fn setActive(t: *const Theme) void {
+    active_ptr = t;
+    active_sgr = SgrSet.compute(t);
+}
+
+/// The name of the active theme (for settings persistence + the ✓ marker).
+/// Defaults to "dark".
+pub var active_name: []const u8 = "dark";
+
+/// Set the active theme AND record its name (pi settings "theme").
+pub fn setActiveNamed(t: *const Theme, name: []const u8) void {
+    setActive(t);
+    active_name = name;
+}
+
+pub fn resetActive() void {
+    active_ptr = null;
+    active_sgr = SgrSet.compute(&builtin_dark);
+}
+
+/// Foreground SGR prefix for a token (no scratch buffer needed).
+pub fn fgStr(t: Token) []const u8 {
+    return active_sgr.fgStr(t);
+}
+
+/// Background SGR prefix for a token (no scratch buffer needed).
+pub fn bgStr(t: Token) []const u8 {
+    return active_sgr.bgStr(t);
+}
+
+/// Foreground SGR prefix for a token from the active theme.
+pub fn fg(token: Token, buf: *[48]u8) []const u8 {
+    return active().fgSgr(token, buf);
+}
+
+/// Background SGR prefix for a token from the active theme.
+pub fn bg(token: Token, buf: *[48]u8) []const u8 {
+    return active().bgSgr(token, buf);
+}
+
 // ---------------------------------------------------------------------------
 // Custom theme discovery (~/.pi/agent/themes/*.json)
 // ---------------------------------------------------------------------------
 
 /// List custom theme names in `themes_dir` (files ending in ".json"). Returns
 /// an owned slice of owned names.
-pub fn listCustomThemes(alloc: std.mem.Allocator, io: std.Io, themes_dir: []const u8) ![][:0]u8 {
+pub fn listCustomThemes(alloc: std.mem.Allocator, io: std.Io, themes_dir: []const u8) ![][]u8 {
     var out = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (out.items) |n| alloc.free(n);
         alloc.free(out.items);
     }
-    const dir = std.Io.Dir.openAbsolute(io, themes_dir, .{}) catch return &.{};
-    defer dir.close();
-    var iter = dir.iterate(io) catch return &.{};
+    const empty: [][]u8 = &[_][]u8{};
+    const dir = std.Io.Dir.cwd().openDir(io, themes_dir, .{ .iterate = true }) catch return empty;
+    defer dir.close(io);
+    var it = std.Io.Dir.iterate(dir);
     while (true) {
-        const entry = iter.next() catch break;
+        const entry = it.next(io) catch break;
         if (entry == null) break;
         const e = entry.?;
         if (e.kind != .file) continue;
         if (!std.mem.endsWith(u8, e.name, ".json")) continue;
-        const stem = e.name[0 .. e.len - 5];
-        const dup = try alloc.dupeZ(u8, stem);
-        out.appendAssumeCapacity(dup);
+        const stem = e.name[0 .. e.name.len - 5];
+        const dup = try alloc.dupe(u8, stem);
+        out.append(alloc, dup) catch { alloc.free(dup); return error.OutOfMemory; };
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -551,11 +709,9 @@ pub fn listCustomThemes(alloc: std.mem.Allocator, io: std.Io, themes_dir: []cons
 pub fn loadCustomTheme(alloc: std.mem.Allocator, io: std.Io, themes_dir: []const u8, name: []const u8) ?*Theme {
     var path: [512]u8 = undefined;
     const full = std.fmt.bufPrint(&path, "{s}/{s}.json", .{ themes_dir, name }) catch return null;
-    const file = std.Io.File.openAbsolute(io, full, .{}) catch return null;
-    defer file.close();
-    const bytes = file.readToEndAlloc(alloc, 1 << 20) catch return null;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, full, alloc, .unlimited) catch return null;
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return null;
     defer parsed.deinit();
     return fromJson(alloc, parsed.value) catch null;
 }

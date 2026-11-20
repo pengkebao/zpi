@@ -112,6 +112,9 @@ pub const Config = struct {
     /// settings.json "defaultThinkingLevel": the · default marker in the
     /// thinking selector (pi defaultThinkingLevel).
     default_thinking_level: ?ThinkingLevel = null,
+    /// settings.json "theme" (pi): the active theme name ("dark", "light", or a
+    /// custom *.json stem). null = default dark. Owned; dup'd on load.
+    theme_name: ?[]const u8 = null,
     /// settings.json "steeringMode" (pi default "one-at-a-time"): "all"
     /// delivers every queued steering message before the next LLM request,
     /// "one-at-a-time" delivers one per round.
@@ -186,6 +189,7 @@ pub const Config = struct {
         self.models.deinit();
         if (self.default_provider) |dp| alloc.free(dp);
         if (self.default_model) |dm| alloc.free(dm);
+        if (self.theme_name) |tn| alloc.free(tn);
         if (self.default_tools) |dt| {
             for (dt) |n| alloc.free(n);
             alloc.free(dt);
@@ -456,6 +460,11 @@ pub const Config = struct {
         if (strIn(root, "defaultThinkingLevel")) |dl| {
             self.default_thinking_level = ThinkingLevel.fromStr(dl);
         }
+        // theme (pi settings "theme"): active theme name.
+        if (strIn(root, "theme")) |tn| {
+            if (self.theme_name) |old| alloc.free(old);
+            self.theme_name = alloc.dupe(u8, tn) catch null;
+        }
         // enabledModels: ["provider/id", "provider/*"] patterns.
         if (root.get("enabledModels")) |ev| {
             switch (ev) {
@@ -577,6 +586,7 @@ pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, 
         if (self.default_provider) |dp| try root.object.put(arena, "defaultProvider", .{ .string = dp });
         if (self.default_model) |dm| try root.object.put(arena, "defaultModel", .{ .string = dm });
         if (self.default_thinking_level) |dtl| try root.object.put(arena, "defaultThinkingLevel", .{ .string = dtl.name() });
+        if (self.theme_name) |tn| try root.object.put(arena, "theme", .{ .string = tn });
         if (self.enabled_models) |pats| {
             var arr = std.json.Array.init(arena);
             for (pats) |pat| arr.append(.{ .string = pat }) catch {};

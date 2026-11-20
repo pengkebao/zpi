@@ -1545,6 +1545,8 @@ pub fn main(init: std.process.Init) !void {
         // Gate project discovery BEFORE the first dynamic-slash refresh.
         t.project_trusted = project_trusted;
         t.initLate();
+        // Load the persisted theme (settings "theme"); default dark when unset.
+        t.applyThemeFromSettings();
         defer t.deinit();
         // Project trust ask (H4): pi TrustSelectorComponent runs before any
         // other interaction; choosing Trust hot-loads project resources via

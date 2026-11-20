@@ -49,6 +49,7 @@ zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP
 - 编辑器：鼠标拖拽选区 + 双击选词（CJK 逐字）+ 三击选行、滚轮滚动编辑区；粘贴走 bracketed paste（多行整体粘贴，不再逐行提交）
 - 剪贴板双通道：OSC 52（SSH/远程终端）+ 系统剪贴板（macOS pbcopy / Linux xclip·wl-copy / Windows PowerShell），覆盖 Terminal.app 忽略 OSC 52 的场景
 - 启动欢迎头：半块像素 logo、双态键位提示（Ctrl+O 展开）、Model scope、技能/模板清单 —— 与 pi 逐行对齐
+- **主题系统**（pi 同款 JSON 主题引擎）：53 个颜色 token，支持 hex / `okhsl()` / `oklch()` / 256 色索引 / `var()` 引用，内置 dark / light 双主题（逐字节对齐 pi 1.5.0），`/themes` 打开选择器（输入过滤、Enter 应用、✓ 标记当前主题）；自定义主题放 `~/.pi/agent/themes/*.json`，选择自动写入 settings.json 的 `theme` 字段并在下次启动时加载
 
 ## 快速开始
 
@@ -93,8 +94,10 @@ zig build
 `settings.json` — 默认模型与行为开关：
 
 ```json
-{ "defaultProvider": "my-provider", "defaultModel": "my-model" }
+{ "defaultProvider": "my-provider", "defaultModel": "my-model", "theme": "dark" }
 ```
+
+`theme` 取值 `dark` / `light` / 自定义主题名（`~/.pi/agent/themes/<name>.json` 的文件名，不含 `.json`）；缺省为 `dark`，也可在运行时用 `/themes` 切换（自动写回该字段）。
 
 apiKey 支持 字面量 / `$ENV_VAR` / `!command` 三种写法；凭据回退顺序：models.json apiKey → auth.json → 内置环境变量。内置提供方（zai-coding-cn 等）定价内置于 catalog。
 
@@ -154,10 +157,12 @@ src/
 ## 测试
 
 ```bash
-zig test test_ui.zig              # 268 个 UI/逻辑测试
+zig test test_ui.zig              # 277 个 UI/逻辑测试
 zig test leak_g2.zig              # 195 个泄漏回归测试（SafeAllocator 全路径）
 zig test src/ui/keys.zig          # 按键/鼠标序列解析（19）
 zig test src/ui/tool_block.zig    # 工具块渲染：diff/ANSI/CJK 折行/实时输出（27）
+zig test src/ui/theme.zig         # 主题引擎：token 解析/JSON 加载/内置主题（9）
+zig test src/ui/oklab.zig         # okhsl/oklch → sRGB 颜色转换（2）
 zig test test_openai.zig          # SSE 协议解析（11）
 zig test test_mcp.zig             # MCP 客户端单测（9）
 zig test test_pt.zig              # bracketed paste（4）

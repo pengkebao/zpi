@@ -24,6 +24,7 @@ const skills = @import("../core/skills.zig");
 const sp = @import("../core/system_prompt.zig");
 const mcp = @import("../core/mcp.zig");
 const ansi = @import("ansi.zig");
+const theme = @import("theme.zig");
 const spinner = @import("spinner.zig");
 const keys = @import("keys.zig");
 const editor_mod = @import("editor.zig");
@@ -55,34 +56,153 @@ const TCIFLUSH: c_int = 0;
 const ThinkingLevel = config.ThinkingLevel;
 
 // Border colors (exact okhsl→sRGB values from pi's dark theme).
-const BORDER_IDLE = "\x1b[38;2;108;118;123m"; // thinkingOff / borderMuted (gray)
-const BORDER_LOW = "\x1b[38;2;84;137;164m"; // thinkingLow (blue)
-const BORDER_MEDIUM = "\x1b[38;2;97;133;204m"; // thinkingMedium (indigo)
-const BORDER_HIGH = "\x1b[38;2;151;118;229m"; // thinkingHigh (purple)
-const BORDER_XHIGH = "\x1b[38;2;222;84;193m"; // thinkingXhigh (magenta)
-const BORDER_MAX = "\x1b[38;2;254;84;98m"; // thinkingMax (red)
-const BORDER_BASH = "\x1b[38;2;94;178;134m"; // bashMode (green)
-const BORDER_INFO = "\x1b[38;2;114;130;216m"; // theme.border okhsl(231 57% 65%) — modal selectors
-const ACCENT = "\x1b[38;2;167;152;215m";
-// Message block colors (pi dark theme).
-const USER_BG = "\x1b[48;2;33;59;73m"; // userMessageBg blueBg
-const SELECTED_BG = "\x1b[48;2;33;59;73m"; // selectedBg (the same blueBg token)
-const USER_FG = "\x1b[38;2;222;224;225m"; // text
-const THINKING_TEXT = "\x1b[38;2;150;160;164m"; // thinkingText // violet (spinner, cursor)
-const MUTED = "\x1b[38;2;108;118;123m"; // muted text ("Working" label)
-const FG_MUTED = "\x1b[38;2;157;165;169m"; // muted (customMessageText)
+fn BORDER_IDLE() []const u8 {
+    return theme.fgStr(.thinkingOff);
+}
+fn BORDER_LOW() []const u8 {
+    return theme.fgStr(.thinkingLow);
+}
+fn BORDER_MEDIUM() []const u8 {
+    return theme.fgStr(.thinkingMedium);
+}
+fn BORDER_HIGH() []const u8 {
+    return theme.fgStr(.thinkingHigh);
+}
+fn BORDER_XHIGH() []const u8 {
+    return theme.fgStr(.thinkingXhigh);
+}
+fn BORDER_MAX() []const u8 {
+    return theme.fgStr(.thinkingMax);
+}
+fn BORDER_BASH() []const u8 {
+    return theme.fgStr(.bashMode);
+}
+fn BORDER_INFO() []const u8 {
+    return theme.fgStr(.border);
+}
+fn ACCENT() []const u8 {
+    return theme.fgStr(.accent);
+}
+fn USER_BG() []const u8 {
+    return theme.bgStr(.userMessageBg);
+}
+fn SELECTED_BG() []const u8 {
+    return theme.bgStr(.selectedBg);
+}
+fn USER_FG() []const u8 {
+    return theme.fgStr(.text);
+}
+fn THINKING_TEXT() []const u8 {
+    return theme.fgStr(.thinkingText);
+}
+fn MUTED() []const u8 {
+    return theme.fgStr(.muted);
+}
+fn FG_MUTED() []const u8 {
+    return theme.fgStr(.muted);
+}
 pub const VERSION = "0.1.0";
-const CUSTOM_MSG_BG = "\x1b[48;2;58;48;85m"; // customMessageBg okhsl(295 42% 24%)
-const FG_ERROR = "\x1b[38;2;234;127;129m"; // error (red)
+fn CUSTOM_MSG_BG() []const u8 {
+    return theme.bgStr(.customMessageBg);
+}
+fn FG_ERROR() []const u8 {
+    return theme.fgStr(.@"error");
+}
 // Scrollbar (pi dark theme tokens).
-const SCROLLBAR_TRACK_FG = "\x1b[38;2;72;78;82m"; // scrollbarTrack
-const SCROLLBAR_THUMB_FG = "\x1b[38;2;151;160;165m"; // scrollbarThumb
-const SCROLLBAR_TRACK = SCROLLBAR_TRACK_FG ++ "\u{2502}" ++ ansi.RESET; // │
-const SCROLLBAR_THUMB = SCROLLBAR_THUMB_FG ++ "\u{2503}" ++ ansi.RESET; // ┃
-const SCROLLBAR_THUMB_SOLID = SCROLLBAR_THUMB_FG ++ "\u{2588}" ++ ansi.RESET; // █
+fn SCROLLBAR_TRACK_FG() []const u8 {
+    return theme.fgStr(.scrollbarTrack);
+}
+fn SCROLLBAR_THUMB_FG() []const u8 {
+    return theme.fgStr(.scrollbarThumb);
+}
+fn SCROLLBAR_TRACK() []const u8 {
+    var buf: [80]u8 = undefined;
+    const c = theme.fgStr(.scrollbarTrack);
+    const g = "\u{2502}";
+    const r = ansi.RESET;
+    if (c.len + g.len + r.len > buf.len) return c;
+    @memcpy(buf[0..c.len], c);
+    @memcpy(buf[c.len .. c.len+g.len], g);
+    @memcpy(buf[c.len+g.len .. c.len+g.len+r.len], r);
+    return buf[0 .. c.len+g.len+r.len];
+}
+fn SCROLLBAR_THUMB() []const u8 {
+    var buf: [80]u8 = undefined;
+    const c = theme.fgStr(.scrollbarThumb);
+    const g = "\u{2503}";
+    const r = ansi.RESET;
+    if (c.len + g.len + r.len > buf.len) return c;
+    @memcpy(buf[0..c.len], c);
+    @memcpy(buf[c.len .. c.len+g.len], g);
+    @memcpy(buf[c.len+g.len .. c.len+g.len+r.len], r);
+    return buf[0 .. c.len+g.len+r.len];
+}
+fn SCROLLBAR_THUMB_SOLID() []const u8 {
+    var buf: [80]u8 = undefined;
+    const c = theme.fgStr(.scrollbarThumb);
+    const g = "\u{2588}";
+    const r = ansi.RESET;
+    if (c.len + g.len + r.len > buf.len) return c;
+    @memcpy(buf[0..c.len], c);
+    @memcpy(buf[c.len .. c.len+g.len], g);
+    @memcpy(buf[c.len+g.len .. c.len+g.len+r.len], r);
+    return buf[0 .. c.len+g.len+r.len];
+}
+/// Runtime string concat helpers (`++` is comptime-only; these use a stack
+/// buffer and are valid for the enclosing scope).
+fn j2(a: []const u8, b: []const u8) []const u8 {
+    var buf: [512]u8 = undefined;
+    if (a.len + b.len > buf.len) return a;
+    @memcpy(buf[0..a.len], a);
+    @memcpy(buf[a.len .. a.len + b.len], b);
+    return buf[0 .. a.len + b.len];
+}
+
+fn j3(a: []const u8, b: []const u8, c: []const u8) []const u8 {
+    var buf: [512]u8 = undefined;
+    if (a.len + b.len + c.len > buf.len) return a;
+    @memcpy(buf[0..a.len], a);
+    @memcpy(buf[a.len .. a.len + b.len], b);
+    @memcpy(buf[a.len + b.len .. a.len + b.len + c.len], c);
+    return buf[0 .. a.len + b.len + c.len];
+}
+
+/// Concatenate up to 4 runtime pieces into an owned heap []u8 (for lines that
+/// must survive the caller's scope). `allocPrint` needs a comptime format
+/// string, so runtime-colored lines are built by hand instead.
+fn concatOwned(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    var total: usize = 0;
+    for (parts) |p| total += p.len;
+    var out = try alloc.alloc(u8, total);
+    var pos: usize = 0;
+    for (parts) |p| {
+        @memcpy(out[pos .. pos + p.len], p);
+        pos += p.len;
+    }
+    return out;
+}
+
+/// Build an owned heap []u8 from a runtime color prefix + a comptime format
+/// (with args) + a runtime color suffix. `allocPrint`/`Writer.print` need a
+/// comptime format, so runtime-colored lines with {s}/{d} placeholders are
+/// assembled by writing the runtime pieces with writeAll and the middle with
+/// print.
+fn printOwned(alloc: std.mem.Allocator, prefix: []const u8, comptime mid: []const u8, args: anytype, suffix: []const u8) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(alloc);
+    defer w.deinit();
+    w.writer.writeAll(prefix) catch return error.OutOfMemory;
+    w.writer.print(mid, args) catch return error.OutOfMemory;
+    w.writer.writeAll(suffix) catch return error.OutOfMemory;
+    return alloc.dupe(u8, w.written());
+}
+
 // Transcript search (pi dark theme tokens, searchMatchBg/searchMatchText).
-const SEARCH_MATCH_BG = "\x1b[48;2;78;47;27m"; // okhsl(53 51% 24%)
-const SEARCH_MATCH_FG = "\x1b[38;2;157;165;169m"; // muted (searchMatchText)
+fn SEARCH_MATCH_BG() []const u8 {
+    return theme.bgStr(.searchMatchBg);
+}
+fn SEARCH_MATCH_FG() []const u8 {
+    return theme.fgStr(.searchMatchText);
+}
 /// pi: PAGE_SCROLL_OVERLAP — rows kept in view when paging.
 const PAGE_SCROLL_OVERLAP: usize = 4;
 /// pi: ALT_WHEEL_SCROLL_MULTIPLIER — Alt+wheel scrolls this much faster.
@@ -90,12 +210,12 @@ const ALT_WHEEL_SCROLL_MULTIPLIER: usize = 5;
 
 fn levelColor(level: ThinkingLevel) []const u8 {
     return switch (level) {
-        .off => BORDER_IDLE,
-        .low => BORDER_LOW,
-        .medium => BORDER_MEDIUM,
-        .high => BORDER_HIGH,
-        .xhigh => BORDER_XHIGH,
-        .max => BORDER_MAX,
+        .off => BORDER_IDLE(),
+        .low => BORDER_LOW(),
+        .medium => BORDER_MEDIUM(),
+        .high => BORDER_HIGH(),
+        .xhigh => BORDER_XHIGH(),
+        .max => BORDER_MAX(),
     };
 }
 
@@ -152,7 +272,7 @@ pub const TUI = struct {
     /// leading slash (pi item.value: label may differ, e.g. models show the
     /// id but complete to "provider/id"); empty = use `name`.
     const MenuEntry = struct { name: []const u8, desc: []const u8, model_idx: ?usize = null, value: []const u8 = "" };
-    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped, model_selector, thinking_selector, login_select, login_key, logout_select };
+    const MenuMode = enum { hidden, commands, models, settings, files, sessions, tree, forksel, mcp, mcp_server, mcp_tools, mcp_exposure, trust, scoped, model_selector, thinking_selector, themes, login_select, login_key, logout_select };
     const CommandDef = struct { name: []const u8, desc: []const u8, takes_arg: bool = false };
 
     const LOGIN_MAX = 32;
@@ -398,6 +518,7 @@ pub const TUI = struct {
         .{ .name = "/compact", .desc = "Manually compact the session context" },
         .{ .name = "/resume", .desc = "Resume another session" },
         .{ .name = "/reload", .desc = "Reload keybindings, extensions, skills, prompts, themes, and context files" },
+        .{ .name = "/themes", .desc = "Choose a theme (builtin dark/light + custom)" },
         .{ .name = "/quit", .desc = "Quit" },
         .{ .name = "/mcp", .desc = "Show MCP servers and their state" },
     };
@@ -670,6 +791,16 @@ pub const TUI = struct {
     ts_levels: [7]config.ThinkingLevel = undefined,
     ts_visible: usize = 0,
     ts_sel: usize = 0,
+    // Theme selector (pi ThemeSelector). th_names holds the FULL list (owned
+    // by th_names_buf); th_vis holds the visible indices after filtering and
+    // th_sel indexes into th_vis. The active theme is tracked by name in
+    // theme.active_name (for the ✓ marker + preselect).
+    th_names: [16][]const u8 = undefined,
+    th_total: usize = 0, // full list length (names 0..th_total)
+    th_vis: [16]usize = undefined, // visible indices into th_names
+    th_vis_count: usize = 0,
+    th_sel: usize = 0, // indexes th_vis
+    th_names_buf: ?[]u8 = null,
     /// /scoped-models: dirty flag (changes applied live; Ctrl+S persists).
     scoped_dirty: bool = false,
     // ---- /login + /logout (pi OAuthSelectorComponent + LoginDialogComponent,
@@ -898,7 +1029,7 @@ pub const TUI = struct {
         // Modal dialogs (settings, session/tree/fork pickers, the /mcp
         // manager, scoped-models) are not driven by editor text.
         switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .login_select, .login_key, .logout_select => return,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .themes, .login_select, .login_key, .logout_select => return,
             else => {},
         }
         const text = self.editor.getText() catch {
@@ -1218,7 +1349,7 @@ pub const TUI = struct {
 
     /// pi SessionSelector row rendering for one visible row.
     fn sessionPickerLine(self: *TUI, v: usize, width: usize) ![]u8 {
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const accent = "\x1b[38;2;167;152;215m";
         const reset = ansi.RESET;
         const item_idx = self.menu_view_start + v;
@@ -1314,7 +1445,7 @@ pub const TUI = struct {
         // Tree picker rows (pi TreeSelector): "› " + rich entry text (the
         // row buffer already carries colors); hint row after the entries.
         if (self.menu_mode == .tree) {
-            const muted = FG_MUTED;
+            const muted = FG_MUTED();
             const reset = ansi.RESET;
             const item_idx = self.menu_view_start + v;
             const selected = item_idx == self.menu_selected;
@@ -1337,7 +1468,7 @@ pub const TUI = struct {
         // projected window directly and menu_view_start only decides the
         // selection marker.
         const projected = switch (self.menu_mode) {
-            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .login_select, .login_key, .logout_select => true,
+            .settings, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .scoped, .model_selector, .thinking_selector, .themes, .login_select, .login_key, .logout_select => true,
             else => false,
         };
         const item_idx = if (projected) v else self.menu_view_start + v;
@@ -1347,7 +1478,7 @@ pub const TUI = struct {
         const name_full = if (e.name.len > 0 and e.name[0] == '/') e.name[1..] else e.name;
         const accent = "\x1b[38;2;167;152;215m";
         const reset = ansi.RESET;
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         var name_buf: [192]u8 = undefined;
         var desc_buf: [256]u8 = undefined;
         var desc_sp_buf: [256]u8 = undefined;
@@ -1496,6 +1627,18 @@ pub const TUI = struct {
                 self.redraw();
                 return false;
             },
+            .themes => {
+                // pi ThemeSelector: Enter applies the selected theme and closes.
+                if (self.th_vis_count > 0 and self.th_sel < self.th_vis_count) {
+                    const name = self.th_names[self.th_vis[self.th_sel]];
+                    self.applyThemeByName(name);
+                }
+                self.menu_mode = .hidden;
+                self.editor.clear() catch {};
+                self.freeThemes();
+                self.redraw();
+                return false;
+            },
             .login_select, .logout_select => {
                 // pi OAuthSelector: Enter opens the login flow for the
                 // selected provider (or removes its stored credential).
@@ -1633,7 +1776,7 @@ pub const TUI = struct {
     fn renderSettingsView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), editor_h: usize, settings_h: usize) void {
         _ = settings_h;
         const width = self.width;
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const accent = "\x1b[38;2;167;152;215m";
         const reset = ansi.RESET;
         // Blank line after the search input (pi: searchInput then "").
@@ -1727,7 +1870,7 @@ pub const TUI = struct {
     }
 
     fn renderModelSelectorView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const accent = "\x1b[38;2;167;152;215m";
         const warn = "\x1b[38;2;222;147;95m";
         const reset = ansi.RESET;
@@ -1763,7 +1906,7 @@ pub const TUI = struct {
                 var clean = std.array_list.Managed(u8).init(self.alloc);
                 defer clean.deinit();
                 clean.appendSlice(if (selected) "\u{2192} " else "  ") catch return;
-                if (selected) clean.appendSlice(ACCENT) catch return;
+                if (selected) clean.appendSlice(ACCENT()) catch return;
                 clean.appendSlice(if (self.isCurrentModel(idx)) "\u{2713} " else "  ") catch return;
                 clean.appendSlice(m.id) catch return;
                 clean.appendSlice(reset) catch return;
@@ -1823,7 +1966,7 @@ pub const TUI = struct {
     /// " • not configured" otherwise; env-var sources render as "env: NAME"
     /// (pi renders ALL-CAPS env lists with the env: prefix).
     fn loginStatusSuffix(self: *TUI, provider_id: []const u8, buf: *[160]u8) []const u8 {
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const success = "\x1b[38;2;114;178;134m";
         const reset = ansi.RESET;
         var stored = false;
@@ -2052,7 +2195,7 @@ pub const TUI = struct {
     }
 
     fn renderLoginKeyView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const reset = ansi.RESET;
         frame.append(self.alloc, "") catch return;
         const instr = std.fmt.allocPrint(self.alloc, "  {s}Enter {s}{s}", .{ muted, self.loginKeyPromptName(), reset }) catch return;
@@ -2067,8 +2210,8 @@ pub const TUI = struct {
     }
 
     fn renderLoginView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
-        const muted = FG_MUTED;
-        const accent = ACCENT;
+        const muted = FG_MUTED();
+        const accent = ACCENT();
         const reset = ansi.RESET;
         frame.append(self.alloc, "") catch return;
         const title_comptime: []const u8 = if (self.menu_mode == .logout_select)
@@ -2594,7 +2737,7 @@ pub const TUI = struct {
         const st = self.session.store orelse return;
         var chain: [SEL_MAX]ss.Store.ChainItem = undefined;
         const cnt = st.leafChain(&chain);
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const accent = "\x1b[38;2;167;152;215m";
         const ok_green = "\x1b[38;2;126;188;135m";
         const warn = "\x1b[38;2;222;147;95m";
@@ -3076,7 +3219,7 @@ pub const TUI = struct {
     }
 
     fn renderThinkingSelectorView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const accent = "\x1b[38;2;167;152;215m";
         const reset = ansi.RESET;
         frame.append(self.alloc, "") catch return;
@@ -3119,6 +3262,186 @@ pub const TUI = struct {
         frame.append(self.alloc, "") catch return;
         const hint = std.fmt.allocPrint(self.alloc, "  {s}Enter to select \u{b7} Ctrl+S to set as default \u{b7} Escape/Ctrl+C to cancel{s}", .{ muted, reset }) catch return;
         frame.append(self.alloc, hint) catch return;
+    }
+
+    // ---- /themes selector (pi ThemeSelector: list, filter, Enter applies;
+    // builtin dark/light + ~/.pi/agent/themes/*.json) ----
+
+    fn freeThemes(self: *TUI) void {
+        if (self.th_names_buf) |b| self.alloc.free(b);
+        self.th_names_buf = null;
+        self.th_total = 0;
+        self.th_vis_count = 0;
+        self.th_sel = 0;
+    }
+
+    /// Gather candidate theme names: builtin dark/light first, then any *.json
+    /// in the themes dir (pi getCustomThemes). Names are stored in self.th_names
+    /// pointing into self.th_names_buf.
+    fn gatherThemes(self: *TUI) void {
+        self.freeThemes();
+        var buf = std.array_list.Managed(u8).init(self.alloc);
+        defer buf.deinit();
+        var count: usize = 0;
+        // Add the builtin names to the front of the list.
+        const builtins = [_][]const u8{ "dark", "light" };
+        for (builtins) |nm| {
+            if (count >= 16) break;
+            const start = buf.items.len;
+            buf.appendSlice(nm) catch break;
+            buf.append(0) catch break;
+            self.th_names[count] = buf.items[start .. buf.items.len - 1];
+            count += 1;
+        }
+        // Custom themes: enumerate the themes dir (base_dir/themes).
+        if (self.cfg) |cfg| {
+            const themes_dir = std.fmt.allocPrint(self.alloc, "{s}/themes", .{cfg.base_dir}) catch return;
+            defer self.alloc.free(themes_dir);
+            const customs = theme.listCustomThemes(self.alloc, self.io, themes_dir) catch &[_][]u8{};
+            defer {
+                for (customs) |n| self.alloc.free(n);
+                self.alloc.free(customs);
+            }
+            for (customs) |n| {
+                if (count >= 16) break;
+                const start = buf.items.len;
+                buf.appendSlice(n) catch break;
+                buf.append(0) catch break;
+                self.th_names[count] = buf.items[start .. buf.items.len - 1];
+                count += 1;
+            }
+        }
+        self.th_names_buf = buf.toOwnedSlice() catch return;
+        self.th_total = count;
+        self.themesRefilter();
+    }
+
+    /// Apply the theme named in settings (pi: the "theme" setting is loaded at
+    /// startup). No-op when unset (default dark) or when the custom theme file
+    /// is missing (falls back to dark).
+    pub fn applyThemeFromSettings(self: *TUI) void {
+        const cfg = self.cfg orelse return;
+        const name = cfg.theme_name orelse return;
+        if (std.mem.eql(u8, name, "dark")) {
+            theme.setActiveNamed(&theme.builtin_dark, "dark");
+            return;
+        }
+        if (std.mem.eql(u8, name, "light")) {
+            theme.setActiveNamed(&theme.builtin_light, "light");
+            return;
+        }
+        const themes_dir = std.fmt.allocPrint(self.alloc, "{s}/themes", .{cfg.base_dir}) catch return;
+        defer self.alloc.free(themes_dir);
+        const t = theme.loadCustomTheme(self.alloc, self.io, themes_dir, name);
+        if (t) |th| theme.setActive(th);
+    }
+
+    fn openThemesSelector(self: *TUI) void {
+        self.menu_mode = .themes;
+        self.editor.clear() catch {};
+        self.gatherThemes();
+        // Preselect the currently-active theme (if it's in the list), keyed by
+        // the theme name recorded at load/switch time.
+        self.th_sel = 0;
+        for (0..self.th_vis_count) |i| {
+            if (std.mem.eql(u8, self.th_names[self.th_vis[i]], theme.active_name)) self.th_sel = i;
+        }
+        self.freeMenuTextCache();
+        self.redraw();
+    }
+
+    /// Re-filter the theme list by the editor's search text (pi ThemeSelector
+    /// input). Rebuilds th_vis from the full list; selection resets to the top.
+    fn themesRefilter(self: *TUI) void {
+        const query_raw = self.editor.getText() catch "";
+        defer self.alloc.free(query_raw);
+        const query = std.mem.trim(u8, query_raw, " ");
+        var kept: usize = 0;
+        for (0..self.th_total) |i| {
+            if (query.len == 0 or containsIgnoreCase2(self.th_names[i], query)) {
+                if (kept >= 16) break;
+                self.th_vis[kept] = i;
+                kept += 1;
+            }
+        }
+        self.th_vis_count = kept;
+        self.th_sel = 0;
+    }
+
+    fn themesViewHeight(self: *TUI) usize {
+        const rows = @min(self.th_vis_count, 10);
+        var h: usize = 5; // blank + title + blank + hint + blank
+        h += rows;
+        h += 2; // blank + hint
+        return h;
+    }
+
+    fn renderThemesView(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
+        const muted = FG_MUTED();
+        const accent = "\x1b[38;2;167;152;215m";
+        const reset = ansi.RESET;
+        frame.append(self.alloc, "") catch return;
+        const title = std.fmt.allocPrint(self.alloc, "{s}Theme{s}", .{ accent, reset }) catch return;
+        frame.append(self.alloc, title) catch return;
+        frame.append(self.alloc, "") catch return;
+        const cyc = std.fmt.allocPrint(self.alloc, "{s}type to filter \u{b7} Enter applies the selected theme{s}", .{ muted, reset }) catch return;
+        frame.append(self.alloc, cyc) catch return;
+        frame.append(self.alloc, "") catch return;
+        const visible_rows = @min(self.th_vis_count, 10);
+        const start: usize = if (self.th_sel >= visible_rows)
+            @min(self.th_sel -| visible_rows / 2, self.th_vis_count -| visible_rows)
+        else
+            0;
+        for (0..visible_rows) |v| {
+            const sel_idx = start + v; // index into th_vis
+            const i = self.th_vis[sel_idx]; // index into th_names
+            const selected = sel_idx == self.th_sel;
+            var line = std.array_list.Managed(u8).init(self.alloc);
+            defer line.deinit();
+            line.appendSlice(if (selected) "\u{2192} " else "  ") catch return;
+            if (selected) line.appendSlice(accent) catch return;
+            line.appendSlice(if (std.mem.eql(u8, self.th_names[i], theme.active_name)) "\u{2713} " else "  ") catch return;
+            line.appendSlice(self.th_names[i]) catch return;
+            line.appendSlice(reset) catch return;
+            frame.append(self.alloc, line.toOwnedSlice() catch return) catch return;
+        }
+        frame.append(self.alloc, "") catch return;
+        const hint = std.fmt.allocPrint(self.alloc, "  {s}Enter to apply \u{b7} Escape/Ctrl+C to cancel{s}", .{ muted, reset }) catch return;
+        frame.append(self.alloc, hint) catch return;
+    }
+
+    /// Apply the selected theme by name: builtin dark/light or a custom JSON
+    /// from the themes dir. Marks the new theme active, persists the choice to
+    /// settings.json (pi settings "theme"), and redraws.
+    fn applyThemeByName(self: *TUI, name: []const u8) void {
+        var ok = false;
+        if (std.mem.eql(u8, name, "dark")) {
+            theme.setActiveNamed(&theme.builtin_dark, "dark");
+            ok = true;
+        } else if (std.mem.eql(u8, name, "light")) {
+            theme.setActiveNamed(&theme.builtin_light, "light");
+            ok = true;
+        } else if (self.cfg) |cfg| {
+            const themes_dir = std.fmt.allocPrint(self.alloc, "{s}/themes", .{cfg.base_dir}) catch return;
+            defer self.alloc.free(themes_dir);
+            const t = theme.loadCustomTheme(self.alloc, self.io, themes_dir, name);
+            if (t) |th| {
+                theme.setActive(th);
+                ok = true;
+            }
+        }
+        if (ok) {
+            // Persist (pi: settings theme is saved on switch).
+            if (self.cfg) |cfg| {
+                if (cfg.theme_name) |old| self.alloc.free(old);
+                cfg.theme_name = self.alloc.dupe(u8, name) catch null;
+                cfg.persistSettings(self.alloc, self.io) catch {};
+            }
+            self.note("\x1b[90mTheme set to {s}\x1b[0m", .{name});
+        } else {
+            self.note("theme load failed: {s}", .{name});
+        }
+        self.redraw();
     }
 
     fn closeModelSelector(self: *TUI) void {
@@ -3276,7 +3599,7 @@ pub const TUI = struct {
     }
 
     fn renderScopedChrome(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const accent = "\x1b[38;2;167;152;215m";
         const warn = "\x1b[38;2;222;147;95m";
         const reset = ansi.RESET;
@@ -3370,7 +3693,7 @@ pub const TUI = struct {
     /// scope file / State; tools: Exposure description).
     fn renderMcpHeader(self: *TUI, frame: *std.ArrayListUnmanaged([]u8), editor_h: usize) void {
         _ = editor_h;
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const accent = "\x1b[38;2;167;152;215m";
         const reset = ansi.RESET;
         frame.append(self.alloc, "") catch return;
@@ -3416,7 +3739,7 @@ pub const TUI = struct {
 
     /// MCP manager footer hint per layer.
     fn renderMcpFooter(self: *TUI, frame: *std.ArrayListUnmanaged([]u8)) void {
-        const muted = FG_MUTED;
+        const muted = FG_MUTED();
         const reset = ansi.RESET;
         const hint: []const u8 = switch (self.menu_mode) {
             .mcp => "Enter manage \u{b7} Esc close",
@@ -4774,6 +5097,7 @@ pub const TUI = struct {
         const settings_h: usize = if (self.menu_mode == .settings) self.settingsViewHeight(editor_h) else 0;
         const ms_h: usize = if (self.menu_mode == .model_selector) self.modelSelectorViewHeight() else 0;
         const ts_h: usize = if (self.menu_mode == .thinking_selector) self.thinkingSelectorViewHeight() else 0;
+        const th_h: usize = if (self.menu_mode == .themes) self.themesViewHeight() else 0;
         const sc_h: usize = if (self.menu_mode == .scoped) self.scopedViewHeight() else 0;
         // Login/logout selectors (pi OAuthSelectorComponent): title + search
         // line + list; the key dialog (LoginDialogComponent) shows title +
@@ -4829,7 +5153,7 @@ pub const TUI = struct {
         }
         const live_q_h: usize = live_q_rows.items.len;
         const compact_q_h: usize = compact_q_rows.items.len;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + sc_h + mcp_h + compact_q_h + live_q_h + login_h;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + th_h + sc_h + mcp_h + compact_q_h + live_q_h + login_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -4893,11 +5217,7 @@ pub const TUI = struct {
             const label_w: usize = wmod.visualWidth(label);
             if (label_w > 0 and label_w < hint_max) {
                 const col = (hint_max - label_w) / 2;
-                const styled = std.fmt.allocPrint(
-                    self.alloc,
-                    SELECTED_BG ++ USER_FG ++ "{s}" ++ ansi.RESET,
-                    .{label},
-                ) catch null;
+                const styled = printOwned(self.alloc, j2(SELECTED_BG(), USER_FG()), "{s}", .{label}, ansi.RESET) catch null;
                 if (styled) |top| {
                     defer self.alloc.free(top);
                     if (overlay.overlay(self.alloc, frame.items[transcript_h - 1], top, label_w, col)) |composited| {
@@ -5041,6 +5361,9 @@ pub const TUI = struct {
         if (self.menu_mode == .thinking_selector and ts_h > 0) {
             self.renderThinkingSelectorView(&frame);
         }
+        if (self.menu_mode == .themes and th_h > 0) {
+            self.renderThemesView(&frame);
+        }
         // 3.8 Scoped-models view header/footer (pi ScopedModelsSelector).
         if (self.menu_mode == .scoped and sc_h > 0) {
             self.renderScopedChrome(&frame);
@@ -5075,7 +5398,7 @@ pub const TUI = struct {
                 var clean = std.array_list.Managed(u8).init(self.alloc);
                 defer clean.deinit();
                 clean.appendSlice(if (selected) "\u{2192} " else "  ") catch return;
-                if (selected) clean.appendSlice(ACCENT) catch return;
+                if (selected) clean.appendSlice(ACCENT()) catch return;
                 const nm = r.name[0..r.name_len];
                 const ds = r.desc[0..r.desc_len];
                 const nm_w = wmod.visualWidth(nm);
@@ -5083,13 +5406,13 @@ pub const TUI = struct {
                 clean.appendSlice(ansi.RESET) catch return;
                 // Two-column: pad name to 24 then desc in muted.
                 if (nm_w < 24) clean.appendSlice((SPACES48)[0..@min(24 - nm_w, 24)]) catch return;
-                clean.appendSlice(FG_MUTED) catch return;
+                clean.appendSlice(FG_MUTED()) catch return;
                 clean.appendSlice(ds) catch return;
                 clean.appendSlice(ansi.RESET) catch return;
                 frame.append(self.alloc, clean.toOwnedSlice() catch return) catch return;
             }
             if (self.sel_len > visible_items) {
-                const cnt = std.fmt.allocPrint(self.alloc, "  {s}({d}/{d}){s}", .{ FG_MUTED, self.menu_selected + 1, self.sel_len, ansi.RESET }) catch return;
+                const cnt = std.fmt.allocPrint(self.alloc, "  {s}({d}/{d}){s}", .{ FG_MUTED(), self.menu_selected + 1, self.sel_len, ansi.RESET }) catch return;
                 frame.append(self.alloc, cnt) catch return;
             }
             self.renderMcpFooter(&frame);
@@ -5122,12 +5445,12 @@ pub const TUI = struct {
                     _ = lines;
                     const l1 = std.fmt.allocPrint(self.alloc, "{s}Project trust{s}", .{ accent, ansi.RESET }) catch return;
                     frame.append(self.alloc, l1) catch return;
-                    const l2 = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}" ++ ansi.RESET, .{tp.cwd}) catch return;
+                    const l2 = printOwned(self.alloc, FG_MUTED(), "{s}", .{tp.cwd}, ansi.RESET) catch return;
                     frame.append(self.alloc, l2) catch return;
-                    const l3 = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "Saved decision: {s}" ++ ansi.RESET, .{saved_txt}) catch return;
+                    const l3 = printOwned(self.alloc, FG_MUTED(), "Saved decision: {s}", .{saved_txt}, ansi.RESET) catch return;
                     frame.append(self.alloc, l3) catch return;
                     const cur: []const u8 = if (self.project_trusted) "trusted" else "untrusted";
-                    const l4 = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "Current session: {s}" ++ ansi.RESET, .{cur}) catch return;
+                    const l4 = printOwned(self.alloc, FG_MUTED(), "Current session: {s}", .{cur}, ansi.RESET) catch return;
                     frame.append(self.alloc, l4) catch return;
                 }
             }
@@ -5142,11 +5465,11 @@ pub const TUI = struct {
                 frame.append(self.alloc, ml) catch return;
             }
             if (self.menu_len > menu_h) {
-                const indicator = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "  ({d}/{d})" ++ ansi.RESET, .{ self.menu_selected + 1, self.menu_len }) catch return;
+                const indicator = printOwned(self.alloc, FG_MUTED(), "  ({d}/{d})", .{ self.menu_selected + 1, self.menu_len }, ansi.RESET) catch return;
                 frame.append(self.alloc, indicator) catch return;
             }
             if (self.menu_mode == .trust) {
-                const foot = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "\u{2191}\u{2193} navigate \u{2022} enter save \u{2022} esc cancel" ++ ansi.RESET, .{}) catch return;
+                const foot = printOwned(self.alloc, FG_MUTED(), "\u{2191}\u{2193} navigate \u{2022} enter save \u{2022} esc cancel", .{}, ansi.RESET) catch return;
                 frame.append(self.alloc, foot) catch return;
             }
         }
@@ -5157,7 +5480,7 @@ pub const TUI = struct {
         const cwd_line = self.cwdLine() catch return;
         frame.append(self.alloc, cwd_line) catch return;
         if (self.flash_msg) |m| {
-            const styled = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "[{s}]" ++ ansi.RESET, .{m}) catch null;
+            const styled = printOwned(self.alloc, FG_MUTED(), "[{s}]", .{m}, ansi.RESET) catch null;
             if (styled) |st| {
                 defer self.alloc.free(st);
                 const fw = wmod.visualWidth(st);
@@ -5227,12 +5550,12 @@ pub const TUI = struct {
 
     /// The border color for the current state (thinking level or bash mode).
     fn borderColor(self: *const TUI) []const u8 {
-        if (self.bash_mode) return BORDER_BASH;
+        if (self.bash_mode) return BORDER_BASH();
         // Modal selectors render their own theme.border (blue) in pi; the
         // plain autocomplete menus (commands/models/files) keep the editor
         // in its normal editing state.
         switch (self.menu_mode) {
-            .settings, .scoped, .model_selector, .thinking_selector, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .login_select, .login_key, .logout_select => return BORDER_INFO,
+            .settings, .scoped, .model_selector, .thinking_selector, .themes, .sessions, .tree, .forksel, .mcp, .mcp_server, .mcp_tools, .mcp_exposure, .trust, .login_select, .login_key, .logout_select => return BORDER_INFO(),
             else => {},
         }
         return levelColor(self.session.thinking_level);
@@ -5284,11 +5607,11 @@ pub const TUI = struct {
             return abuf.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
         }
         if (cols + 1 <= self.width) {
-            abuf.appendSlice(self.alloc, ACCENT) catch return error.OutOfMemory;
+            abuf.appendSlice(self.alloc, ACCENT()) catch return error.OutOfMemory;
             abuf.appendSlice(self.alloc, frame) catch return error.OutOfMemory; // spinner (1 col)
             cols += 1;
         }
-        abuf.appendSlice(self.alloc, MUTED) catch return error.OutOfMemory;
+        abuf.appendSlice(self.alloc, MUTED()) catch return error.OutOfMemory;
         // Label, capped to the remaining width (wide chars drop whole).
         var it = std.unicode.Utf8View.initUnchecked(label).iterator();
         while (it.nextCodepointSlice()) |cp| {
@@ -5437,7 +5760,7 @@ pub const TUI = struct {
                     if (b == idx) shut = true;
                 }
                 if (shut) {
-                    const line = std.fmt.allocPrint(self.alloc, " " ++ THINKING_TEXT ++ "\x1b[3m· Thinking…\x1b[0m", .{}) catch break :blk null;
+                    const line = concatOwned(self.alloc, &.{ " ", THINKING_TEXT(), "\x1b[3m· Thinking…\x1b[0m" }) catch break :blk null;
                     break :blk line;
                 }
                 self.renderThinkingBlock(raw, &block);
@@ -6014,11 +6337,11 @@ pub const TUI = struct {
             }
             self.scroll_glyphs[row] = target;
             const glyph: []const u8 = if (target == GLYPH_THUMB_SOLID)
-                SCROLLBAR_THUMB_SOLID
+                SCROLLBAR_THUMB_SOLID()
             else if (target == GLYPH_THUMB)
-                SCROLLBAR_THUMB
+                SCROLLBAR_THUMB()
             else
-                SCROLLBAR_TRACK;
+                SCROLLBAR_TRACK();
             // In auto mode the TRACK preserves the content cell's background
             // (pi), the THUMB is the position indicator and paints over any
             // block background.
@@ -6781,7 +7104,7 @@ pub const TUI = struct {
             if (self.thinking_collapsed) {
                 // Clicked shut: a single "Thinking…" line (pi's collapsed
                 // streaming-thinking display); clicking again expands.
-                if (std.fmt.allocPrint(self.alloc, " " ++ THINKING_TEXT ++ "\x1b[3m· Thinking…\x1b[0m", .{})) |line| {
+                if (concatOwned(self.alloc, &.{ " ", THINKING_TEXT(), "\x1b[3m· Thinking…\x1b[0m" })) |line| {
                     try out.append(self.alloc, line);
                     think_rows = 1;
                 } else |_| {}
@@ -7018,7 +7341,7 @@ pub const TUI = struct {
         for (rows, 0..) |row, i| {
             if (i > 0) block.append(self.alloc, '\n') catch return;
             block.appendSlice(self.alloc, " ") catch return;
-            block.appendSlice(self.alloc, FG_ERROR) catch return;
+            block.appendSlice(self.alloc, FG_ERROR()) catch return;
             block.appendSlice(self.alloc, row) catch return;
             block.appendSlice(self.alloc, "\x1b[0m ") catch return;
         }
@@ -7068,14 +7391,14 @@ pub const TUI = struct {
     /// padding rows, padded to the full width. Used by add and resize alike.
     fn renderUserBlock(self: *TUI, text: []const u8, block: *std.ArrayListUnmanaged(u8)) void {
         const inner = if (self.width > 2) self.width - 2 else 1;
-        const rendered = markdown.renderWith(self.alloc, text, inner, .{ .base_style = USER_FG }) catch {
-            self.appendBgRow(block, text, USER_BG);
+        const rendered = markdown.renderWith(self.alloc, text, inner, .{ .base_style = USER_FG() }) catch {
+            self.appendBgRow(block, text, USER_BG());
             return;
         };
         defer markdown.freeLines(self.alloc, rendered);
-        self.appendBgRow(block, "", USER_BG);
-        for (rendered) |row| self.appendBgRow(block, row, USER_BG);
-        self.appendBgRow(block, "", USER_BG);
+        self.appendBgRow(block, "", USER_BG());
+        for (rendered) |row| self.appendBgRow(block, row, USER_BG());
+        self.appendBgRow(block, "", USER_BG());
     }
 
     /// A `/skill:name [args]` submission (pi SkillInvocationMessageComponent):
@@ -7114,21 +7437,21 @@ pub const TUI = struct {
     /// bold name + the body markdown, all on the custom message background.
     fn renderSkillBlock(self: *TUI, e: *const SkillEntry, block: *std.ArrayListUnmanaged(u8)) void {
         if (e.effectiveExpanded(self.tools_expanded)) {
-            const label = std.fmt.allocPrint(self.alloc, "{s}\x1b[1m[skill]\x1b[22m", .{CUSTOM_MSG_BG}) catch return;
+            const label = std.fmt.allocPrint(self.alloc, "{s}\x1b[1m[skill]\x1b[22m", .{CUSTOM_MSG_BG()}) catch return;
             defer self.alloc.free(label);
-            self.appendBgRow(block, label, CUSTOM_MSG_BG);
+            self.appendBgRow(block, label, CUSTOM_MSG_BG());
             const header = std.fmt.allocPrint(self.alloc, "**{s}**", .{e.name}) catch return;
             defer self.alloc.free(header);
             const joined = std.mem.concat(self.alloc, u8, &.{ header, "\n\n", e.content }) catch return;
             defer self.alloc.free(joined);
             const inner = if (self.width > 2) self.width - 2 else 1;
-            const rendered = markdown.renderWith(self.alloc, joined, inner, .{ .base_style = FG_MUTED }) catch return;
+            const rendered = markdown.renderWith(self.alloc, joined, inner, .{ .base_style = FG_MUTED() }) catch return;
             defer markdown.freeLines(self.alloc, rendered);
-            for (rendered) |row| self.appendBgRow(block, row, CUSTOM_MSG_BG);
+            for (rendered) |row| self.appendBgRow(block, row, CUSTOM_MSG_BG());
         } else {
-            const line = std.fmt.allocPrint(self.alloc, "{s}\x1b[1m[skill]\x1b[22m {s}{s} (\x1b[2mctrl+o\x1b[0m to expand)", .{ CUSTOM_MSG_BG, FG_MUTED, e.name }) catch return;
+            const line = std.fmt.allocPrint(self.alloc, "{s}\x1b[1m[skill]\x1b[22m {s}{s} (\x1b[2mctrl+o\x1b[0m to expand)", .{ CUSTOM_MSG_BG(), FG_MUTED(), e.name }) catch return;
             defer self.alloc.free(line);
-            self.appendBgRow(block, line, CUSTOM_MSG_BG);
+            self.appendBgRow(block, line, CUSTOM_MSG_BG());
         }
     }
 
@@ -7303,7 +7626,7 @@ pub const TUI = struct {
 
     fn renderThinkingSegmentStrip(self: *TUI, trimmed: []const u8, prev_kind: *?markdown.BlockKind, strip: bool) ![][]u8 {
         const inner = if (self.width > 2) self.width - 2 else 1;
-        const base = THINKING_TEXT ++ "\x1b[3m";
+        const base = j2(THINKING_TEXT(), "\x1b[3m");
         const rendered = try markdown.renderSegment(self.alloc, trimmed, inner, .{ .base_style = base }, prev_kind, strip);
         defer markdown.freeLines(self.alloc, rendered);
         var out: std.ArrayListUnmanaged([]u8) = .empty;
@@ -7341,9 +7664,9 @@ pub const TUI = struct {
         } else blk: {
             break :blk std.fmt.bufPrint(&text_buf, "({d} tokens).", .{info.tokens_before}) catch return;
         };
-        block.appendSlice(self.alloc, BORDER_BASH) catch return;
+        block.appendSlice(self.alloc, BORDER_BASH()) catch return;
         block.appendSlice(self.alloc, "● \x1b[0m\u{2702} Context compacted ") catch return;
-        block.appendSlice(self.alloc, FG_MUTED) catch return;
+        block.appendSlice(self.alloc, FG_MUTED()) catch return;
         block.appendSlice(self.alloc, tail) catch return;
         block.appendSlice(self.alloc, "\x1b[0m") catch return;
     }
@@ -7353,7 +7676,7 @@ pub const TUI = struct {
     fn addCompactionPending(self: *TUI) void {
         var block: std.ArrayListUnmanaged(u8) = .empty;
         defer block.deinit(self.alloc);
-        block.appendSlice(self.alloc, BORDER_BASH) catch return;
+        block.appendSlice(self.alloc, BORDER_BASH()) catch return;
         block.appendSlice(self.alloc, "● Compacting…\x1b[0m") catch return;
         const n_before = self.scrollback.items.len;
         self.finishBlock(&block, .plain);
@@ -7651,7 +7974,7 @@ pub const TUI = struct {
         }
         // Logo lines (top carries the version, bottom the first hint line —
         // pi withLogo(): hints start on the logo's second row).
-        const version_line = std.fmt.allocPrint(self.alloc, "{s} v{s}\x1b[0m", .{ FG_MUTED, VERSION }) catch return null;
+        const version_line = std.fmt.allocPrint(self.alloc, "{s} v{s}\x1b[0m", .{ FG_MUTED(), VERSION }) catch return null;
         defer self.alloc.free(version_line);
         if (apple) {
             const wm = std.fmt.allocPrint(self.alloc, "{s}z\x1b[0m{s}pi\x1b[0m {s}", .{ LOGO_CORAL, LOGO_YELLOW, version_line }) catch return null;
@@ -7841,7 +8164,7 @@ pub const TUI = struct {
                 .compaction => |ci| self.addCompactionBlock(ci),
                 .error_text => |txt| {
                     // Persisted turn failure: render like a live error line.
-                    self.addMessageFmt("{s}{s}{s}", .{ FG_ERROR, txt, ansi.RESET });
+                    self.addMessageFmt("{s}{s}{s}", .{ FG_ERROR(), txt, ansi.RESET });
                 },
                 .message => |m| {
                     switch (m.role) {
@@ -8852,7 +9175,7 @@ pub const TUI = struct {
                 while (s.len > 0 and (s[0] == '\n' or s[0] == '\r')) s = s[1..];
                 while (s.len > 0 and (s[s.len - 1] == '\n' or s[s.len - 1] == '\r')) s = s[0 .. s.len - 1];
                 if (s.len == 0) return;
-                t.addMessageFmt("{s}· {s}{s}", .{ FG_MUTED, s, ansi.RESET });
+                t.addMessageFmt("{s}· {s}{s}", .{ FG_MUTED(), s, ansi.RESET });
                 t.flash(s);
                 t.redrawCached();
             },
@@ -9084,7 +9407,7 @@ pub const TUI = struct {
                 owned_cut = cut;
                 break :cut cut;
             } else r;
-            const line = std.fmt.allocPrint(self.alloc, FG_MUTED ++ "{s}{s}{s}", .{ prefix, shown, ansi.RESET }) catch continue;
+            const line = concatOwned(self.alloc, &.{ FG_MUTED(), prefix, shown, ansi.RESET }) catch continue;
             frame.append(self.alloc, line) catch {};
         }
     }
@@ -9276,7 +9599,7 @@ pub const TUI = struct {
         }
 
         if (std.mem.eql(u8, word, "/help")) {
-            self.addMessage("Commands:\n" ++ "  /exit          quit\n" ++ "  /help          show this help\n" ++ "  /clear         clear conversation\n" ++ "  /model [name]  switch model (interactive selector)\n" ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)\n" ++ "  /session       show current session info\n" ++ "  /name <name>   name this session\n" ++ "  /new           start a new session\n" ++ "  /tree          show session entry tree\n" ++ "  /fork          fork current session into a new one\n" ++ "  /resume <id>   resume a session by (partial) id\n" ++ "  /export [path] export session to HTML (default: alongside)\n" ++ "  /mcp           list MCP servers and their state\n" ++ "  /compact [f]   compact the context now (optionally focused)\n" ++ "  /copy          copy last assistant message to clipboard\n" ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)");
+            self.addMessage("Commands:\n" ++ "  /exit          quit\n" ++ "  /help          show this help\n" ++ "  /clear         clear conversation\n" ++ "  /model [name]  switch model (interactive selector)\n" ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)\n" ++ "  /session       show current session info\n" ++ "  /name <name>   name this session\n" ++ "  /new           start a new session\n" ++ "  /tree          show session entry tree\n" ++ "  /fork          fork current session into a new one\n" ++ "  /resume <id>   resume a session by (partial) id\n" ++ "  /export [path] export session to HTML (default: alongside)\n" ++ "  /mcp           list MCP servers and their state\n" ++ "  /themes        choose a theme (builtin dark/light + custom)\n" ++ "  /compact [f]   compact the context now (optionally focused)\n" ++ "  /copy          copy last assistant message to clipboard\n" ++ "  /think [level] show or set thinking level (off|low|medium|high|xhigh|max)");
             self.redraw();
             return false;
         }
@@ -9303,6 +9626,13 @@ pub const TUI = struct {
             }
             const line = self.alloc.dupe(u8, aw.written()) catch "hotkeys failed";
             self.noteOwned(line);
+            self.redraw();
+            return false;
+        }
+
+        // pi: /themes opens the theme selector (ThemeSelectorComponent).
+        if (std.mem.eql(u8, word, "/themes")) {
+            self.openThemesSelector();
             self.redraw();
             return false;
         }
@@ -10522,6 +10852,56 @@ pub const TUI = struct {
                 }
                 continue; // swallow everything else while the selector is open
             }
+            if (self.menu_mode == .themes) {
+                // Theme selector (pi ThemeSelector): arrows + Enter apply;
+                // Esc cancels; printable keys filter the list.
+                if (self.bindings.matches(key, .menu_up)) {
+                    if (self.th_sel > 0) self.th_sel -= 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_down)) {
+                    if (self.th_sel + 1 < self.th_vis_count) self.th_sel += 1;
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_close)) {
+                    self.menu_mode = .hidden;
+                    self.editor.clear() catch {};
+                    self.freeThemes();
+                    self.redraw();
+                    continue;
+                } else if (self.bindings.matches(key, .menu_confirm)) {
+                    if (self.th_vis_count > 0 and self.th_sel < self.th_vis_count) {
+                        const name = self.th_names[self.th_vis[self.th_sel]];
+                        self.applyThemeByName(name);
+                    }
+                    self.menu_mode = .hidden;
+                    self.editor.clear() catch {};
+                    self.freeThemes();
+                    self.redraw();
+                    continue;
+                }
+                switch (key) {
+                    .char => |c| {
+                        if (!c.ctrl and !c.alt and c.c >= 0x20 and c.c != 127) {
+                            self.editor.insertChar(c.c) catch {};
+                            self.themesRefilter();
+                            self.redraw();
+                            continue;
+                        }
+                    },
+                    .backspace => {
+                        const t = self.editor.getText() catch "";
+                        if (t.len > 0) {
+                            self.editor.replaceRange(t.len - 1, t.len, "") catch {};
+                            self.themesRefilter();
+                        }
+                        self.redraw();
+                        continue;
+                    },
+                    else => {},
+                }
+                continue; // swallow everything else while the selector is open
+            }
             if (self.menu_mode == .login_select or self.menu_mode == .logout_select) {
                 // Login/logout provider selector (pi OAuthSelectorComponent):
                 // arrows navigate; Enter activates; Esc cancels; printable
@@ -10980,7 +11360,7 @@ pub const TUI = struct {
                     self.alloc.free(text_to_send);
                     if (self.session.isAborted()) {
                         agent.clearAbort();
-                        self.addMessage(FG_ERROR ++ "Operation aborted" ++ "\x1b[0m");
+                        self.addMessage(j3(FG_ERROR(), "Operation aborted", "\x1b[0m"));
                     }
                 }
             }
