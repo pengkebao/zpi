@@ -1789,3 +1789,82 @@ test "read-of-image result: kitty protocol -> encoded line + spacer rows" {
     try std.testing.expect(saw_seq);
     try std.testing.expectEqual(e.image_rows - 1, after);
 }
+
+// A 600x100 blue PNG, base64 (IHDR w=600 h=100) — wide enough that the
+// capped cell width (min(term_width-2, image_width_cells)) changes with the
+// terminal width, so a resize forces a re-encode.
+const WIDE_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAlgAAABkCAYAAABaQU4jAAAB+ElEQVR4nO3OsQnAMAAEMY+d7e0lAgePCvU657sXAIAf5QEAgDV5AABgTR4AAFiTBwAA1uQBAIA1eQAAYE0eAABYkwcAANbkAQCANXkAAGBNHgAAWJMHAADW5AEAgDV5AABgTR4AAFiTBwAA1uQBAIA1eQAAYE0eAABYkwcAANbkAQCANXkAAGBNHgAAWJMHAADW5AEAgDV5AABgTR4AAFiTBwAA1uQBAIA1eQAAYE0eAABYkwcAANbkAQCANXkAAGBNHgAAWJMHAADW5AEAgDV5AABgTR4AAFiTBwAA1uQBAIA1eQAAYE0eAABYkwcAANbkAQCANXkAAGBNHgAAWJMHAADW5AEAgDV5AABgTR4AAFiTBwAA1uQBAIA1eQAAYE0eAABYkwcAANbkAQCANXkAAGBNHgAAWJMHAADW5AEAgDV5AABgTR4AAFiTBwAA1uQBAIA1eQAAYE0eAABYkwcAANbkAQCANXkAAGBNHgAAWJMHAADW5AEAgDV5AABgTR4AAFiTBwAA1uQBAIA1eQAAYE0eAABYkwcAABjzAOhP6gHZdsdjAAAAAElFTkSuQmCC";
+
+test "image: resize re-encodes the placement (stable id, width-capped)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    t.image_caps = .{ .images = .kitty };
+
+    t.addPendingTool(.{
+        .id = try alloc.dupe(u8, "img3"),
+        .name = try alloc.dupe(u8, "read"),
+        .arguments = try alloc.dupe(u8, "{\"path\":\"a.png\"}"),
+    });
+    // Wide terminal: cap = min(80-2, 60) = 60.
+    t.width = 80;
+    t.finishTool(.{
+        .id = try alloc.dupe(u8, "img3"),
+        .content = try alloc.dupe(u8, "Read image file [image/png]"),
+        .is_error = false,
+        .duration_ms = 10,
+        .image_data = try alloc.dupe(u8, WIDE_PNG_B64),
+        .image_mime = try alloc.dupe(u8, "image/png"),
+    });
+    // Capture the entry by POINTER: rerenderAtWidth swaps image_line for a
+    // fresh allocation, so a by-value copy would dangle.
+    const e = &t.tool_calls.items[0];
+    const id0 = image.imageId(e.image_line orelse "");
+    const rows0 = e.image_rows;
+    try std.testing.expect(id0 != null);
+    try std.testing.expect(rows0 > 1); // a 6:1 image at 60 cols is multi-row
+    // The source is retained so the line can be rebuilt on resize.
+    try std.testing.expect(e.image_b64 != null);
+
+    // Narrow the terminal: cap = min(40-2, 60) = 38 < 60, so the encoded
+    // line must be rebuilt at the new (smaller) width, keeping the SAME
+    // placement id (the placement moves in place rather than leaking).
+    t.width = 40;
+    t.render_mutex.lock(t.io) catch {};
+    t.rerenderAtWidth();
+    t.render_mutex.unlock(t.io);
+    const id1 = image.imageId(e.image_line orelse "");
+    try std.testing.expect(id1 != null);
+    try std.testing.expectEqual(id0.?, id1.?); // stable placement id
+    // Re-encoding at 38 columns of a 6:1 image yields fewer rows than at 60.
+    try std.testing.expect(e.image_rows < rows0);
+    const rows1 = e.image_rows;
+
+    // A second resize must reuse the SAME id again (the id is allocated once
+    // and cached on the entry; re-allocating per encode would leak the prior
+    // placement). Widen to 60: cap = min(60-2, 60) = 58, a third distinct
+    // width, so the line re-encodes once more.
+    t.width = 60;
+    t.render_mutex.lock(t.io) catch {};
+    t.rerenderAtWidth();
+    t.render_mutex.unlock(t.io);
+    const id2 = image.imageId(e.image_line orelse "");
+    try std.testing.expect(id2 != null);
+    try std.testing.expectEqual(id0.?, id2.?); // still the same placement id
+    try std.testing.expectEqual(id1.?, id2.?);
+    // 58 cols is wider than 38 but narrower than 60: rows land in between.
+    try std.testing.expect(e.image_rows >= rows1);
+    try std.testing.expect(e.image_rows <= rows0);
+}

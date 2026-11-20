@@ -426,11 +426,26 @@ pub const TUI = struct {
         /// Per-block expansion override (clicking the block toggles it);
         /// null follows the global tools_expanded (Ctrl+O).
         expanded: ?bool = null,
-        /// Encoded Kitty image line for a read-of-image result (owned; null
-        /// when there is no image or the terminal cannot render it). Built
-        /// once in finishTool so the placement id stays stable across
-        /// re-renders (a new id per render would leak placements).
+        /// Source base64 image bytes for a read-of-image result (owned; null
+        /// when there is no image). Kept so the encoded line can be rebuilt
+        /// when the terminal width changes (pi Image.render(width) re-encodes
+        /// on width change).
+        image_b64: ?[]u8 = null,
+        /// MIME type for image_b64 (owned; null = unknown).
+        image_mime: ?[]u8 = null,
+        /// Decoded pixel dimensions (null if unknown/undecodable).
+        image_dims: ?image.Dims = null,
+        /// Stable Kitty placement id, allocated once (a fresh id per encode
+        /// would leak the old placements; re-issuing the same id moves the
+        /// placement in place on resize).
+        image_id: ?u32 = null,
+        /// Encoded Kitty image line for the current width (owned; null when
+        /// not rendered inline).
         image_line: ?[]u8 = null,
+        /// The capped cell width (min(term_width-2, image_width_cells)) that
+        /// image_line was built at; 0 = not built. Only re-encode when this
+        /// changes, so a width change that keeps the same cap is a no-op.
+        image_line_width: u32 = 0,
         /// Visual rows the image occupies (1 = none/fallback text).
         image_rows: u32 = 1,
         /// Fallback indicator line ("[Image: mime WxH]") when the image is
@@ -447,6 +462,8 @@ pub const TUI = struct {
             alloc.free(self.args);
             if (self.result.len > 0) alloc.free(self.result);
             if (self.live_output.len > 0) alloc.free(self.live_output);
+            if (self.image_b64) |l| alloc.free(l);
+            if (self.image_mime) |l| alloc.free(l);
             if (self.image_line) |l| alloc.free(l);
             if (self.image_fallback) |l| alloc.free(l);
         }
@@ -2523,9 +2540,31 @@ pub const TUI = struct {
             .skill_commands => self.skill_commands = std.mem.eql(u8, next, "true"),
             .show_images => {
                 if (cfg) |c| c.show_images = std.mem.eql(u8, next, "true");
+                // Re-encode every inline image (or its fallback) at the new
+                // setting and repaint. rerenderAtWidth requires the render
+                // lock (the run loop does not hold it here).
+                if (blk: {
+                    self.render_mutex.lock(self.io) catch break :blk false;
+                    break :blk true;
+                }) {
+                    self.rerenderAtWidth();
+                    self.redrawLocked();
+                    self.render_mutex.unlock(self.io);
+                }
             },
             .image_width => {
                 if (cfg) |c| c.image_width_cells = std.fmt.parseInt(u32, next, 10) catch 60;
+                // New cell-width cap: re-encode every inline image at the new
+                // width (placement id stays stable, so the image moves in
+                // place) and repaint.
+                if (blk: {
+                    self.render_mutex.lock(self.io) catch break :blk false;
+                    break :blk true;
+                }) {
+                    self.rerenderAtWidth();
+                    self.redrawLocked();
+                    self.render_mutex.unlock(self.io);
+                }
             },
             .autocomplete_max => self.autocomplete_max = std.fmt.parseInt(usize, next, 10) catch 5,
             .steering_mode => {
@@ -8026,9 +8065,12 @@ pub const TUI = struct {
     }
 
     /// A tool call finished: fill in its entry and repaint its block. Takes
-    /// ownership of the event's strings.
+    /// ownership of the event's strings (the image bytes are dup'd into the
+    /// entry by buildImageForEntry, so they are freed here).
     pub fn finishTool(self: *TUI, result: agent.TurnEvent.ToolEnd) void {
         defer self.session.alloc.free(result.id);
+        defer if (result.image_data) |d| self.session.alloc.free(d);
+        defer if (result.image_mime) |m| self.session.alloc.free(m);
         for (self.tool_calls.items, 0..) |*e, i| {
             if (!e.pending or !std.mem.eql(u8, e.id, result.id)) continue;
             e.result = result.content;
@@ -8045,19 +8087,15 @@ pub const TUI = struct {
         if (result.image_mime) |m| self.session.alloc.free(m);
     }
 
-    /// Turn a read-of-image result into the entry's display (pi Image
-    /// component): an encoded Kitty line + reserved row count when the
-    /// terminal speaks the protocol AND the `showImages` setting is on, else
-    /// a one-line `[Image: mime WxH]` fallback. The encoded line is built
-    /// ONCE so its placement id is stable across re-renders (a fresh id per
-    /// render would leak the old placements). Takes ownership of the base64
-    /// bytes and mime (frees them when unused).
+    /// Store the source image for a read-of-image result and build its
+    /// display at the current width (pi Image component). The encoded line is
+    /// rebuilt lazily by `refreshImageEntry` whenever the terminal width (and
+    /// thus the capped cell width) changes; the placement id is stable so the
+    /// placement moves in place rather than leaking. Takes ownership of the
+    /// base64 bytes and mime.
     fn buildImageForEntry(self: *TUI, e: *ToolEntry, b64: ?[]const u8, mime: ?[]const u8) void {
         const data = b64 orelse return;
-        defer self.session.alloc.free(data);
         const m = mime orelse "image/unknown";
-        const mime_owned = if (mime) |mm| mm else self.session.alloc.dupe(u8, "image/unknown") catch "image/unknown";
-        defer self.session.alloc.free(mime_owned);
         // Decode to read the pixel dimensions (the encoded sequence keeps the
         // base64; the decoder buffer is scratch).
         const raw = blk: {
@@ -8071,22 +8109,64 @@ pub const TUI = struct {
         };
         const dims = if (raw) |r| image.dimensions(r, m) else null;
         if (raw) |r| self.session.alloc.free(r);
-        // Render inline only when the terminal can and the setting allows.
+        // Keep the source so the line can be rebuilt on width change.
+        const data_dup = self.session.alloc.dupe(u8, data) catch return;
+        const mime_dup = self.session.alloc.dupe(u8, m) catch {
+            self.session.alloc.free(data_dup);
+            return;
+        };
+        e.image_b64 = data_dup;
+        e.image_mime = mime_dup;
+        e.image_dims = dims;
+        if (e.image_id == null) e.image_id = self.nextKittyImageId();
+        self.refreshImageEntry(e);
+    }
+
+    /// (Re)build the entry's encoded image line at the current width (pi
+    /// Image.render(width)). `maxWidth = min(width-2, image_width_cells)`; the
+    /// line is only re-encoded when that cap actually changed, so a resize that
+    /// keeps the same cap is a no-op. Re-issuing the same placement id moves
+    /// the image in place. Falls back to the `[Image: mime WxH]` indicator when
+    /// the terminal cannot render or `showImages` is off.
+    fn refreshImageEntry(self: *TUI, e: *ToolEntry) void {
+        const data = e.image_b64 orelse return;
+        const m = e.image_mime orelse "image/unknown";
+        const dims = e.image_dims;
         const show: bool = if (self.cfg) |c| c.show_images else true; // pi default true
         const max_w: u32 = if (self.cfg) |c| c.image_width_cells else 60;
         const render_inline = self.image_caps.images == .kitty and show;
         if (render_inline) {
             if (dims) |d| {
-                const size = image.cellSize(d, max_w, true);
-                const id = self.nextKittyImageId();
+                // pi: maxWidth = max(1, min(width - 2, maxWidthCells)).
+                const term_cap: u32 = if (self.width > 2) @as(u32, self.width - 2) else 1;
+                const cap = @max(1, @min(term_cap, max_w));
+                if (e.image_line != null and e.image_line_width == cap) return; // unchanged
+                const size = image.cellSize(d, cap, true);
+                // Allocate the id once and keep it: re-issuing the same id
+                // moves the placement in place, a new id would leak the old.
+                const id = e.image_id orelse blk: {
+                    const nid = self.nextKittyImageId();
+                    e.image_id = nid;
+                    break :blk nid;
+                };
                 const seq = image.encodeKitty(self.session.alloc, data, id, size.columns, size.rows) catch return;
+                if (e.image_line) |old| self.session.alloc.free(old);
                 e.image_line = seq;
+                e.image_line_width = cap;
                 e.image_rows = size.rows;
+                // Inline rendering supersedes any stale fallback indicator.
+                if (e.image_fallback) |fb| self.session.alloc.free(fb);
+                e.image_fallback = null;
                 return;
             }
         }
         // Fallback indicator (pi imageFallback): the image data is not
         // rendered; the label keeps the mime + dimensions.
+        if (e.image_line) |old| self.session.alloc.free(old);
+        e.image_line = null;
+        e.image_line_width = 0;
+        e.image_rows = 1;
+        if (e.image_fallback) |fb| self.session.alloc.free(fb);
         e.image_fallback = image.fallback(self.session.alloc, m, dims) catch null;
     }
 
@@ -9226,6 +9306,10 @@ pub const TUI = struct {
                 .tool => |ti| blk: {
                     if (ti >= self.tool_calls.items.len) break :blk null;
                     const e = &self.tool_calls.items[ti];
+                    // Re-encode any inline image at the new width before the
+                    // block is rebuilt (pi Image.render(width) re-encodes on
+                    // width change; the placement id is stable).
+                    if (e.image_b64 != null) self.refreshImageEntry(e);
                     var rendered = tool_block.render(self.alloc, e.view(), .{
                         .width = self.width,
                         .expanded = e.effectiveExpanded(self.tools_expanded),
