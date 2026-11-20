@@ -67,6 +67,11 @@ pub const ExecutionContext = struct {
     cwd: []const u8,
     /// Returns true when the caller wants the current operation aborted (Ctrl-C).
     abort_check: ?*const fn () bool = null,
+    /// Live output callback (pi: tool_execution_update). Invoked from the
+    /// shell reader threads for each output chunk; null when the caller
+    /// only wants the final result.
+    on_output: ?*const fn (data: []const u8, ctx: *anyopaque) void = null,
+    on_output_ctx: *anyopaque = undefined,
 };
 
 pub const Registry = struct {
@@ -395,6 +400,8 @@ fn executeBash(_: *const Tool, args_json: []const u8, ctx: *ExecutionContext) To
     const res = shell.exec(ctx.alloc, ctx.io, shell.defaultConfig(), command, .{
         .timeout = timeout,
         .abort_check = ctx.abort_check,
+        .on_data = ctx.on_output,
+        .on_data_ctx = ctx.on_output_ctx,
     }, &out) catch |e| {
         return .{
             .content = std.fmt.allocPrint(ctx.alloc, "error: {s}", .{@errorName(e)}) catch "",

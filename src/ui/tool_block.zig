@@ -57,6 +57,9 @@ pub const ToolView = struct {
     is_error: bool = false,
     /// True until the result arrives (pending background, no result rows).
     pending: bool = false,
+    /// Output streamed so far while the call is still running (pi
+    /// tool_execution_update partialResult). Ignored once the result lands.
+    live_output: []const u8 = "",
     /// Wall time of the execution; null when unknown.
     duration_ms: ?u64 = null,
 };
@@ -197,9 +200,11 @@ fn renderBash(b: *Builder, view: ToolView, args: Args) !void {
             }
         },
     }
-    if (view.pending) return;
-
-    const output = std.mem.trim(u8, try sanitize(b.arena, view.result), " \n");
+    // Pending: no final result yet, but the live stream (pi partialResult)
+    // may already carry output — show the same last-rows preview while the
+    // command runs.
+    const output_src: []const u8 = if (view.pending) view.live_output else view.result;
+    const output = std.mem.trim(u8, try sanitize(b.arena, output_src), " \n");
     if (output.len > 0) {
         try b.blank();
         const lines = try splitLines(b.arena, output);
@@ -1121,6 +1126,26 @@ test "background follows the call state" {
     defer t.allocator.free(pending);
     try t.expect(std.mem.indexOf(u8, pending, BG_PENDING) != null);
     try expectRows(&.{ "", "", " ls .", "" }, pending);
+}
+
+test "bash pending card shows live output (partialResult)" {
+    const alloc = std.testing.allocator;
+    // A pending bash call with streamed output shows the live preview in
+    // the pending background; the final result stays hidden.
+    const live = try render(alloc, .{
+        .name = "bash",
+        .args = "{\"command\":\"sleep 2 && echo done\"}",
+        .pending = true,
+        .live_output = "alpha\nbeta\ngamma",
+    }, .{ .width = 40 });
+    defer alloc.free(live);
+    try t.expect(std.mem.indexOf(u8, live, BG_PENDING) != null);
+    try t.expect(std.mem.indexOf(u8, live, "beta") != null);
+    try t.expect(std.mem.indexOf(u8, live, "gamma") != null);
+    // A pending call without live output shows no result rows.
+    const bare = try render(alloc, .{ .name = "bash", .args = "{}", .pending = true }, .{ .width = 40 });
+    defer alloc.free(bare);
+    try t.expect(std.mem.indexOf(u8, bare, "beta") == null);
 }
 
 test "every box row spans the full width" {

@@ -42,8 +42,10 @@ pub fn defaultConfig() ShellConfig {
 pub const ExecOptions = struct {
     /// Timeout in seconds (null = no timeout).
     timeout: ?f64 = null,
-    /// Streaming callback invoked for each output chunk (stdout+stderr, in arrival order).
-    on_data: ?*const fn (data: []const u8) void = null,
+    /// Streaming callback invoked for each output chunk (stdout+stderr, in
+    /// arrival order, from a reader thread). `ctx` is passed through.
+    on_data: ?*const fn (data: []const u8, ctx: *anyopaque) void = null,
+    on_data_ctx: *anyopaque = undefined,
     /// Returns true when the caller wants the command aborted (Ctrl-C).
     abort_check: ?*const fn () bool = null,
     /// Environment map override (null = inherit).
@@ -71,7 +73,8 @@ const ReaderCtx = struct {
     io: Io,
     out: *std.array_list.Managed(u8),
     mutex: *Mutex,
-    on_data: ?*const fn (data: []const u8) void,
+    on_data: ?*const fn (data: []const u8, ctx: *anyopaque) void,
+    on_data_ctx: *anyopaque,
     done: *std.atomic.Value(bool),
 };
 
@@ -83,7 +86,7 @@ fn readerMain(ctx: ReaderCtx) void {
         ctx.mutex.lock(ctx.io) catch {};
         ctx.out.appendSlice(buf[0..n]) catch {};
         ctx.mutex.unlock(ctx.io);
-        if (ctx.on_data) |cb| cb(buf[0..n]);
+        if (ctx.on_data) |cb| cb(buf[0..n], ctx.on_data_ctx);
     }
     ctx.done.store(true, .unordered);
 }
@@ -128,13 +131,13 @@ pub fn exec(alloc: std.mem.Allocator, io: Io, config: ShellConfig, command: []co
     var killed = false;
 
     var stdout_thread = std.Thread.spawn(.{}, readerMain, .{
-        ReaderCtx{ .file = stdout_file, .io = io, .out = out, .mutex = &mutex, .on_data = opts.on_data, .done = &state.stdout_done },
+        ReaderCtx{ .file = stdout_file, .io = io, .out = out, .mutex = &mutex, .on_data = opts.on_data, .on_data_ctx = opts.on_data_ctx, .done = &state.stdout_done },
     }) catch {
         child.kill(io);
         return error.SpawnFailed;
     };
     var stderr_thread = std.Thread.spawn(.{}, readerMain, .{
-        ReaderCtx{ .file = stderr_file, .io = io, .out = out, .mutex = &mutex, .on_data = opts.on_data, .done = &state.stderr_done },
+        ReaderCtx{ .file = stderr_file, .io = io, .out = out, .mutex = &mutex, .on_data = opts.on_data, .on_data_ctx = opts.on_data_ctx, .done = &state.stderr_done },
     }) catch {
         stdout_thread.join();
         child.kill(io);
@@ -193,4 +196,41 @@ test "defaultConfig" {
     } else {
         try std.testing.expectEqualStrings("/bin/sh", cfg.shell);
     }
+}
+
+const OnDataTest = struct {
+    chunks: std.array_list.Managed([]const u8),
+    joined: std.array_list.Managed(u8),
+};
+
+fn onDataCb(data: []const u8, c: *anyopaque) void {
+    const t: *OnDataTest = @alignCast(@ptrCast(c));
+    t.chunks.append(data) catch return;
+    t.joined.appendSlice(data) catch return;
+}
+
+test "on_data callback receives every chunk in order" {
+    if (builtin.os.tag == .windows) return; // /bin/sh -c only on posix
+    const alloc = std.testing.allocator;
+    var t = OnDataTest{
+        .chunks = std.array_list.Managed([]const u8).init(alloc),
+        .joined = std.array_list.Managed(u8).init(alloc),
+    };
+    defer t.chunks.deinit();
+    defer t.joined.deinit();
+    var out = std.array_list.Managed(u8).init(alloc);
+    defer out.deinit();
+    const res = exec(alloc, std.Io.Threaded.global_single_threaded.io(), defaultConfig(), "seq 1 5", .{
+        .on_data = onDataCb,
+        .on_data_ctx = &t,
+    }, &out) catch |err| switch (err) {
+        error.SpawnFailed => return, // sandboxed test env: no child processes
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(?u8, 0), res.exit_code);
+    // The callback saw the same bytes the buffer collected.
+    try std.testing.expectEqualStrings(out.items, t.joined.items);
+    try std.testing.expectEqualStrings("1\n2\n3\n4\n5\n", out.items);
+    // At least one chunk arrived via the callback.
+    try std.testing.expect(t.chunks.items.len >= 1);
 }

@@ -335,6 +335,9 @@ pub const TUI = struct {
         name: []u8,
         args: []u8,
         result: []u8 = &.{},
+        /// Output streamed while the call runs (pi partialResult); freed
+        /// when the result arrives or the entry is torn down.
+        live_output: []u8 = &.{},
         is_error: bool = false,
         pending: bool = true,
         duration_ms: ?u64 = null,
@@ -353,6 +356,7 @@ pub const TUI = struct {
             alloc.free(self.name);
             alloc.free(self.args);
             if (self.result.len > 0) alloc.free(self.result);
+            if (self.live_output.len > 0) alloc.free(self.live_output);
         }
 
         fn view(self: *const ToolEntry) tool_block.ToolView {
@@ -360,6 +364,7 @@ pub const TUI = struct {
                 .name = self.name,
                 .args = self.args,
                 .result = self.result,
+                .live_output = if (self.pending) self.live_output else "",
                 .is_error = self.is_error,
                 .pending = self.pending,
                 .duration_ms = self.duration_ms,
@@ -7554,6 +7559,28 @@ pub const TUI = struct {
         self.redrawCached();
     }
 
+    /// A running tool streamed output (pi tool_execution_update): park the
+    /// full-so-far output on the pending entry and repaint its block. The
+    /// final tool_result still repaints from the authoritative content.
+    pub fn updatePendingTool(self: *TUI, ev: agent.TurnEvent.ToolUpdate) void {
+        const id = ev.id;
+        var output = ev.output;
+        defer {
+            self.session.alloc.free(id);
+            if (output.len > 0) self.session.alloc.free(output);
+        }
+        for (self.tool_calls.items, 0..) |*e, i| {
+            if (!e.pending or !std.mem.eql(u8, e.id, id)) continue;
+            if (e.live_output.len > 0) self.session.alloc.free(e.live_output);
+            e.live_output = output;
+            output = ""; // ownership moved
+            self.renderToolBlockAt(i);
+            return;
+        }
+        // No matching pending entry (result already landed): the event's
+        // output is freed by the defer.
+    }
+
     /// A tool call finished: fill in its entry and repaint its block. Takes
     /// ownership of the event's strings.
     pub fn finishTool(self: *TUI, result: agent.TurnEvent.ToolEnd) void {
@@ -8720,6 +8747,7 @@ pub const TUI = struct {
                 },
                 .tool_start => |s| self.addPendingTool(s),
                 .tool_args => |s| self.updatePendingToolArgs(s),
+                .tool_update => |u| self.updatePendingTool(u),
                 .tool_result => |r| self.finishTool(r),
                 .compaction => |info| self.addCompactionBlock(info),
                 .note => |n| {

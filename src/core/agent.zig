@@ -62,6 +62,10 @@ pub const TurnEvent = union(enum) {
     /// then the content preview grows line by line with the "N more lines"
     /// counter). Replaces the pending entry with the same id.
     tool_args: ToolStart,
+    /// A running tool produced output (pi: tool_execution_update with
+    /// partialResult — the card shows streaming output while the command
+    /// runs). `output` is the FULL output so far, not a delta.
+    tool_update: ToolUpdate,
 
     pub const ToolStart = struct {
         id: []u8,
@@ -76,6 +80,13 @@ pub const TurnEvent = union(enum) {
         content: []u8,
         is_error: bool,
         duration_ms: u64,
+    };
+
+    pub const ToolUpdate = struct {
+        /// The `id` of the matching `tool_start`.
+        id: []u8,
+        /// Full output so far (owned).
+        output: []u8,
     };
 
     pub fn deinit(self: TurnEvent, alloc: std.mem.Allocator) void {
@@ -96,6 +107,10 @@ pub const TurnEvent = union(enum) {
                 alloc.free(s.name);
                 alloc.free(s.arguments);
             },
+            .tool_update => |u| {
+                alloc.free(u.id);
+                alloc.free(u.output);
+            },
         }
     }
 };
@@ -108,6 +123,16 @@ pub const Session = struct {
     provider: aiprovider.AnyProvider,
     context: msg.Context,
     exec_ctx: tools.ExecutionContext,
+    /// Live output of the running tool (bash streaming, pi: partialResult).
+    /// One per parallel call; owned slices, freed on reset. Throttled
+    /// tool_update events are pushed from the shell reader threads.
+    live_tool_outputs: [4]?std.array_list.Managed(u8) = .{ null, null, null, null },
+    live_tool_last_ms: [4]i64 = .{ 0, 0, 0, 0 },
+    /// Tool call id per slot (borrowed from the round's assistant message,
+    /// valid while the tool runs; reader threads read it).
+    live_tool_ids: [4]?[]const u8 = .{ null, null, null, null },
+    /// Guards the live_tool_outputs buffers (reader threads vs teardown).
+    live_tool_mutex: std.Io.Mutex = std.Io.Mutex.init,
     max_tool_rounds: usize = 200,
     compaction: compact.Settings = compact.DEFAULT_SETTINGS,
     /// Optional callback for streamed output. If set (TUI mode), all output
@@ -141,6 +166,10 @@ pub const Session = struct {
     /// mode, where nothing would take them.
     record_turn_events: bool = false,
     turn_events: std.ArrayListUnmanaged(TurnEvent) = .empty,
+    /// Guards turn_events: pushTurnEvent runs on shell reader threads
+    /// (live tool output) as well as the provider/agent threads, while the
+    /// front end takes the queue from its own thread.
+    turn_events_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     // Streaming state (shared with provider event handler)
     stream_text: *std.array_list.Managed(u8) = undefined,
@@ -224,6 +253,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        self.resetLiveToolOutputs();
         self.clearTurnEvents();
         self.turn_events.deinit(self.alloc);
         self.context.deinit();
@@ -457,6 +487,8 @@ pub const Session = struct {
     /// owns the slice and every event in it: `deinit` each event, then free
     /// the slice, both with the session allocator.
     pub fn takeTurnEvents(self: *Session) []TurnEvent {
+        self.turn_events_mutex.lock(self.io) catch return &.{};
+        defer self.turn_events_mutex.unlock(self.io);
         return self.turn_events.toOwnedSlice(self.alloc) catch {
             // Out of memory: drop the events instead of handing out a part.
             self.clearTurnEvents();
@@ -465,16 +497,27 @@ pub const Session = struct {
     }
 
     fn clearTurnEvents(self: *Session) void {
+        self.turn_events_mutex.lock(self.io) catch {};
+        defer self.turn_events_mutex.unlock(self.io);
         for (self.turn_events.items) |ev| ev.deinit(self.alloc);
         self.turn_events.clearRetainingCapacity();
     }
 
     /// Append `ev` (taking ownership) and tell the front end.
     fn pushTurnEvent(self: *Session, ev: TurnEvent) void {
-        self.turn_events.append(self.alloc, ev) catch {
+        self.turn_events_mutex.lock(self.io) catch {
             ev.deinit(self.alloc);
             return;
         };
+        var ok = true;
+        self.turn_events.append(self.alloc, ev) catch {
+            ev.deinit(self.alloc);
+            ok = false;
+        };
+        self.turn_events_mutex.unlock(self.io);
+        if (!ok) return;
+        // Outside the lock: emit runs the front-end callback, which takes
+        // the queue again (drainTurnEvents → takeTurnEvents).
         self.emit(.turn_event, "");
     }
 
@@ -539,6 +582,66 @@ pub const Session = struct {
         self.stream_finish = null;
         self.tool_args_last_ms = 0;
         self.tool_args_last_len = 0;
+    }
+
+    /// Free any live tool output buffers (session teardown).
+    pub fn resetLiveToolOutputs(self: *Session) void {
+        self.live_tool_mutex.lock(self.io) catch {};
+        defer self.live_tool_mutex.unlock(self.io);
+        for (&self.live_tool_outputs) |*buf| {
+            if (buf.*) |b| {
+                b.deinit();
+                buf.* = null;
+            }
+        }
+    }
+
+    /// Shell reader-thread callback (pi: tool_execution_update with
+    /// partialResult). Appends the chunk to this call's live buffer and,
+    /// throttled to 100 ms, pushes a tool_update turn event carrying the
+    /// FULL output so far — the TUI paints it into the pending card. The
+    /// final result still arrives via tool_result (the card repaints from
+    /// the authoritative content).
+    /// Carried in the shell callback ctx: which session slot this call's
+    /// reader threads belong to (parallel calls share the session, so the
+    /// slot cannot live on the session itself).
+    const LiveToolCtx = struct {
+        session: *Session,
+        slot: usize,
+    };
+
+    fn onToolOutput(data: []const u8, ctx: *anyopaque) void {
+        const ltc: *LiveToolCtx = @alignCast(@ptrCast(ctx));
+        const s = ltc.session;
+        // Plain print mode: nobody consumes live output; skip accumulation.
+        if (!s.record_turn_events and s.json_out == null) return;
+        const i: usize = ltc.slot;
+        s.live_tool_mutex.lock(s.io) catch return;
+        defer s.live_tool_mutex.unlock(s.io);
+        if (s.live_tool_outputs[i] == null) {
+            const new_buf = std.array_list.Managed(u8).init(s.alloc);
+            s.live_tool_outputs[i] = new_buf;
+        }
+        s.live_tool_outputs[i].?.appendSlice(data) catch return;
+        const now_ms = ss.nowMs(s.io);
+        if (now_ms - s.live_tool_last_ms[i] < 100) return;
+        const id = s.live_tool_ids[i] orelse return;
+        s.live_tool_last_ms[i] = now_ms;
+        // --mode json: pi emits tool_execution_update with partialResult.
+        if (s.json_out != null) {
+            const esc_id = s.jsonEscaped(id) catch return;
+            defer s.alloc.free(esc_id);
+            const esc_out = s.jsonEscaped(s.live_tool_outputs[i].?.items) catch return;
+            defer s.alloc.free(esc_out);
+            s.jsonEvent("{{\"type\":\"tool_execution_update\",\"toolCallId\":\"{s}\",\"partialResult\":\"{s}\"}}", .{ esc_id, esc_out });
+        }
+        if (!s.record_turn_events) return;
+        const id_copy = s.alloc.dupe(u8, id) catch return;
+        const out_copy = s.alloc.dupe(u8, s.live_tool_outputs[i].?.items) catch {
+            s.alloc.free(id_copy);
+            return;
+        };
+        s.pushTurnEvent(.{ .tool_update = .{ .id = id_copy, .output = out_copy } });
     }
 
     pub fn isAborted(self: *Session) bool {
@@ -1292,10 +1395,11 @@ pub const Session = struct {
                     if (idx == 0) {
                         // First call inline: warms nothing, keeps the common
                         // single-tool path thread-free.
-                        results[0] = self.execToolTimed(tc.name, tc.arguments);
+                        results[0] = self.execToolTimed(0, tc.name, tc.id, tc.arguments);
                     } else {
-                        const t = std.Thread.spawn(.{}, toolThreadMain, .{ self, tc, &results[idx] }) catch {
-                            results[idx] = self.execToolTimed(tc.name, tc.arguments);
+                        const slot = @min(idx, @as(usize, 3));
+                        const t = std.Thread.spawn(.{}, toolThreadMain, .{ self, tc, &results[idx], slot }) catch {
+                            results[idx] = self.execToolTimed(slot, tc.name, tc.id, tc.arguments);
                             try threads.append(.{ .t = null, .i = idx, .tc = tc });
                             idx += 1;
                             continue;
@@ -1312,14 +1416,15 @@ pub const Session = struct {
         }
     }
 
-    fn toolThreadMain(self: *Session, tc: msg.ToolCall, out: *tools.ToolResult) void {
-        out.* = self.execToolTimed(tc.name, tc.arguments);
+    fn toolThreadMain(self: *Session, tc: msg.ToolCall, out: *tools.ToolResult, slot: usize) void {
+        out.* = self.execToolTimed(slot, tc.name, tc.id, tc.arguments);
     }
 
     /// execTool with the wall time filled in. The pre_tool_call hook (Phase
     /// I2) may BLOCK the call — the model then receives the hook's reason as
-    /// a tool error; post_tool_call runs observe-only.
-    fn execToolTimed(self: *Session, name: []const u8, args_json: []const u8) tools.ToolResult {
+    /// a tool error; post_tool_call runs observe-only. `slot` + `id` wire up
+    /// the live output stream (bash streaming, pi tool_execution_update).
+    fn execToolTimed(self: *Session, slot: usize, name: []const u8, id: []const u8, args_json: []const u8) tools.ToolResult {
         const start = ss.nowMs(self.io);
         if (events.getGlobal()) |bus| {
             if (bus.emitBlocking(.{ .pre_tool_call = .{ .name = name, .args_json = args_json } })) |reason| {
@@ -1334,7 +1439,15 @@ pub const Session = struct {
                 return .{ .content = blocked, .is_error = true, .duration_ms = 0 };
             }
         }
-        var result = self.execTool(name, args_json);
+        // Arm the live output stream for this slot: clear any stale buffer
+        // from a previous round, point the reader threads at it.
+        self.live_tool_mutex.lock(self.io) catch {};
+        if (self.live_tool_outputs[slot]) |old| old.deinit();
+        self.live_tool_outputs[slot] = null;
+        self.live_tool_last_ms[slot] = 0;
+        self.live_tool_ids[slot] = id;
+        self.live_tool_mutex.unlock(self.io);
+        var result = self.execTool(slot, name, args_json);
         if (events.getGlobal()) |bus| {
             bus.emit(.{ .post_tool_call = .{
                 .name = name,
@@ -1374,10 +1487,17 @@ pub const Session = struct {
         }
     }
 
-    fn execTool(self: *Session, name: []const u8, args_json: []const u8) tools.ToolResult {
+    fn execTool(self: *Session, slot: usize, name: []const u8, args_json: []const u8) tools.ToolResult {
         const tool = self.registry.find(name) orelse
             return .{ .content = std.fmt.allocPrint(self.alloc, "unknown tool: {s}", .{name}) catch "", .is_error = true };
-        return tool.execute(tool, args_json, &self.exec_ctx);
+        // Per-call context: the shared exec_ctx is borrowed by the tools,
+        // but the live-output callback must be armed per slot. A stack copy
+        // keeps the shared one untouched for non-streaming callers.
+        var ctx = self.exec_ctx;
+        var ltc = LiveToolCtx{ .session = self, .slot = slot };
+        ctx.on_output = onToolOutput;
+        ctx.on_output_ctx = &ltc;
+        return tool.execute(tool, args_json, &ctx);
     }
 
     /// --mode json: block count before the first tool call slot.
