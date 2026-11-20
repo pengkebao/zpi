@@ -31,7 +31,7 @@ zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP
   - **空响应自动重试**：网关偶发返回 200 但空/截断 SSE 体时，指数退避重试（默认 3 次，1s/2s/4s），不再静默 `EmptyResponse` 死回合
   - **长度截断恢复**（pi `isRecoverableLength`）：`finish_reason=length` 且 `output < max_tokens` 时判定上下文压力/网关截断，一次性压缩并重试
   - **纯思考回合轻推**：某轮只产出 thinking（无文本无工具调用）时注入一次 continue 提示，防止模型把输出预算耗在推理上后静默停滞
-  - 工具轮次上限（默认 200）触顶时提示而非静默停止
+  - **无轮次上限**（对齐 pi `agent-loop` 的 `while(true)`）：工具轮循环只在模型停止调用工具或用户 ESC 中断时结束，长任务不会被中途切断
 - **失败可见性**（不再静默死回合）：重试 / 自动压缩等恢复提示同时写入转写（灰色 `·` 行，不再 1.5 秒闪没）；回合失败时错误行自动滚入视口（钉底跟随），并持久化为会话条目——重启后红色内联重放，事后可追溯
 - MCP 客户端：stdio + HTTP 传输、OAuth 登录、工具注册与热重载、`zpi mcp add/remove/list` 全套管理
 - 技能（Skills）与提示模板（Prompts）：pi 同款发现机制与 `SKILL.md` 格式；`/skill:name` 调用时**完整技能体发给模型，但转写只占一行** `[skill] name (ctrl+o to expand)`——点击或 Ctrl+O 才展开正文（对齐 pi `SkillInvocationMessageComponent`，不再把整个 SKILL.md 刷屏）

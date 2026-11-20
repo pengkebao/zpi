@@ -137,7 +137,6 @@ pub const Session = struct {
     live_tool_ids: [4]?[]const u8 = .{ null, null, null, null },
     /// Guards the live_tool_outputs buffers (reader threads vs teardown).
     live_tool_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    max_tool_rounds: usize = 200,
     compaction: compact.Settings = compact.DEFAULT_SETTINGS,
     /// Optional callback for streamed output. If set (TUI mode), all output
     /// kinds go to the callback; otherwise text goes to stdout and everything
@@ -982,10 +981,12 @@ pub const Session = struct {
         }
         try self.appendAndRecord(&user_msg);
 
-        var rounds: usize = 0;
         // One overflow-recovery attempt per run (pi _overflowRecoveryAttempted).
         var overflow_recovered = false;
-        while (rounds < self.max_tool_rounds) : (rounds += 1) {
+        // pi agent-loop: unbounded — the round loop runs until the model
+        // stops calling tools (or the user aborts). There is NO round limit:
+        // a model that keeps making progress must never be cut off.
+        while (true) {
             // Auto-compact before building the request if context is large.
             try self.maybeAutoCompact();
 
@@ -1191,7 +1192,6 @@ pub const Session = struct {
                     self.alloc.free(current_prompt);
                     current_prompt = prompt2;
                     follow_up = true;
-                    rounds = 0;
                 }
                 break;
             }
@@ -1270,17 +1270,6 @@ pub const Session = struct {
             }
 
             if (self.isAborted()) break;
-        }
-        // The loop exhausted its tool rounds without the model finishing:
-        // say so — a silent exit looked exactly like a random interruption.
-        if (rounds >= self.max_tool_rounds) {
-            const s = std.fmt.allocPrint(
-                self.alloc,
-                "\n[stopped: tool-round limit reached ({d} rounds). Send '继续' to resume the task.]\n",
-                .{self.max_tool_rounds},
-            ) catch "\n[stopped: tool-round limit reached]\n";
-            defer self.alloc.free(s);
-            self.emit(.tool_info, s);
         }
         }
     }
