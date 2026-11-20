@@ -7682,6 +7682,7 @@ pub const TUI = struct {
                 .{ "ctrl+z", "to suspend" },
                 .{ "ctrl+k", "to delete to end" },
                 .{ "shift+tab", "to cycle thinking level" },
+                .{ "ctrl+s", "to save thinking level" },
                 .{ "ctrl+p/shift+ctrl+p", "to cycle models" },
                 .{ "ctrl+l", "to select model" },
                 .{ "ctrl+o", "to expand tools" },
@@ -10112,6 +10113,17 @@ pub const TUI = struct {
             // (ctrl+x), app.suspend (ctrl+z), app.exit (ctrl+d).
             if (self.bindings.matches(key, .thinking_cycle)) {
                 self.cycleThinkingLevel();
+                continue;
+            }
+            // pi app.thinking.save (ctrl+s): persist the current level as
+            // the settings default.
+            if (!modal_open and self.bindings.matches(key, .thinking_save)) {
+                if (self.cfg) |c2| {
+                    c2.default_thinking_level = self.session.thinking_level;
+                    c2.persistSettings(self.alloc, self.io) catch {};
+                    self.note("\x1b[90mDefault thinking level: {s}\x1b[0m", .{self.session.thinking_level.name()});
+                }
+                self.redraw();
                 continue;
             }
             if (!modal_open and self.bindings.matches(key, .model_next)) {

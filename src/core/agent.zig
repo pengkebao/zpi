@@ -24,6 +24,10 @@ pub fn clearAbort() void {
     g_abort.store(false, .release);
 }
 
+/// Verbose diagnostics to stderr (pi --verbose): retry details, transport
+/// diagnostics. Off by default.
+pub var verbose = false;
+
 /// Global abort check (for helper sessions that aren't a *Session, e.g.
 /// compaction summarization).
 pub fn isAbortedGlobal() bool {
@@ -1055,6 +1059,7 @@ pub const Session = struct {
                     // provider buffer is empty, so store a readable reason.
                     var tb: [128]u8 = undefined;
                     const tmsg = std.fmt.bufPrint(&tb, "transport error: {s}", .{@errorName(e)}) catch "transport error";
+                    if (verbose) std.debug.print("[verbose] transport error: {s}\n", .{tmsg});
                     self.provider.setLastErrorIfEmpty(tmsg);
                     const le = self.provider.lastErrorText();
                     if (le.len > 0) {

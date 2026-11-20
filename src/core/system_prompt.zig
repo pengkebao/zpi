@@ -140,6 +140,25 @@ pub fn buildFromSnippets(
     });
 }
 
+/// buildFromSnippets with project context files disabled (pi --no-context-files).
+pub fn buildFromSnippetsNoContext(
+    alloc: std.mem.Allocator,
+    tool_snippets: []const ToolSnippet,
+    cwd: []const u8,
+    append_system_prompt: ?[]const u8,
+    system_prompt_override: ?[]const u8,
+    skills_block: ?[]const u8,
+) ![]u8 {
+    return try buildSystemPrompt(alloc, .{
+        .cwd = cwd,
+        .tools = tool_snippets,
+        .append_system_prompt = append_system_prompt orelse "",
+        .custom_prompt = system_prompt_override,
+        .context_files = &.{},
+        .skills_block = skills_block,
+    });
+}
+
 fn buildToolsSection(alloc: std.mem.Allocator, tools: []const ToolSnippet) ![]u8 {
     var out = std.array_list.Managed(u8).init(alloc);
     errdefer out.deinit();
@@ -295,6 +314,16 @@ fn loadContextFileFromDir(alloc: std.mem.Allocator, io: std.Io, dir: []const u8,
         return .{ .path = path_owned, .content = content_owned };
     }
     return null;
+}
+
+test "buildFromSnippetsNoContext skips context files (pi --no-context-files)" {
+    const alloc = std.testing.allocator;
+    const sp = try buildFromSnippetsNoContext(alloc, &.{}, "/tmp/proj", null, null, null);
+    defer alloc.free(sp);
+    try std.testing.expect(std.mem.indexOf(u8, sp, "You are a coding assistant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sp, "<cwd>\n/tmp/proj\n</cwd>") != null);
+    // No project context section without context files.
+    try std.testing.expect(std.mem.indexOf(u8, sp, "<project_context>") == null);
 }
 
 test "buildSystemPrompt basic" {

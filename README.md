@@ -64,6 +64,12 @@ zig build
 
 首次在某个目录使用会提示信任确认（pi 同款 trust 机制）。
 
+### 命令行参数
+
+与 pi 1.5.0 同名同义：`-p/--print`、`-m/--model`、`--model-id`、`--provider`、`--api-key`、`--models`、`--mode text|json|rpc`、`--thinking`、`-c/--continue`、`-r/--resume`、`--session`、`--session-id`、`--session-dir`、`--fork`、`--name`、`--no-session`、`--list-sessions`、`--list-models`、`--cwd`、`--no-tui`、`-t/--tools`、`-xt/--exclude-tools`、`-nt/--no-tools`、`-nbt/--no-builtin-tools`、`-a/--approve`、`-na/--no-approve`、`--append-system-prompt`、`--system-prompt`、`@file` 附加文件、子命令 `zpi mcp …`。
+
+诊断开关：`--version`、`--no-mcp`（跳过 MCP 服务器加载）、`--no-context-files`（跳过 AGENTS.md/CLAUDE.md 注入）、`--quiet`（抑制匹配提示等诊断输出）、`--verbose`（stderr 输出传输/重试诊断）。
+
 ## 配置
 
 智能体目录：环境变量 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`。**与 pi 完全共享** —— 如果你已经在用 pi，无需任何迁移，zpi 直接读取你的模型、凭据、技能、提示模板与会话历史。
@@ -104,6 +110,7 @@ apiKey 支持 字面量 / `$ENV_VAR` / `!command` 三种写法；凭据回退顺
 | ctrl+d | 空编辑器时退出 |
 | ctrl+z | 挂起后台（fg 恢复） |
 | shift+tab | thinking 档位循环 off→low→…→max |
+| ctrl+s | 保存当前 thinking 档位为默认（pi app.thinking.save） |
 | ctrl+t | 显示/隐藏 thinking 块 |
 | ctrl+p / shift+ctrl+p | 循环切换模型（下一个 / 上一个） |
 | ctrl+l | 显示模型列表 |
@@ -147,10 +154,10 @@ src/
 ## 测试
 
 ```bash
-zig test test_ui.zig              # 265 个 UI/逻辑测试
+zig test test_ui.zig              # 268 个 UI/逻辑测试
 zig test leak_g2.zig              # 195 个泄漏回归测试（SafeAllocator 全路径）
 zig test src/ui/keys.zig          # 按键/鼠标序列解析（19）
-zig test src/ui/tool_block.zig    # 工具块渲染：diff/ANSI/CJK 折行（26）
+zig test src/ui/tool_block.zig    # 工具块渲染：diff/ANSI/CJK 折行/实时输出（27）
 zig test test_openai.zig          # SSE 协议解析（11）
 zig test test_mcp.zig             # MCP 客户端单测（9）
 zig test test_pt.zig              # bracketed paste（4）

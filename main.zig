@@ -500,6 +500,12 @@ pub fn main(init: std.process.Init) !void {
     var exclude_tools_arg: ?[]const u8 = null;
     var no_tools = false;
     var no_builtin_tools = false;
+    // pi CLI flags: --no-mcp / --no-context-files / --quiet / --verbose /
+    // --version.
+    var no_mcp = false;
+    var no_context_files = false;
+    var quiet_flag = false;
+    var verbose_flag = false;
     // System prompt (Phase D5)
     var append_system_prompt: ?[]const u8 = null;
     var system_prompt_override: ?[]const u8 = null;
@@ -594,6 +600,17 @@ pub fn main(init: std.process.Init) !void {
             no_tools = true;
         } else if (std.mem.eql(u8, arg, "--no-builtin-tools") or std.mem.eql(u8, arg, "-nbt")) {
             no_builtin_tools = true;
+        } else if (std.mem.eql(u8, arg, "--no-mcp")) {
+            no_mcp = true;
+        } else if (std.mem.eql(u8, arg, "--no-context-files")) {
+            no_context_files = true;
+        } else if (std.mem.eql(u8, arg, "--quiet")) {
+            quiet_flag = true;
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            verbose_flag = true;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            std.debug.print("zpi v0.1.0\n", .{});
+            return;
         } else if (std.mem.eql(u8, arg, "--append-system-prompt")) {
             if (i + 1 < argv.items.len) append_system_prompt = argv.items[i + 1];
             i += 1;
@@ -874,11 +891,13 @@ pub fn main(init: std.process.Init) !void {
                         mm.api_key = try alloc.dupe(u8, k);
                     }
                     mm.thinking_level = cli_thinking orelse suffix_level orelse mm.thinking_level;
-                    std.debug.print("note: '{s}' matched {s}/{s}", .{ pattern, mm.provider, mm.id });
-                    if (f.others.len > 0) {
-                        std.debug.print(" ({d} other candidates)", .{f.others.len});
+                    if (!quiet_flag) {
+                        std.debug.print("note: '{s}' matched {s}/{s}", .{ pattern, mm.provider, mm.id });
+                        if (f.others.len > 0) {
+                            std.debug.print(" ({d} other candidates)", .{f.others.len});
+                        }
+                        std.debug.print("\n", .{});
                     }
-                    std.debug.print("\n", .{});
                     break :blk mm;
                 },
                 .not_found => {
@@ -1008,6 +1027,7 @@ pub fn main(init: std.process.Init) !void {
     // session (servers are long-lived) and is retired at the end of main.
     var mcp_mgr: ?*mcp.Manager = null;
     blk: {
+        if (no_mcp) break :blk; // pi --no-mcp: skip MCP server loading entirely
         const user_mcp = std.fmt.allocPrint(alloc, "{s}/mcp.json", .{cfg.base_dir}) catch break :blk;
         defer alloc.free(user_mcp);
         const proj_mcp = std.fmt.allocPrint(alloc, "{s}/.pi/mcp.json", .{cwd_abs}) catch break :blk;
@@ -1254,10 +1274,14 @@ pub fn main(init: std.process.Init) !void {
         if (!t.active) continue;
         try tool_snippets.append(.{ .name = t.name, .snippet = t.description });
     }
-    const system_prompt = try sp.buildFromSnippets(alloc, io, tool_snippets.items, cwd_abs, cfg.base_dir, append_system_prompt, system_prompt_override, skills_block);
+    const system_prompt = try if (no_context_files)
+        sp.buildFromSnippetsNoContext(alloc, tool_snippets.items, cwd_abs, append_system_prompt, system_prompt_override, skills_block)
+    else
+        sp.buildFromSnippets(alloc, io, tool_snippets.items, cwd_abs, cfg.base_dir, append_system_prompt, system_prompt_override, skills_block);
 
     // Create session
     const model_ptr = &model;
+    agent.verbose = verbose_flag;
     var session = try agent.Session.init(alloc, io, model_ptr, &registry, provider, system_prompt);
     defer session.deinit();
     alloc.free(system_prompt);
