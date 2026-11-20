@@ -17,6 +17,7 @@ const tool_block = @import("src/ui/tool_block.zig");
 const footer = @import("src/ui/footer.zig");
 const overlay = @import("src/ui/overlay.zig");
 const ansi = @import("src/ui/ansi.zig");
+const image = @import("src/ui/image.zig");
 comptime {
     _ = tool_search;
     _ = tui;
@@ -1683,4 +1684,108 @@ test "jump hint line: styled prefix is heap-built, no garbage bytes from stack s
     }
     try std.testing.expect(!gap_bad);
     try expectFrameFits(&t, t.width);
+}
+
+// A 1x1 red PNG, base64 (IHDR w=1 h=1).
+const TINY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==";
+
+test "read-of-image result: no image protocol -> [Image: ...] fallback line" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    // No image protocol in the test env (TERM_PROGRAM unset) -> fallback.
+    t.image_caps = .{ .images = .none };
+
+    t.addPendingTool(.{
+        .id = try alloc.dupe(u8, "img1"),
+        .name = try alloc.dupe(u8, "read"),
+        .arguments = try alloc.dupe(u8, "{\"path\":\"a.png\"}"),
+    });
+    t.finishTool(.{
+        .id = try alloc.dupe(u8, "img1"),
+        .content = try alloc.dupe(u8, "Read image file [image/png]"),
+        .is_error = false,
+        .duration_ms = 10,
+        .image_data = try alloc.dupe(u8, TINY_PNG_B64),
+        .image_mime = try alloc.dupe(u8, "image/png"),
+    });
+    const block = t.scrollback.items[0];
+    // The fallback indicator names the mime and the 1x1 dimensions.
+    try std.testing.expect(std.mem.indexOf(u8, block, "[Image: image/png 1x1]") != null);
+    // And no Kitty sequence leaked into the block.
+    try std.testing.expect(std.mem.indexOf(u8, block, "\x1b_G") == null);
+}
+
+test "read-of-image result: kitty protocol -> encoded line + spacer rows" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    t.image_caps = .{ .images = .kitty };
+
+    t.addPendingTool(.{
+        .id = try alloc.dupe(u8, "img2"),
+        .name = try alloc.dupe(u8, "read"),
+        .arguments = try alloc.dupe(u8, "{\"path\":\"a.png\"}"),
+    });
+    t.finishTool(.{
+        .id = try alloc.dupe(u8, "img2"),
+        .content = try alloc.dupe(u8, "Read image file [image/png]"),
+        .is_error = false,
+        .duration_ms = 10,
+        .image_data = try alloc.dupe(u8, TINY_PNG_B64),
+        .image_mime = try alloc.dupe(u8, "image/png"),
+    });
+    const block = t.scrollback.items[0];
+    // The encoded Kitty sequence is present, with a placement id + row count.
+    try std.testing.expect(std.mem.indexOf(u8, block, "\x1b_Ga=T,f=100,q=2,C=1,c=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, ",i=") != null);
+    // The entry recorded a valid row count (1x1 image -> at least 1 row).
+    const e = t.tool_calls.items[0];
+    try std.testing.expect(e.image_line != null);
+    try std.testing.expect(e.image_rows >= 1);
+    // The image line occupies image_rows visual rows: the block is the tool
+    // text + the sequence line + (rows-1) empty spacer lines.
+    // The image line is followed by exactly (image_rows - 1) spacer rows (pi
+    // Image.render), so the placement occupies image_rows visual rows. Strip
+    // the block's trailing newline so split yields no phantom final segment.
+    const trimmed = blk: {
+        const b = if (block.len > 0 and block[block.len - 1] == '\n') block[0 .. block.len - 1] else block;
+        break :blk b;
+    };
+    var lines = std.mem.splitScalar(u8, trimmed, '\n');
+    var saw_seq = false;
+    var after: usize = 0;
+    while (lines.next()) |l| {
+        if (image.isImageLine(l)) {
+            saw_seq = true;
+            continue;
+        }
+        if (saw_seq) after += 1;
+    }
+    try std.testing.expect(saw_seq);
+    try std.testing.expectEqual(e.image_rows - 1, after);
 }

@@ -18,6 +18,7 @@ const clipboard = @import("../core/clipboard.zig");
 const ptmod = @import("../core/prompt_template.zig");
 const trust = @import("../core/trust.zig");
 const events = @import("../core/events.zig");
+const image = @import("image.zig");
 const fuzzy = @import("fuzzy.zig");
 const compact = @import("../core/compaction.zig");
 const skills = @import("../core/skills.zig");
@@ -425,6 +426,16 @@ pub const TUI = struct {
         /// Per-block expansion override (clicking the block toggles it);
         /// null follows the global tools_expanded (Ctrl+O).
         expanded: ?bool = null,
+        /// Encoded Kitty image line for a read-of-image result (owned; null
+        /// when there is no image or the terminal cannot render it). Built
+        /// once in finishTool so the placement id stays stable across
+        /// re-renders (a new id per render would leak placements).
+        image_line: ?[]u8 = null,
+        /// Visual rows the image occupies (1 = none/fallback text).
+        image_rows: u32 = 1,
+        /// Fallback indicator line ("[Image: mime WxH]") when the image is
+        /// not rendered inline (owned; null when image_line is set).
+        image_fallback: ?[]u8 = null,
 
         fn effectiveExpanded(self: *const ToolEntry, global: bool) bool {
             return self.expanded orelse global;
@@ -436,6 +447,8 @@ pub const TUI = struct {
             alloc.free(self.args);
             if (self.result.len > 0) alloc.free(self.result);
             if (self.live_output.len > 0) alloc.free(self.live_output);
+            if (self.image_line) |l| alloc.free(l);
+            if (self.image_fallback) |l| alloc.free(l);
         }
 
         fn view(self: *const ToolEntry) tool_block.ToolView {
@@ -697,6 +710,15 @@ pub const TUI = struct {
     thinking_hidden: bool = false,
     /// Tool calls of the transcript, re-renderable (see ToolEntry).
     tool_calls: std.ArrayListUnmanaged(ToolEntry) = .empty,
+    /// Terminal image protocol capability (pi getCapabilities), detected once
+    /// at init. `.none` on tmux / non-image terminals.
+    image_caps: image.Caps = .{ .images = .none },
+    /// Kitty placement ids currently on screen (collected from the last
+    /// painted frame). Stale ids are deleted when a frame no longer shows
+    /// their line (pi previousKittyImageIds). Owned u32 list.
+    kitty_ids: std.ArrayListUnmanaged(u32) = .empty,
+    /// Monotonic counter for new Kitty placement ids (pi allocateImageId).
+    kitty_image_next_id: u32 = 0,
     /// `/skill:name` invocations of the transcript (see SkillEntry).
     skill_invocations: std.ArrayListUnmanaged(SkillEntry) = .empty,
     /// Scrollback indices of thinking blocks, for Ctrl+T.
@@ -2419,8 +2441,8 @@ pub const TUI = struct {
         const cfg = self.cfg;
         return switch (def.kind) {
             .autocompact => if (cfg) |c| (if (c.compaction.enabled) "true" else "false") else "true",
-            .show_images => "true",
-            .image_width => "60",
+            .show_images => if (cfg) |c| (if (c.show_images) "true" else "false") else "true",
+            .image_width => if (cfg) |c| std.fmt.bufPrint(buf, "{d}", .{c.image_width_cells}) catch "60" else "60",
             .auto_resize_images => "true",
             .block_images => "false",
             .skill_commands => if (self.skill_commands) "true" else "false",
@@ -2499,6 +2521,12 @@ pub const TUI = struct {
                 self.session.compaction.enabled = on;
             },
             .skill_commands => self.skill_commands = std.mem.eql(u8, next, "true"),
+            .show_images => {
+                if (cfg) |c| c.show_images = std.mem.eql(u8, next, "true");
+            },
+            .image_width => {
+                if (cfg) |c| c.image_width_cells = std.fmt.parseInt(u32, next, 10) catch 60;
+            },
             .autocomplete_max => self.autocomplete_max = std.fmt.parseInt(usize, next, 10) catch 5,
             .steering_mode => {
                 self.steering_mode_all = std.mem.eql(u8, next, "all");
@@ -4527,6 +4555,10 @@ pub const TUI = struct {
                 }
             }
         }
+        // Image protocol capability (pi getCapabilities): cached once. tmux,
+        // non-image terminals and the e2e PTY all resolve to `.none`, so the
+        // read-of-image result falls back to a text indicator there.
+        const image_caps = image.detect(environ);
         // Wheel feel (pi: wheelScrollLines "auto"): a local macOS terminal
         // delivers already-accelerated, one-line-at-a-time events.
         const over_ssh = std.process.Environ.getPosix(environ, "SSH_CONNECTION") != null or
@@ -4561,6 +4593,7 @@ pub const TUI = struct {
             .prev_lines = std.array_list.Managed([]u8).init(alloc),
             .cfg = cfg,
             .environ = environ,
+            .image_caps = image_caps,
             .bindings = bindings,
             .sv = sv,
             .wheel = wheel,
@@ -6215,7 +6248,17 @@ pub const TUI = struct {
         const start = self.sv.scroll_top;
         var idx = start;
         while (idx < self.doc_lines.items.len and frame.items.len < transcript_h) : (idx += 1) {
-            const truncated = truncateToWidth(self.alloc, self.doc_lines.items[idx], self.width) catch return error.OutOfMemory;
+            // A Kitty image line is ONE model row but N visual rows and its
+            // base64 payload is far wider than the screen: it must go out
+            // verbatim (truncating it would corrupt the placement, and the
+            // diff engine paints it specially). Everything else is wrapped.
+            const line = self.doc_lines.items[idx];
+            if (image.isImageLine(line)) {
+                const dup = self.alloc.dupe(u8, line) catch return error.OutOfMemory;
+                frame.append(self.alloc, dup) catch self.alloc.free(dup);
+                continue;
+            }
+            const truncated = truncateToWidth(self.alloc, line, self.width) catch return error.OutOfMemory;
             frame.append(self.alloc, truncated) catch return error.OutOfMemory;
         }
         // The window may start INSIDE the live block (committed rows shorter
@@ -6719,6 +6762,37 @@ pub const TUI = struct {
         return null;
     }
 
+    /// True when any frame row is an encoded Kitty image line (pi
+    /// collectKittyImageIds non-empty). Used to decide whether native scroll
+    /// is safe (it is not — placements don't scroll with the text).
+    fn frameHasImage(lines: []const []const u8, n: usize) bool {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (image.isImageLine(lines[i])) return true;
+        }
+        return false;
+    }
+
+    /// Collect the distinct Kitty placement ids present in `lines` (pi
+    /// collectKittyImageIds). Owned; caller frees.
+    fn collectKittyIds(self: *TUI, lines: []const []const u8) ![]u32 {
+        var out: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer out.deinit(self.alloc);
+        for (lines) |l| {
+            if (image.imageId(l)) |id| {
+                var seen = false;
+                for (out.items) |x| {
+                    if (x == id) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) try out.append(self.alloc, id);
+            }
+        }
+        return out.toOwnedSlice(self.alloc);
+    }
+
     /// Paint one row: move to it, clear it, write it. `pending_newline` lets
     /// consecutive rows chain with `\r\n` instead of a full absolute move
     /// (pi chains relative moves the same way).
@@ -6806,12 +6880,50 @@ pub const TUI = struct {
         // rows are dropped instead (and not adopted into prev_lines), so
         // the next frame repaints whatever belongs on screen.
         const paint_limit = @min(n, self.height);
+        // Kitty placement lifecycle (pi previousKittyImageIds): a placement
+        // lingers on the terminal until deleted or overwritten. When an image
+        // line leaves the frame (scrolled out of the viewport), delete its
+        // placement so it does not float over the new content. Re-emitting the
+        // same id elsewhere in the frame repositions it (the paint loop), so
+        // only ids ABSENT from the new frame are deleted. The deletes go at
+        // the TOP of the frame, before any paint.
+        var new_ids: []u32 = &[_]u32{};
+        if (self.kitty_ids.items.len > 0) {
+            new_ids = self.collectKittyIds(new_lines[0..@min(n, self.height)]) catch &[_]u32{};
+            var stale: [64]u32 = undefined;
+            var stale_count: usize = 0;
+            for (self.kitty_ids.items) |old_id| {
+                var present = false;
+                for (new_ids) |nid| {
+                    if (nid == old_id) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present and stale_count < stale.len) {
+                    stale[stale_count] = old_id;
+                    stale_count += 1;
+                }
+            }
+            if (stale_count > 0) {
+                var db: [64]u8 = undefined;
+                for (stale[0..stale_count]) |sid| {
+                    frame_out.appendSlice(self.alloc, image.deleteKittyInto(&db, sid)) catch return;
+                }
+            }
+        }
         var shifted = false;
         var reveal_from: usize = 0;
         var reveal_to: usize = 0; // exclusive
         var outlier_rows: [MAX_SHIFT_OUTLIERS]usize = undefined;
         var outlier_count: usize = 0;
-        if (th > 0 and th == self.prev_transcript_h) {
+        // A Kitty placement is a floating layer anchored at a screen row, NOT
+        // text: a native DECSTBM scroll would move the text but leave the image
+        // behind, misaligning them. When an image is in the frame, skip native
+        // scroll and let the per-row CUP repaint reposition it (re-emitting the
+        // sequence with the same placement id moves it; pi fullRenders here).
+        const has_image = frameHasImage(new_lines, n);
+        if (th > 0 and th == self.prev_transcript_h and !has_image) {
             // The scroll_top movement between the previous painted frame and
             // this one; null after a forced full repaint (no prior frame).
             const scroll_delta: ?isize = if (self.rendered_scroll_top) |prev_top|
@@ -6907,6 +7019,34 @@ pub const TUI = struct {
                     (row >= self.prev_lines.items.len or
                         !std.mem.eql(u8, self.prev_lines.items[row], new_lines[row])));
             if (!need) continue;
+            // A Kitty image row is painted specially (pi fullRender image
+            // branch): move to the row, emit the sequence (it reserves its
+            // `r` rows as a floating placement), advance the cursor rows-1,
+            // move back. The following spacer rows carry no content, so they
+            // are skipped — clearing them could erase the placement.
+            if (image.isImageLine(new_lines[row])) {
+                // `C=1` leaves the cursor on the image row after the sequence;
+                // the placement reserves the following r-1 rows. Move the
+                // cursor down to the last reserved row so the NEXT painted row
+                // can chain with `\r\n` (or reposition absolutely). Do NOT move
+                // back up: the spacer rows are skipped, not cleared (clearing
+                // them could erase the placement).
+                var mv: [16]u8 = undefined;
+                const ml = ansi.moveTo(&mv, @intCast(row + 1), 1);
+                frame_out.appendSlice(self.alloc, mv[0..ml]) catch return;
+                frame_out.appendSlice(self.alloc, new_lines[row]) catch return;
+                const r = image.rowsOf(new_lines[row]) orelse 1;
+                const last: usize = @min(n, row + r);
+                // Advance at most to the screen bottom (moving past it would
+                // scroll the whole screen and desync the model).
+                const stop: usize = @min(last - 1, self.height - 1);
+                var cur = row;
+                while (cur < stop) : (cur += 1)
+                    frame_out.appendSlice(self.alloc, "\r\n") catch return;
+                last_painted = stop;
+                row = stop;
+                continue;
+            }
             // Chain with `\r\n` only when the previous painted row is exactly
             // this one's predecessor; after any gap the `\r\n` would land on
             // the wrong screen row.
@@ -6948,6 +7088,17 @@ pub const TUI = struct {
         const adopt = @min(n, self.height);
         self.prev_lines.appendSlice(new_lines[0..adopt]) catch {};
         for (new_lines[adopt..]) |l| self.alloc.free(l);
+        // Adopt the frame's Kitty placement ids (pi previousKittyImageIds);
+        // the stale deletes were emitted at the TOP of the frame (before any
+        // paint) by the pre-pass above. Recompute when the pre-pass skipped
+        // collection (no prior ids, but the frame may now introduce some).
+        if (self.kitty_ids.items.len == 0 and new_ids.len == 0) {
+            const ids = self.collectKittyIds(new_lines[0..adopt]) catch &[_]u32{};
+            for (ids) |nid| self.kitty_ids.append(self.alloc, nid) catch {};
+        } else {
+            self.kitty_ids.clearRetainingCapacity();
+            for (new_ids) |nid| self.kitty_ids.append(self.alloc, nid) catch {};
+        }
         frame.clearRetainingCapacity();
         self.prev_transcript_h = th;
         self.rendered_scroll_top = self.frame_scroll_top;
@@ -7884,11 +8035,64 @@ pub const TUI = struct {
             e.is_error = result.is_error;
             e.duration_ms = result.duration_ms;
             e.pending = false;
+            self.buildImageForEntry(e, result.image_data, result.image_mime);
             self.renderToolBlockAt(i);
             return;
         }
         // A result without a matching start should not happen; do not leak it.
         self.session.alloc.free(result.content);
+        if (result.image_data) |d| self.session.alloc.free(d);
+        if (result.image_mime) |m| self.session.alloc.free(m);
+    }
+
+    /// Turn a read-of-image result into the entry's display (pi Image
+    /// component): an encoded Kitty line + reserved row count when the
+    /// terminal speaks the protocol AND the `showImages` setting is on, else
+    /// a one-line `[Image: mime WxH]` fallback. The encoded line is built
+    /// ONCE so its placement id is stable across re-renders (a fresh id per
+    /// render would leak the old placements). Takes ownership of the base64
+    /// bytes and mime (frees them when unused).
+    fn buildImageForEntry(self: *TUI, e: *ToolEntry, b64: ?[]const u8, mime: ?[]const u8) void {
+        const data = b64 orelse return;
+        defer self.session.alloc.free(data);
+        const m = mime orelse "image/unknown";
+        const mime_owned = if (mime) |mm| mm else self.session.alloc.dupe(u8, "image/unknown") catch "image/unknown";
+        defer self.session.alloc.free(mime_owned);
+        // Decode to read the pixel dimensions (the encoded sequence keeps the
+        // base64; the decoder buffer is scratch).
+        const raw = blk: {
+            const n = std.base64.standard.Decoder.calcSizeForSlice(data) catch break :blk null;
+            const buf = self.session.alloc.alloc(u8, n) catch return;
+            std.base64.standard.Decoder.decode(buf, data) catch {
+                self.session.alloc.free(buf);
+                break :blk null;
+            };
+            break :blk buf;
+        };
+        const dims = if (raw) |r| image.dimensions(r, m) else null;
+        if (raw) |r| self.session.alloc.free(r);
+        // Render inline only when the terminal can and the setting allows.
+        const show: bool = if (self.cfg) |c| c.show_images else true; // pi default true
+        const max_w: u32 = if (self.cfg) |c| c.image_width_cells else 60;
+        const render_inline = self.image_caps.images == .kitty and show;
+        if (render_inline) {
+            if (dims) |d| {
+                const size = image.cellSize(d, max_w, true);
+                const id = self.nextKittyImageId();
+                const seq = image.encodeKitty(self.session.alloc, data, id, size.columns, size.rows) catch return;
+                e.image_line = seq;
+                e.image_rows = size.rows;
+                return;
+            }
+        }
+        // Fallback indicator (pi imageFallback): the image data is not
+        // rendered; the label keeps the mime + dimensions.
+        e.image_fallback = image.fallback(self.session.alloc, m, dims) catch null;
+    }
+
+    fn nextKittyImageId(self: *TUI) u32 {
+        self.kitty_image_next_id += 1;
+        return self.kitty_image_next_id;
     }
 
     /// The transcript's first block: startup header (pi: headerContainer is
@@ -8939,11 +9143,18 @@ pub const TUI = struct {
     /// (Re-)render tool call `i` into its scrollback slot.
     fn renderToolBlockAt(self: *TUI, i: usize) void {
         const e = &self.tool_calls.items[i];
-        const block = tool_block.render(self.alloc, e.view(), .{
+        var block = tool_block.render(self.alloc, e.view(), .{
             .width = self.width,
             .expanded = e.effectiveExpanded(self.tools_expanded),
             .home = self.home_dir,
         }) catch return;
+        // A read-of-image result appends its image (an encoded line + spacer
+        // rows) or a one-line fallback indicator below the tool text.
+        // error.NoImage means the entry has no image: keep the plain block.
+        if (self.blockWithImage(block, e) catch null) |wi| {
+            self.alloc.free(block);
+            block = wi;
+        }
         self.render_mutex.lock(self.io) catch {
             self.alloc.free(block);
             return;
@@ -8969,6 +9180,38 @@ pub const TUI = struct {
         self.transcript_gen += 1;
     }
 
+    /// Append a tool entry's image rows to a rendered block (pi Image
+    /// component: the encoded line occupies `image_rows` visual rows, so it is
+    /// stored as ONE doc line plus `rows-1` empty spacer lines — the diff
+    /// engine paints the sequence row specially and leaves the spacers
+    /// alone). Returns the new owned block, or null when the entry has no
+    /// image. The input block is consumed (freed by the caller on replace).
+    fn blockWithImage(self: *TUI, block: []const u8, e: *const ToolEntry) ![]u8 {
+        if (e.image_line == null and e.image_fallback == null) return error.NoImage;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.alloc);
+        try out.appendSlice(self.alloc, block);
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(self.alloc, '\n');
+        if (e.image_line) |seq| {
+            // The sequence is its own doc line (starts with ESC so the frame
+            // builder can detect it and skip width-truncation; a Kitty
+            // placement is full-width, so no text indent).
+            try out.appendSlice(self.alloc, seq);
+            try out.append(self.alloc, '\n');
+            var spacers: u32 = e.image_rows;
+            while (spacers > 1) : (spacers -= 1) {
+                try out.append(self.alloc, '\n');
+            }
+        } else if (e.image_fallback) |fb| {
+            try out.appendSlice(self.alloc, "  ");
+            try out.appendSlice(self.alloc, FG_MUTED());
+            try out.appendSlice(self.alloc, fb);
+            try out.appendSlice(self.alloc, ansi.RESET);
+            try out.append(self.alloc, '\n');
+        }
+        return out.toOwnedSlice(self.alloc);
+    }
+
     /// Re-render every scrollback block that has a source at the current
     /// width (pi re-renders components at the live size every frame, so a
     /// resize re-wraps the transcript and the colored blocks). Caller holds
@@ -8983,11 +9226,16 @@ pub const TUI = struct {
                 .tool => |ti| blk: {
                     if (ti >= self.tool_calls.items.len) break :blk null;
                     const e = &self.tool_calls.items[ti];
-                    break :blk tool_block.render(self.alloc, e.view(), .{
+                    var rendered = tool_block.render(self.alloc, e.view(), .{
                         .width = self.width,
                         .expanded = e.effectiveExpanded(self.tools_expanded),
                         .home = self.home_dir,
-                    }) catch null;
+                    }) catch break :blk null;
+                    if (self.blockWithImage(rendered, e) catch null) |wi| {
+                        self.alloc.free(rendered);
+                        rendered = wi;
+                    }
+                    break :blk rendered;
                 },
                 .user => |raw| blk: {
                     self.renderUserBlock(raw, &block);

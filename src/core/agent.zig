@@ -84,6 +84,10 @@ pub const TurnEvent = union(enum) {
         content: []u8,
         is_error: bool,
         duration_ms: u64,
+        /// base64 image bytes from a read-of-image result (owned; null = none).
+        image_data: ?[]u8 = null,
+        /// MIME type for image_data (owned; null = none).
+        image_mime: ?[]u8 = null,
     };
 
     pub const ToolUpdate = struct {
@@ -104,6 +108,8 @@ pub const TurnEvent = union(enum) {
             .tool_result => |r| {
                 alloc.free(r.id);
                 alloc.free(r.content);
+                if (r.image_data) |d| alloc.free(d);
+                if (r.image_mime) |m| alloc.free(m);
             },
             .compaction => {},
             .tool_args => |s| {
@@ -550,18 +556,22 @@ pub const Session = struct {
         self.pushTurnEvent(.{ .tool_start = .{ .id = id, .name = name, .arguments = arguments } });
     }
 
-    fn recordToolResult(self: *Session, id: []const u8, content: []const u8, is_error: bool, duration_ms: u64) void {
+    fn recordToolResult(self: *Session, id: []const u8, content: []const u8, is_error: bool, duration_ms: u64, image_data: ?[]const u8, image_mime: ?[]const u8) void {
         if (!self.record_turn_events) return;
         const id_copy = self.alloc.dupe(u8, id) catch return;
         const content_copy = self.alloc.dupe(u8, content) catch {
             self.alloc.free(id_copy);
             return;
         };
+        const img_data_dup: ?[]u8 = if (image_data) |d| self.alloc.dupe(u8, d) catch null else null;
+        const img_mime_dup: ?[]u8 = if (image_mime) |m| self.alloc.dupe(u8, m) catch null else null;
         self.pushTurnEvent(.{ .tool_result = .{
             .id = id_copy,
             .content = content_copy,
             .is_error = is_error,
             .duration_ms = duration_ms,
+            .image_data = img_data_dup,
+            .image_mime = img_mime_dup,
         } });
     }
 
@@ -1232,7 +1242,9 @@ pub const Session = struct {
                         // The raw-content echo here duplicated the card as a
                         // muted scrollback line (pi: updateResult only).
                         // Before the content moves into the message below.
-                        self.recordToolResult(tc.id, result.content, result.is_error, result.duration_ms);
+                        // recordToolResult BEFORE the image bytes move into
+                        // the message block below (it dup's them for the event).
+                        self.recordToolResult(tc.id, result.content, result.is_error, result.duration_ms, result.image_data, result.image_mime);
 
                         var tr_msg = msg.Message.init(self.alloc);
                         defer tr_msg.deinit();
@@ -1350,7 +1362,7 @@ pub const Session = struct {
                 .tool_call => |tc| {
                     // These calls were never announced: show them as failed.
                     self.recordToolStart(tc);
-                    self.recordToolResult(tc.id, "aborted by user", true, 0);
+                    self.recordToolResult(tc.id, "aborted by user", true, 0, null, null);
 
                     var tr_msg = msg.Message.init(self.alloc);
                     defer tr_msg.deinit();

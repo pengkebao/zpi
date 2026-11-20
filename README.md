@@ -50,6 +50,7 @@ zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP
 - 剪贴板双通道：OSC 52（SSH/远程终端）+ 系统剪贴板（macOS pbcopy / Linux xclip·wl-copy / Windows PowerShell），覆盖 Terminal.app 忽略 OSC 52 的场景
 - 启动欢迎头：半块像素 logo、双态键位提示（Ctrl+O 展开）、Model scope、技能/模板清单 —— 与 pi 逐行对齐
 - **主题系统**（pi 同款 JSON 主题引擎）：53 个颜色 token，支持 hex / `okhsl()` / `oklch()` / 256 色索引 / `var()` 引用，内置 dark / light 双主题（逐字节对齐 pi 1.5.0），`/themes` 打开选择器（输入过滤、Enter 应用、✓ 标记当前主题）；自定义主题放 `~/.pi/agent/themes/*.json`，选择自动写入 settings.json 的 `theme` 字段并在下次启动时加载
+- **图片内联渲染**（pi 同款）：`read` 工具读取图片文件（PNG/GIF/WebP/JPEG）时，在 Kitty 图形协议终端（Ghostty / WezTerm / Kitty，自动按环境变量检测）内联渲染，宽度受 `image_width` 限制、按宽高比占多行；不支持协议的终端降级为 `[Image: image/png 1280x720]` 文本指示；`show_images` 开关（默认开）
 
 ## 快速开始
 

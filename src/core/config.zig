@@ -115,6 +115,12 @@ pub const Config = struct {
     /// settings.json "theme" (pi): the active theme name ("dark", "light", or a
     /// custom *.json stem). null = default dark. Owned; dup'd on load.
     theme_name: ?[]const u8 = null,
+    /// settings.json "showImages" (pi default true): render tool-result images
+    /// inline when the terminal speaks an image protocol.
+    show_images: bool = true,
+    /// settings.json "imageWidthCells" (pi default 60): preferred inline image
+    /// width in terminal cells.
+    image_width_cells: u32 = 60,
     /// settings.json "steeringMode" (pi default "one-at-a-time"): "all"
     /// delivers every queued steering message before the next LLM request,
     /// "one-at-a-time" delivers one per round.
@@ -465,6 +471,14 @@ pub const Config = struct {
             if (self.theme_name) |old| alloc.free(old);
             self.theme_name = alloc.dupe(u8, tn) catch null;
         }
+        // showImages (pi terminal.showImages, default true).
+        if (root.get("showImages")) |v| {
+            if (v == .bool) self.show_images = v.bool;
+        }
+        // imageWidthCells (pi terminal.imageWidthCells, default 60).
+        if (numIn(root, "imageWidthCells")) |n| {
+            if (n >= 1) self.image_width_cells = @intCast(n);
+        }
         // enabledModels: ["provider/id", "provider/*"] patterns.
         if (root.get("enabledModels")) |ev| {
             switch (ev) {
@@ -587,6 +601,8 @@ pub fn loadProjectSettings(self: *Config, alloc: std.mem.Allocator, io: std.Io, 
         if (self.default_model) |dm| try root.object.put(arena, "defaultModel", .{ .string = dm });
         if (self.default_thinking_level) |dtl| try root.object.put(arena, "defaultThinkingLevel", .{ .string = dtl.name() });
         if (self.theme_name) |tn| try root.object.put(arena, "theme", .{ .string = tn });
+        try root.object.put(arena, "showImages", .{ .bool = self.show_images });
+        try root.object.put(arena, "imageWidthCells", .{ .integer = @intCast(self.image_width_cells) });
         if (self.enabled_models) |pats| {
             var arr = std.json.Array.init(arena);
             for (pats) |pat| arr.append(.{ .string = pat }) catch {};
