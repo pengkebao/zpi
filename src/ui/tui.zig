@@ -410,7 +410,7 @@ pub const TUI = struct {
     /// One tool call of the transcript (from the agent's turn events). Owns
     /// its strings, allocated with the session allocator; the rendered block
     /// in `scrollback` can be rebuilt from it (Ctrl+O, result arrival).
-    const ToolEntry = struct {
+    pub const ToolEntry = struct {
         id: []u8,
         name: []u8,
         args: []u8,
@@ -456,7 +456,7 @@ pub const TUI = struct {
             return self.expanded orelse global;
         }
 
-        fn deinit(self: *ToolEntry, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ToolEntry, alloc: std.mem.Allocator) void {
             alloc.free(self.id);
             alloc.free(self.name);
             alloc.free(self.args);
@@ -736,6 +736,10 @@ pub const TUI = struct {
     kitty_ids: std.ArrayListUnmanaged(u32) = .empty,
     /// Monotonic counter for new Kitty placement ids (pi allocateImageId).
     kitty_image_next_id: u32 = 0,
+    /// Encoded geometry per live placement id (pi kittyImageMetadata
+    /// registry): cell rows + source pixel height, needed by cropKitty to map
+    /// a viewport crop onto source pixel rows. Owned.
+    kitty_meta: std.AutoHashMapUnmanaged(u32, image.Meta) = .empty,
     /// `/skill:name` invocations of the transcript (see SkillEntry).
     skill_invocations: std.ArrayListUnmanaged(SkillEntry) = .empty,
     /// Scrollback indices of thinking blocks, for Ctrl+T.
@@ -4688,6 +4692,8 @@ pub const TUI = struct {
         self.restoreTerminal();
         keys.restoreWinchHandler();
         self.watch_captured.deinit(self.alloc);
+        self.kitty_ids.deinit(self.alloc);
+        self.kitty_meta.deinit(self.alloc);
         for (self.slash_extras.items) |*e| {
             self.alloc.free(e.name);
             self.alloc.free(e.desc);
@@ -5064,6 +5070,11 @@ pub const TUI = struct {
             for (self.prev_lines.items) |l| self.alloc.free(l);
             self.prev_lines.clearRetainingCapacity();
             self.prev_transcript_h = 0;
+            // The hard clear wipes every placement from the screen (and the
+            // model forgets its rows); the registry goes with it (pi
+            // resetRenderState clears kittyImageMetadata with previousLines).
+            self.kitty_ids.clearRetainingCapacity();
+            self.kitty_meta.clearRetainingCapacity();
             _ = self.writeRaw("\x1b[2J");
         }
         _ = self.refreshSize();
@@ -6317,6 +6328,45 @@ pub const TUI = struct {
             const blank = self.alloc.dupe(u8, "") catch return;
             frame.append(self.alloc, blank) catch return;
         }
+        // pi paintBox (layout.js): when the scroll_top lands INSIDE an image
+        // block — the model row scrolled above the viewport while its spacer
+        // rows still reach into the window — the visible tail must be painted
+        // from the viewport top, or the image visibly vanishes the moment it
+        // starts scrolling away (the stale-placement delete already removed
+        // the floating layer). Crop the placement to its still-visible tail
+        // and put it on the first window row (payload kept, no re-send). The
+        // search is bounded by the tallest live placement (pi
+        // getMaxKittyImageRows).
+        var max_live_rows: u32 = 1;
+        var mit = self.kitty_meta.iterator();
+        while (mit.next()) |kv| max_live_rows = @max(max_live_rows, kv.value_ptr.rows);
+        if (start > 0 and start <= self.doc_lines.items.len) {
+            const min_doc = start -| @min(start, max_live_rows - 1);
+            var d = start;
+            while (d > min_doc) {
+                d -= 1;
+                const cand = self.doc_lines.items[d];
+                if (!image.isImageLine(cand) or image.isCropped(cand)) continue;
+                const hidden: u32 = @intCast(start - d);
+                if (hidden == 0) continue;
+                const r = image.rowsOf(cand) orelse 1;
+                if (hidden >= r) continue; // fully above the window
+                const pid = image.imageId(cand) orelse continue;
+                const meta = self.kitty_meta.get(pid) orelse continue;
+                // pi paintBox: visibleRows = min(viewport height, remaining
+                // placement rows) — the tail is clipped at both edges.
+                const visible: u32 = @min(@as(u32, @intCast(transcript_h)), r - hidden);
+                if (image.cropKitty(self.alloc, cand, meta, hidden, visible)) |cropped| {
+                    if (frame.items[0].len == 0) {
+                        self.alloc.free(frame.items[0]);
+                        frame.items[0] = cropped;
+                    } else {
+                        self.alloc.free(cropped);
+                    }
+                }
+                break;
+            }
+        }
     }
 
     /// Scrollbar glyph classes for the transcript screen rows.
@@ -6801,13 +6851,18 @@ pub const TUI = struct {
         return null;
     }
 
-    /// True when any frame row is an encoded Kitty image line (pi
-    /// collectKittyImageIds non-empty). Used to decide whether native scroll
-    /// is safe (it is not — placements don't scroll with the text).
-    fn frameHasImage(lines: []const []const u8, n: usize) bool {
+    /// True when a frame row is an encoded Kitty image line whose placement
+    /// still reserves visual rows below its model row (pi:
+    /// getKittyImageReservedRows > 1): those rows must not scroll natively —
+    /// the placement is a floating layer and would desync from its text. A
+    /// fully-cropped image reserves one row and paints as plain text.
+    pub fn frameHasImage(lines: []const []const u8, n: usize, viewport_h: usize) bool {
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            if (image.isImageLine(lines[i])) return true;
+            if (image.isImageLine(lines[i])) {
+                const r = image.rowsOf(lines[i]) orelse 1;
+                if (r > 1 and i + r <= viewport_h) return true;
+            }
         }
         return false;
     }
@@ -6948,6 +7003,7 @@ pub const TUI = struct {
                 var db: [64]u8 = undefined;
                 for (stale[0..stale_count]) |sid| {
                     frame_out.appendSlice(self.alloc, image.deleteKittyInto(&db, sid)) catch return;
+                    _ = self.kitty_meta.remove(sid);
                 }
             }
         }
@@ -6961,7 +7017,13 @@ pub const TUI = struct {
         // behind, misaligning them. When an image is in the frame, skip native
         // scroll and let the per-row CUP repaint reposition it (re-emitting the
         // sequence with the same placement id moves it; pi fullRenders here).
-        const has_image = frameHasImage(new_lines, n);
+        // Images whose rows fit below their frame row (post height-cap, or
+        // cropped to the viewport) reserve visual space and must not scroll:
+        // frameHasImage counts only those (a mostly-cropped image reserves
+        // one row and paints as plain text). The clip is the transcript
+        // viewport (pi paintBox clips to the ScrollView rect): placements
+        // never reach the chrome rows below it.
+        const has_image = frameHasImage(new_lines, n, th);
         if (th > 0 and th == self.prev_transcript_h and !has_image) {
             // The scroll_top movement between the previous painted frame and
             // this one; null after a forced full repaint (no prior frame).
@@ -7064,17 +7126,52 @@ pub const TUI = struct {
             // move back. The following spacer rows carry no content, so they
             // are skipped — clearing them could erase the placement.
             if (image.isImageLine(new_lines[row])) {
-                // `C=1` leaves the cursor on the image row after the sequence;
-                // the placement reserves the following r-1 rows. Move the
-                // cursor down to the last reserved row so the NEXT painted row
-                // can chain with `\r\n` (or reposition absolutely). Do NOT move
-                // back up: the spacer rows are skipped, not cleared (clearing
-                // them could erase the placement).
+                // pi layout paintBox: a placement reaching past the viewport
+                // bottom is CROPPED with y/h/r source-window params (payload
+                // kept verbatim, no re-transmission) so the floating layer
+                // never covers the editor below the transcript. A scroll may
+                // also leave the model row above the viewport while its
+                // spacer rows still reach into it — that case paints the
+                // cropped tail from the viewport top (buildTranscript), not
+                // here. Full-window (cropKitty null) paints the line as-is.
+                var painted_line: []const u8 = new_lines[row];
+                var crop_buf: ?[]u8 = null;
+                defer if (crop_buf) |cb| self.alloc.free(cb);
+                const r_total = image.rowsOf(painted_line) orelse 1;
+                if (image.imageId(painted_line)) |pid| {
+                    if (self.kitty_meta.get(pid)) |meta| {
+                        // Bottom clip: rows of the placement that fit between
+                        // this row and the transcript viewport's last row (pi
+                        // paintBox clips to the ScrollView rect — the
+                        // placement is a floating layer over the transcript;
+                        // rows past the viewport would cover the editor, the
+                        // bug this crop fixes).
+                        const fit: u32 = if (row < th)
+                            @intCast(@min(r_total, th - row))
+                        else
+                            0;
+                        if (fit == 0) {
+                            // Fully below the viewport: paint nothing (an
+                            // empty row); the crop machinery cannot express
+                            // "zero rows".
+                            self.paintRow(&frame_out, row, "", last_painted != null and last_painted.? + 1 == row);
+                            last_painted = row;
+                            continue;
+                        }
+                        if (!image.isCropped(painted_line)) {
+                            if (image.cropKitty(self.alloc, painted_line, meta, 0, fit)) |cropped| {
+                                crop_buf = cropped;
+                                painted_line = cropped;
+                            }
+                        }
+                    }
+                }
                 var mv: [16]u8 = undefined;
                 const ml = ansi.moveTo(&mv, @intCast(row + 1), 1);
                 frame_out.appendSlice(self.alloc, mv[0..ml]) catch return;
-                frame_out.appendSlice(self.alloc, new_lines[row]) catch return;
-                const r = image.rowsOf(new_lines[row]) orelse 1;
+                frame_out.appendSlice(self.alloc, ansi.CLEAR_EOL) catch return;
+                frame_out.appendSlice(self.alloc, painted_line) catch return;
+                const r = image.rowsOf(painted_line) orelse 1;
                 const last: usize = @min(n, row + r);
                 // Advance at most to the screen bottom (moving past it would
                 // scroll the whole screen and desync the model).
@@ -8093,7 +8190,7 @@ pub const TUI = struct {
     /// thus the capped cell width) changes; the placement id is stable so the
     /// placement moves in place rather than leaking. Takes ownership of the
     /// base64 bytes and mime.
-    fn buildImageForEntry(self: *TUI, e: *ToolEntry, b64: ?[]const u8, mime: ?[]const u8) void {
+    pub fn buildImageForEntry(self: *TUI, e: *ToolEntry, b64: ?[]const u8, mime: ?[]const u8) void {
         const data = b64 orelse return;
         const m = mime orelse "image/unknown";
         // Decode to read the pixel dimensions (the encoded sequence keeps the
@@ -8128,7 +8225,7 @@ pub const TUI = struct {
     /// keeps the same cap is a no-op. Re-issuing the same placement id moves
     /// the image in place. Falls back to the `[Image: mime WxH]` indicator when
     /// the terminal cannot render or `showImages` is off.
-    fn refreshImageEntry(self: *TUI, e: *ToolEntry) void {
+    pub fn refreshImageEntry(self: *TUI, e: *ToolEntry) void {
         const data = e.image_b64 orelse return;
         const m = e.image_mime orelse "image/unknown";
         const dims = e.image_dims;
@@ -8137,11 +8234,13 @@ pub const TUI = struct {
         const render_inline = self.image_caps.images == .kitty and show;
         if (render_inline) {
             if (dims) |d| {
-                // pi: maxWidth = max(1, min(width - 2, maxWidthCells)).
+                // pi: maxWidth = max(1, min(width - 2, maxWidthCells));
+                // maxHeight = options.maxHeightCells ?? ceil(maxWidth*9/18).
                 const term_cap: u32 = if (self.width > 2) @as(u32, self.width - 2) else 1;
                 const cap = @max(1, @min(term_cap, max_w));
+                const max_h = image.defaultMaxHeight(cap);
                 if (e.image_line != null and e.image_line_width == cap) return; // unchanged
-                const size = image.cellSize(d, cap, true);
+                const size = image.cellSize(d, cap, max_h, true);
                 // Allocate the id once and keep it: re-issuing the same id
                 // moves the placement in place, a new id would leak the old.
                 const id = e.image_id orelse blk: {
@@ -8150,6 +8249,14 @@ pub const TUI = struct {
                     break :blk nid;
                 };
                 const seq = image.encodeKitty(self.session.alloc, data, id, size.columns, size.rows) catch return;
+                // Register the placement geometry (pi registerKittyImageMetadata)
+                // so viewport crops can map cell rows onto source pixel rows.
+                self.kitty_meta.put(self.alloc, id, .{
+                    .columns = size.columns,
+                    .rows = size.rows,
+                    .width_px = d.w,
+                    .height_px = d.h,
+                }) catch {};
                 if (e.image_line) |old| self.session.alloc.free(old);
                 e.image_line = seq;
                 e.image_line_width = cap;

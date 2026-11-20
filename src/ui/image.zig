@@ -142,34 +142,68 @@ fn webpDims(raw: []const u8) ?Dims {
     return null;
 }
 
+/// pi Image.render defaultMaxHeight: without an explicit per-image limit the
+/// height is capped at the width-equivalent in cells (a square image never
+/// exceeds maxWidth rows; at the 9x18 default cell that is maxWidth/2).
+pub fn defaultMaxHeight(max_width_cells: u32) u32 {
+    const cell_w: f64 = 9;
+    const cell_h: f64 = 18;
+    const maxw = @as(f64, @floatFromInt(@max(1, max_width_cells)));
+    return @max(1, @as(u32, @intFromFloat(@ceil((maxw * cell_w) / cell_h))));
+}
+
 /// Cell size for an image (pi calculateImageCellSize with the aspect-ratio
-/// correction for kitty). `max_width_cells` caps the width; the height is
-/// derived from the aspect ratio at the default 9x18 cell (pi's default
-/// cellDimensions).
-pub fn cellSize(dims: Dims, max_width_cells: u32, is_kitty: bool) struct { columns: u32, rows: u32 } {
+/// correction for kitty). `max_width_cells` caps the width; `max_height_cells`
+/// (pi maxHeightCells, null = unbounded) caps the height — the scale is the
+/// min of both axes so tall images shrink to fit instead of overflowing the
+/// viewport. The height derives from the aspect ratio at the default 9x18
+/// cell (pi's default cellDimensions).
+pub fn cellSize(dims: Dims, max_width_cells: u32, max_height_cells: ?u32, is_kitty: bool) struct { columns: u32, rows: u32 } {
     const cell_w: f64 = 9;
     const cell_h: f64 = 18;
     const iw = @as(f64, @floatFromInt(@max(1, dims.w)));
     const ih = @as(f64, @floatFromInt(@max(1, dims.h)));
     const maxw = @as(f64, @floatFromInt(@max(1, max_width_cells)));
     const width_scale = (maxw * cell_w) / iw;
-    const scaled_h = ih * width_scale;
-    const cw: u32 = @intFromFloat(@ceil((iw * width_scale) / cell_w));
+    // pi: heightScale defaults to widthScale when no height limit is given
+    // (the scale is then width-driven only); rows are clamped to maxHeight.
+    const maxh_f: ?f64 = if (max_height_cells) |mh| @as(f64, @floatFromInt(@max(1, mh))) else null;
+    const height_scale: f64 = if (maxh_f) |mh| (mh * cell_h) / ih else width_scale;
+    const scale = @min(width_scale, height_scale);
+    const scaled_w = iw * scale;
+    const scaled_h = ih * scale;
+    const cw: u32 = @intFromFloat(@ceil(scaled_w / cell_w));
     var columns = @min(@as(u32, max_width_cells), cw);
     columns = @max(1, columns);
     var rows: u32 = @max(1, @as(u32, @intFromFloat(@ceil(scaled_h / cell_h))));
+    if (maxh_f) |mh| {
+        const mh_u: u32 = @as(u32, @intFromFloat(mh));
+        rows = @min(mh_u, rows);
+    }
     if (is_kitty) {
         // pi chooseLessDistortedCellCount: the cell count nearest the ideal
-        // aspect ratio.
-        const ideal = (@as(f64, @floatFromInt(columns)) * cell_w * ih) / (iw * cell_h);
+        // aspect ratio. With both axes capped the ideal count stays within
+        // the caps (pi guarantees this algebraically; see image.js).
+        const ideal_w = (@as(f64, @floatFromInt(columns)) * cell_w * ih) / (iw * cell_h);
+        const ideal_h = (@as(f64, @floatFromInt(rows)) * cell_h * iw) / (ih * cell_w);
+        const ideal = if (width_scale <= height_scale) ideal_w else ideal_h;
         const lo_i: u32 = @max(1, @as(u32, @intFromFloat(@floor(ideal))));
         const hi_i: u32 = lo_i + 1;
         const lo: f64 = @floatFromInt(lo_i);
         const hi: f64 = @floatFromInt(hi_i);
         const dlo = if (ideal >= lo) ideal - lo else lo - ideal;
         const dhi = if (ideal >= hi) ideal - hi else hi - ideal;
-        rows = if (dlo <= dhi) lo_i else hi_i;
-        rows = @max(1, rows);
+        var nearest = if (dlo <= dhi) lo_i else hi_i;
+        nearest = @max(1, nearest);
+        // Re-clamp both axes after the distortion pick (pi does not need
+        // this — its ideal counts are provably inside the caps — but the
+        // float ceil here is not, so clamp defensively).
+        if (maxh_f) |mh| {
+            const mh_u: u32 = @as(u32, @intFromFloat(mh));
+            nearest = @min(mh_u, nearest);
+        }
+        nearest = @min(@as(u32, max_width_cells), nearest);
+        rows = nearest;
     }
     return .{ .columns = columns, .rows = rows };
 }
@@ -212,11 +246,73 @@ pub fn encodeKitty(alloc: std.mem.Allocator, b64: []const u8, image_id: u32, col
     return out.toOwnedSlice(alloc);
 }
 
+/// Per-image geometry registered at encode time (pi
+/// registerKittyImageMetadata): cropKitty needs the source pixel height to
+/// map cropped cell rows back onto source rows.
+pub const Meta = struct { columns: u32, rows: u32, width_px: u32, height_px: u32 };
+
+/// Crop an encoded Kitty line to the cell rows `[hidden, hidden+visible)` of
+/// its placement (pi cropKittyImageLine): the first chunk's header loses its
+/// `y`/`h`/`r` params and gains `y=<sourceY> h=<sourceHeight> r=<cropped>`;
+/// the base64 payload (including any `m=1` continuation chunks) is kept
+/// verbatim, so no image data is re-transmitted. Returns null when the line
+/// is not a Kitty image, the metadata is missing, the window is empty, or
+/// the crop would cover the whole placement (the caller then uses the line
+/// as-is). Caller owns the returned slice.
+pub fn cropKitty(alloc: std.mem.Allocator, line: []const u8, meta: Meta, hidden_rows: u32, visible_rows: u32) ?[]u8 {
+    if (!isImageLine(line)) return null;
+    if (hidden_rows >= meta.rows or visible_rows == 0) return null;
+    const cropped_rows = @min(visible_rows, meta.rows - hidden_rows);
+    if (hidden_rows == 0 and cropped_rows >= meta.rows) return null;
+    // First chunk header: from ESC _ G up to (excluding) the first ';'.
+    const esc_g = mem.indexOf(u8, line, "\x1b_G") orelse return null;
+    const params_start = esc_g + 2;
+    const params_end = mem.indexOfScalarPos(u8, line, params_start, ';') orelse return null;
+    const source_y: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(meta.height_px * hidden_rows)) / @as(f64, @floatFromInt(meta.rows))));
+    const source_end_f = @ceil(@as(f64, @floatFromInt(meta.height_px * (hidden_rows + cropped_rows))) / @as(f64, @floatFromInt(meta.rows)));
+    const source_end = @min(@as(f64, @floatFromInt(meta.height_px)), source_end_f);
+    const source_y_f = @as(f64, @floatFromInt(source_y));
+    const source_h: u32 = @intFromFloat(@max(1, source_end - source_y_f));
+    // Rebuild the header without y/h/r, then append the crop params.
+    var header: std.ArrayListUnmanaged(u8) = .empty;
+    defer header.deinit(alloc);
+    var it = mem.splitScalar(u8, line[params_start..params_end], ',');
+    var first = true;
+    while (it.next()) |kv| {
+        if (kv.len >= 2 and (kv[0] == 'y' or kv[0] == 'h' or kv[0] == 'r') and kv[1] == '=') continue;
+        if (!first) header.append(alloc, ',') catch return null;
+        header.appendSlice(alloc, kv) catch return null;
+        first = false;
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    out.appendSlice(alloc, line[0..params_start]) catch return null;
+    out.appendSlice(alloc, header.items) catch return null;
+    const crop_params = std.fmt.allocPrint(alloc, ",y={d},h={d},r={d}", .{ source_y, source_h, cropped_rows }) catch return null;
+    defer alloc.free(crop_params);
+    out.appendSlice(alloc, crop_params) catch return null;
+    out.appendSlice(alloc, line[params_end..]) catch return null;
+    return out.toOwnedSlice(alloc) catch null;
+}
+
 /// Format a delete-by-id sequence into `buf` (pi deleteKittyImage: frees the
 /// placement and its image data); returns the used prefix.
 pub fn deleteKittyInto(buf: []u8, image_id: u32) []const u8 {
     const s = std.fmt.bufPrint(buf, "\x1b_Ga=d,d=I,i={d},q=2\x1b\\", .{image_id}) catch return "";
     return s;
+}
+
+/// True when the line is already a viewport crop (a `y=` param in the first
+/// chunk's header — see cropKitty). Re-cropping a cropped line would restart
+/// its source window from row 0; callers paint those as-is.
+pub fn isCropped(line: []const u8) bool {
+    if (!isImageLine(line)) return false;
+    const params_end = mem.indexOfScalar(u8, line, ';') orelse return false;
+    var it = mem.splitScalar(u8, line[2..params_end], ',');
+    while (it.next()) |kv| {
+        if (kv.len >= 2 and kv[0] == 'y' and kv[1] == '=') return true;
+    }
+    return false;
 }
 
 /// Extract the placement id from an encoded Kitty line (the `i=<n>` param in
@@ -378,4 +474,42 @@ test "deleteKittyInto" {
     var buf: [48]u8 = undefined;
     const s = deleteKittyInto(&buf, 42);
     try std.testing.expectEqualStrings("\x1b_Ga=d,d=I,i=42,q=2\x1b\\", s);
+}
+
+test "defaultMaxHeight caps square image height" {
+    // pi Image.render: defaultMaxHeight = ceil(maxWidth*9/18) = ceil(60/2).
+    try std.testing.expectEqual(@as(u32, 30), defaultMaxHeight(60));
+    try std.testing.expectEqual(@as(u32, 1), defaultMaxHeight(1));
+}
+
+test "cellSize caps tall image height at maxHeight" {
+    // 1000x800 at cap 60 without a height limit: width-driven scale
+    // (540x432 px) -> 60 cols x 24 rows.
+    const wide = cellSize(.{ .w = 1000, .h = 800 }, 60, null, true);
+    try std.testing.expectEqual(@as(u32, 60), wide.columns);
+    try std.testing.expectEqual(@as(u32, 24), wide.rows);
+    // A 1000x2000 portrait image would be 60 rows uncapped; pi's default
+    // height cap (30 rows) shrinks both axes to 30x30, aspect kept.
+    const tall_none = cellSize(.{ .w = 1000, .h = 2000 }, 60, null, true);
+    try std.testing.expectEqual(@as(u32, 60), tall_none.rows);
+    const tall_capped = cellSize(.{ .w = 1000, .h = 2000 }, 60, 30, true);
+    try std.testing.expectEqual(@as(u32, 30), tall_capped.rows);
+    try std.testing.expectEqual(@as(u32, 30), tall_capped.columns);
+}
+
+test "cropKitty rewrites header and keeps payload" {
+    const alloc = std.heap.page_allocator;
+    const seq = try encodeKitty(alloc, "QUJD", 7, 10, 6);
+    defer alloc.free(seq);
+    // Hidden top row, keep 3 of the remaining 5 rows.
+    const cropped = cropKitty(alloc, seq, .{ .columns = 10, .rows = 6, .width_px = 100, .height_px = 60 }, 1, 3) orelse return error.NoCrop;
+    defer alloc.free(cropped);
+    // Header keeps a/c/r? -> original params (C=1,c=10,r=6,i=7) minus y/h/r,
+    // plus the crop window; payload QUJD and terminator intact.
+    try std.testing.expect(mem.startsWith(u8, cropped, "\x1b_Ga=T,f=100,q=2,C=1,c=10,i=7,y="));
+    try std.testing.expect(mem.indexOf(u8, cropped, ";QUJD\x1b\\") != null);
+    // The placement id survives (the delete/replace machinery keys on it).
+    try std.testing.expectEqual(@as(u32, 7), imageId(cropped) orelse 0);
+    // Full window is a no-op (the caller paints the line as-is).
+    try std.testing.expectEqual(@as(?[]u8, null), cropKitty(alloc, seq, .{ .columns = 10, .rows = 6, .width_px = 100, .height_px = 60 }, 0, 6));
 }

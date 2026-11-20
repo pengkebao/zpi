@@ -1868,3 +1868,84 @@ test "image: resize re-encodes the placement (stable id, width-capped)" {
     try std.testing.expect(e.image_rows >= rows1);
     try std.testing.expect(e.image_rows <= rows0);
 }
+
+// A 1000x2000 PNG header-only base64 (IHDR w=1000 h=2000) — taller than
+// any terminal viewport: pi's default height cap must shrink it (the old
+// unbounded encoding produced 60-row placements that covered the editor).
+const TALL_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAA+gAAAfQCAIAAAAAAAAA";
+
+test "image: tall image height-capped at pi defaultMaxHeight (meta registered)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    t.image_caps = .{ .images = .kitty };
+    t.width = 80;
+    t.height = 24;
+    t.transcript_h = 20;
+
+    // A 1000x2000 portrait PNG: uncapped it would encode 60 rows (taller
+    // than most terminals); pi's default height cap ceil(60*9/18)=30 rows
+    // shrinks both axes to 30x30, keeping the aspect ratio.
+    t.addPendingTool(.{
+        .id = try alloc.dupe(u8, "tall"),
+        .name = try alloc.dupe(u8, "read"),
+        .arguments = try alloc.dupe(u8, "{\"path\":\"tall.png\"}"),
+    });
+    t.finishTool(.{
+        .id = try alloc.dupe(u8, "tall"),
+        .content = try alloc.dupe(u8, "Read image file [image/png]"),
+        .is_error = false,
+        .duration_ms = 10,
+        .image_data = try alloc.dupe(u8, TALL_PNG_B64),
+        .image_mime = try alloc.dupe(u8, "image/png"),
+    });
+    const e = &t.tool_calls.items[0];
+    try std.testing.expectEqual(@as(u32, 30), e.image_rows);
+    try std.testing.expectEqual(@as(u32, 30), image.rowsOf(e.image_line.?) orelse 0);
+    // Geometry registered (pi kittyImageMetadata) — the crop machinery keys
+    // off it to map viewport crops onto source pixel rows.
+    const meta = t.kitty_meta.get(e.image_id.?);
+    try std.testing.expect(meta != null);
+    try std.testing.expectEqual(@as(u32, 2000), meta.?.height_px);
+
+    // Scrolling 10 rows past the model row crops the visible tail to 20
+    // rows (pi paintBox top-edge crop): header rewritten, payload kept,
+    // placement id stable — the image no longer vanishes when it scrolls.
+    const cropped = image.cropKitty(alloc, e.image_line.?, meta.?, 10, 20) orelse return error.NoCrop;
+    defer alloc.free(cropped);
+    try std.testing.expect(image.isCropped(cropped));
+    try std.testing.expectEqual(e.image_id.?, image.imageId(cropped) orelse 0);
+    try std.testing.expectEqual(@as(u32, 20), image.rowsOf(cropped) orelse 0);
+    // A fully-cropped placement reserves one row: the scroller treats it as
+    // plain text again (native DECSTBM scroll stays safe).
+    const one = image.cropKitty(alloc, e.image_line.?, meta.?, 0, 1) orelse return error.NoCrop;
+    defer alloc.free(one);
+    try std.testing.expect(!tui.TUI.frameHasImage(&[_][]const u8{one}, 1, 20));
+}
+
+test "frameHasImage: only view-fitting placements block native scroll" {
+    // An image whose rows fit below its frame row reserves visual space:
+    // native DECSTBM scroll would desync the floating placement.
+    const fit = [_][]const u8{ "", "", "", "", "", "\x1b_Ga=T,f=100,q=2,C=1,c=10,r=10,i=1;x\x1b\\" };
+    try std.testing.expect(tui.TUI.frameHasImage(&fit, fit.len, 20));
+    // r=30 at row 5 does not fit a 20-row viewport: paint crops it to fit,
+    // and the frame the diff sees carries the cropped header — the raw
+    // oversized line never reserves (this shape cannot reach the scroller).
+    const overflow = [_][]const u8{ "", "", "", "", "", "\x1b_Ga=T,f=100,q=2,C=1,c=10,r=30,i=1;x\x1b\\" };
+    try std.testing.expect(!tui.TUI.frameHasImage(&overflow, overflow.len, 20));
+    // A fully-cropped image reserves one row: plain text for the scroller.
+    const cropped = [_][]const u8{"\x1b_Ga=T,f=100,q=2,C=1,c=10,y=18,h=18,r=1,i=1;x\x1b\\"};
+    try std.testing.expect(!tui.TUI.frameHasImage(&cropped, cropped.len, 20));
+}
