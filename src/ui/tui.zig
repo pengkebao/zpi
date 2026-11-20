@@ -9507,17 +9507,30 @@ pub const TUI = struct {
                 end = ce;
             }
             var brk: usize = 0;
+            var next: usize = 0;
             if (end < text.len and text[end] == '\n') {
-                brk = end + 1; // consume the newline
+                brk = end; // the row EXCLUDES the newline — a frame row must
+                // never carry a literal \n (the diff writer treats each row
+                // as one screen row; an embedded newline paints two and
+                // shifts every row below, desyncing the diff model).
+                next = end + 1; // consume the newline
             } else if (end < text.len and last_space != null and last_space.? > start) {
                 brk = last_space.? + 1;
+                next = brk;
             } else {
                 brk = end;
+                next = end;
             }
-            if (brk <= start) brk = wmod.nextCharEnd(text, start);
+            if (next <= start) {
+                // Hard break: the first character alone exceeds the width;
+                // force one character so the loop always makes progress.
+                const ce = wmod.nextCharEnd(text, start);
+                brk = ce;
+                next = ce;
+            }
             const row = alloc.dupe(u8, text[start..brk]) catch return error.OutOfMemory;
             out.append(alloc, row) catch return error.OutOfMemory;
-            start = brk;
+            start = next;
         }
         if (out.items.len == 0) {
             out.append(alloc, try alloc.dupe(u8, "")) catch return error.OutOfMemory;

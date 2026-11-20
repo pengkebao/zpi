@@ -1566,3 +1566,56 @@ fn expectFrameFits(t: *tui.TUI, w: u16) !void {
     // The frame invariant: exactly one screen worth of rows.
     if (t.prev_lines.items.len > t.height) return error.FrameTooTall;
 }
+
+test "queued multi-line message: frame rows never carry an embedded newline" {
+    // Regression: a multi-line steering/follow-up message queued while the
+    // agent works rendered as pending rows whose strings carried a literal
+    // trailing \n (wrapPlain consumed the newline INTO the row). The diff
+    // writer treats each frame row as ONE screen row, so an embedded newline
+    // painted two screen rows and shifted every row below — the model
+    // desynced (squeezed borders / stranded stale rows). Single-line messages
+    // have no \n and were unaffected, which is why only multi-line queued
+    // input reproduced it.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+    t.width = 80;
+    t.height = 24;
+    t.working = true;
+    t.addMessage("assistant working on something\n\nmore output here");
+
+    // Single-line queue (never reproduced the bug).
+    session.queueSteering("single line task");
+    t.addUserMessage("single line task");
+    t.redraw();
+    for (t.prev_lines.items) |l| try expectNoEmbeddedNewline(l);
+
+    // Multi-line queue: each line becomes its own frame row, NONE carrying a
+    // literal newline, and the frame still fills the terminal exactly.
+    const multi = "first line of the task\nsecond line of the task\nthird line is quite long enough to wrap around the width of the terminal box";
+    session.queueSteering(multi);
+    t.addUserMessage(multi);
+    t.redraw();
+    try std.testing.expectEqual(t.height, t.prev_lines.items.len);
+    for (t.prev_lines.items) |l| try expectNoEmbeddedNewline(l);
+}
+
+fn expectNoEmbeddedNewline(s: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, s, '\n')) |p| {
+        std.debug.print("frame row carries an embedded newline at {d}: {s}\n", .{ p, s });
+        return error.EmbeddedNewline;
+    }
+}
