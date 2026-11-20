@@ -148,28 +148,12 @@ fn SCROLLBAR_THUMB_SOLID() []const u8 {
     @memcpy(buf[c.len+g.len .. c.len+g.len+r.len], r);
     return buf[0 .. c.len+g.len+r.len];
 }
-/// Runtime string concat helpers (`++` is comptime-only; these use a stack
-/// buffer and are valid for the enclosing scope).
-fn j2(a: []const u8, b: []const u8) []const u8 {
-    var buf: [512]u8 = undefined;
-    if (a.len + b.len > buf.len) return a;
-    @memcpy(buf[0..a.len], a);
-    @memcpy(buf[a.len .. a.len + b.len], b);
-    return buf[0 .. a.len + b.len];
-}
-
-fn j3(a: []const u8, b: []const u8, c: []const u8) []const u8 {
-    var buf: [512]u8 = undefined;
-    if (a.len + b.len + c.len > buf.len) return a;
-    @memcpy(buf[0..a.len], a);
-    @memcpy(buf[a.len .. a.len + b.len], b);
-    @memcpy(buf[a.len + b.len .. a.len + b.len + c.len], c);
-    return buf[0 .. a.len + b.len + c.len];
-}
-
-/// Concatenate up to 4 runtime pieces into an owned heap []u8 (for lines that
-/// must survive the caller's scope). `allocPrint` needs a comptime format
-/// string, so runtime-colored lines are built by hand instead.
+/// Concatenate runtime pieces into an owned heap []u8 (for lines that must
+/// survive the caller's scope). `allocPrint` needs a comptime format string,
+/// so runtime-colored lines are built by hand instead.
+/// NOTE: never build these with a stack-buffer helper returning a slice into
+/// its own frame — the slice dangles at the call and the bytes get overwritten
+/// by the next function's locals (the 2026-12 jump-hint mojibake heisenbug).
 fn concatOwned(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
     var total: usize = 0;
     for (parts) |p| total += p.len;
@@ -5216,7 +5200,11 @@ pub const TUI = struct {
             const label_w: usize = wmod.visualWidth(label);
             if (label_w > 0 and label_w < hint_max) {
                 const col = (hint_max - label_w) / 2;
-                const styled = printOwned(self.alloc, j2(SELECTED_BG(), USER_FG()), "{s}", .{label}, ansi.RESET) catch null;
+                const hint_prefix = concatOwned(self.alloc, &.{ SELECTED_BG(), USER_FG() }) catch null;
+                const styled: ?[]u8 = if (hint_prefix) |hp| blk: {
+                    defer self.alloc.free(hp);
+                    break :blk printOwned(self.alloc, hp, "{s}", .{label}, ansi.RESET) catch null;
+                } else null;
                 if (styled) |top| {
                     defer self.alloc.free(top);
                     if (overlay.overlay(self.alloc, frame.items[transcript_h - 1], top, label_w, col)) |composited| {
@@ -7625,7 +7613,12 @@ pub const TUI = struct {
 
     fn renderThinkingSegmentStrip(self: *TUI, trimmed: []const u8, prev_kind: *?markdown.BlockKind, strip: bool) ![][]u8 {
         const inner = if (self.width > 2) self.width - 2 else 1;
-        const base = j2(THINKING_TEXT(), "\x1b[3m");
+        // concatOwned, NOT j2: j2 returns a slice into its own stack
+        // buffer, which dies at the call — renderSegment keeps `base` for
+        // the whole markdown pass and read the overwritten bytes (the
+        // content-area mojibake).
+        const base = concatOwned(self.alloc, &.{ THINKING_TEXT(), "\x1b[3m" }) catch return error.OutOfMemory;
+        defer self.alloc.free(base);
         const rendered = try markdown.renderSegment(self.alloc, trimmed, inner, .{ .base_style = base }, prev_kind, strip);
         defer markdown.freeLines(self.alloc, rendered);
         var out: std.ArrayListUnmanaged([]u8) = .empty;
@@ -11372,7 +11365,11 @@ pub const TUI = struct {
                     self.alloc.free(text_to_send);
                     if (self.session.isAborted()) {
                         agent.clearAbort();
-                        self.addMessage(j3(FG_ERROR(), "Operation aborted", "\x1b[0m"));
+                        const aborted_msg = concatOwned(self.alloc, &.{ FG_ERROR(), "Operation aborted", "\x1b[0m" }) catch null;
+                        if (aborted_msg) |m| {
+                            defer self.alloc.free(m);
+                            self.addMessage(m);
+                        } else self.addMessage("Operation aborted");
                     }
                 }
             }

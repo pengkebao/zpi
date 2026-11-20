@@ -237,17 +237,11 @@ pub fn overlay(
     var cur: usize = 0; // current visual column
     var after_started = false;
     var i: usize = 0;
-    // Track the SGR state that should be active at the overlay start
-    var overlay_start_state = SgrState{};
     while (i < base.len) {
         if (base[i] == 0x1b) {
             const seq_end = escapeEnd(base, i);
             const seq = base[i..seq_end];
             state.apply(seq);
-            // Save the state at the overlay start position
-            if (cur == col) {
-                overlay_start_state = state;
-            }
             if (cur < col) {
                 try pending.appendSlice(alloc, seq);
             } else if (cur >= after_start and after_started) {
@@ -278,14 +272,9 @@ pub fn overlay(
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, before.items);
     if (before_w < col) try out.appendNTimes(alloc, ' ', col - before_w);
-    
-    // Apply the state that was active at the overlay start
-    try overlay_start_state.writeActive(&out, alloc);
-    try out.appendSlice(alloc, top);
-    
-    // Reset to default and apply the state that was active after the overlay
     try out.appendSlice(alloc, RESET);
-    try state.writeActive(&out, alloc);
+    try out.appendSlice(alloc, top);
+    try out.appendSlice(alloc, RESET);
     try out.appendSlice(alloc, after.items);
     return out.toOwnedSlice(alloc);
 }
