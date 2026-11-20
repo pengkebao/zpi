@@ -109,44 +109,19 @@ fn FG_ERROR() []const u8 {
     return theme.fgStr(.@"error");
 }
 // Scrollbar (pi dark theme tokens).
-fn SCROLLBAR_TRACK_FG() []const u8 {
-    return theme.fgStr(.scrollbarTrack);
-}
-fn SCROLLBAR_THUMB_FG() []const u8 {
-    return theme.fgStr(.scrollbarThumb);
-}
-fn SCROLLBAR_TRACK() []const u8 {
-    var buf: [80]u8 = undefined;
-    const c = theme.fgStr(.scrollbarTrack);
-    const g = "\u{2502}";
-    const r = ansi.RESET;
-    if (c.len + g.len + r.len > buf.len) return c;
-    @memcpy(buf[0..c.len], c);
-    @memcpy(buf[c.len .. c.len+g.len], g);
-    @memcpy(buf[c.len+g.len .. c.len+g.len+r.len], r);
-    return buf[0 .. c.len+g.len+r.len];
-}
-fn SCROLLBAR_THUMB() []const u8 {
-    var buf: [80]u8 = undefined;
-    const c = theme.fgStr(.scrollbarThumb);
-    const g = "\u{2503}";
-    const r = ansi.RESET;
-    if (c.len + g.len + r.len > buf.len) return c;
-    @memcpy(buf[0..c.len], c);
-    @memcpy(buf[c.len .. c.len+g.len], g);
-    @memcpy(buf[c.len+g.len .. c.len+g.len+r.len], r);
-    return buf[0 .. c.len+g.len+r.len];
-}
-fn SCROLLBAR_THUMB_SOLID() []const u8 {
-    var buf: [80]u8 = undefined;
-    const c = theme.fgStr(.scrollbarThumb);
-    const g = "\u{2588}";
-    const r = ansi.RESET;
-    if (c.len + g.len + r.len > buf.len) return c;
-    @memcpy(buf[0..c.len], c);
-    @memcpy(buf[c.len .. c.len+g.len], g);
-    @memcpy(buf[c.len+g.len .. c.len+g.len+r.len], r);
-    return buf[0 .. c.len+g.len+r.len];
+/// Build a scrollbar glyph (colored symbol + reset) into `buf`; returns a
+/// prefix slice of `buf`. The CALLER's frame owns the bytes: a helper that
+/// returns a slice into its own stack buffer dangles at the call, and the
+/// next function's locals overwrite the bytes before they are read — that
+/// was the scrollbar mojibake ("8;2;167;152;21" literal SGR debris painted
+/// over content cells, same class as the deleted j2/j3).
+fn scrollbarGlyphInto(buf: []u8, fg: []const u8, sym: []const u8) []const u8 {
+    const need = fg.len + sym.len + ansi.RESET.len;
+    if (need > buf.len) return sym;
+    @memcpy(buf[0..fg.len], fg);
+    @memcpy(buf[fg.len .. fg.len + sym.len], sym);
+    @memcpy(buf[fg.len + sym.len ..][0..ansi.RESET.len], ansi.RESET);
+    return buf[0..need];
 }
 /// Concatenate runtime pieces into an owned heap []u8 (for lines that must
 /// survive the caller's scope). `allocPrint` needs a comptime format string,
@@ -6323,12 +6298,15 @@ pub const TUI = struct {
                 continue;
             }
             self.scroll_glyphs[row] = target;
+            // Glyph bytes live in THIS frame (paintScrollbarLocked); the
+            // deeper cellReplacement call cannot overwrite them.
+            var gbuf: [80]u8 = undefined;
             const glyph: []const u8 = if (target == GLYPH_THUMB_SOLID)
-                SCROLLBAR_THUMB_SOLID()
+                scrollbarGlyphInto(&gbuf, theme.fgStr(.scrollbarThumb), "\u{2588}")
             else if (target == GLYPH_THUMB)
-                SCROLLBAR_THUMB()
+                scrollbarGlyphInto(&gbuf, theme.fgStr(.scrollbarThumb), "\u{2503}")
             else
-                SCROLLBAR_TRACK();
+                scrollbarGlyphInto(&gbuf, theme.fgStr(.scrollbarTrack), "\u{2502}");
             // In auto mode the TRACK preserves the content cell's background
             // (pi), the THUMB is the position indicator and paints over any
             // block background.
