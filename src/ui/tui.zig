@@ -1321,10 +1321,26 @@ pub const TUI = struct {
         };
     }
 
+    /// Total items the current menu shows over ALL pages: for window-
+    /// projected pickers that is the full filtered list (sel_len); for
+    /// editor-completion menus it is menu_len itself. Drives the viewport
+    /// math, the "(n/m)" indicator visibility and its denominator.
+    fn menuTotal(self: *const TUI) usize {
+        const projected = self.menu_mode == .sessions or self.menu_mode == .tree or
+            self.menu_mode == .forksel or self.menu_mode == .trust or
+            self.menu_mode == .mcp or self.menu_mode == .mcp_server or
+            self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure;
+        return if (projected) self.sel_len else self.menu_len;
+    }
+
     /// Keep the menu viewport window such that menu_selected stays visible
-    /// (pi SelectList.getVisibleRange: centered on the selection).
+    /// (pi SelectList.getVisibleRange: centered on the selection). The
+    /// TOTAL must be the full list for window-projected pickers (their
+    /// menu_len is the projected ≤64-row window — clamping against it made
+    /// the viewport unable to scroll past the projection, freezing the
+    /// /resume picker at 64 entries).
     fn updateMenuViewport(self: *TUI, menu_h: usize) void {
-        const total = if (self.menu_len > 0) self.menu_len else 1;
+        const total = if (self.menuTotal() > 0) self.menuTotal() else 1;
         if (menu_h >= total) {
             self.menu_view_start = 0;
             return;
@@ -2727,7 +2743,8 @@ pub const TUI = struct {
     }
 
     /// Clamp the viewport so menu_selected stays visible, then re-project.
-    fn scrollSelMenu(self: *TUI) void {
+    /// Public: the picker pagination regression test drives it directly.
+    pub fn scrollSelMenu(self: *TUI) void {
         const menu_h: usize = self.menuMaxVisible();
         self.updateMenuViewport(menu_h);
         self.refreshSelMenu();
@@ -5184,8 +5201,10 @@ pub const TUI = struct {
         // (pi SelectList.render appends it after the items) and must be part
         // of the bottom budget — without it the frame is one row taller than
         // the terminal, which scrolls the screen by one line on every menu
-        // frame and leaves stale rows behind.
-        const count_line: usize = if (menu_h > 0 and self.menu_len > menu_h) 1 else 0;
+        // frame and leaves stale rows behind. Visibility uses the FULL list
+        // total (menuTotal): a projected picker whose window happens to fit
+        // the height still needs the indicator row when the list pages.
+        const count_line: usize = if (menu_h > 0 and self.menuTotal() > menu_h) 1 else 0;
         // Trust prompt panel: title + cwd + saved/current lines above the
         // list and a key-hint footer below (pi TrustSelectorComponent frame).
         const trust_head: usize = if (self.menu_mode == .trust) 4 else 0;
@@ -5577,11 +5596,11 @@ pub const TUI = struct {
                 self.alloc.free(ml_raw);
                 frame.append(self.alloc, ml) catch return;
             }
-            if (self.menu_len > menu_h) {
+            if (self.menuTotal() > menu_h) {
                 // pi SelectList indicator: (selected, TOTAL) — the total is
                 // the full filtered list (sel_len), not the projected
                 // window (menu_len) the old denominator used.
-                const total: usize = if (self.menu_mode == .sessions or self.menu_mode == .tree or self.menu_mode == .forksel or self.menu_mode == .trust) self.sel_len else self.menu_len;
+                const total = self.menuTotal();
                 const indicator = printOwned(self.alloc, FG_MUTED(), "  ({d}/{d})", .{ self.menu_selected + 1, total }, ansi.RESET) catch return;
                 frame.append(self.alloc, indicator) catch return;
             }
@@ -10157,12 +10176,16 @@ pub const TUI = struct {
     }
 
     fn parseCmd(cmd: []const u8) struct { word: []const u8, arg: []const u8 } {
-        const trimmed = std.mem.trim(u8, cmd, " \t");
+        // pi trims all whitespace before parsing: pasted command text often
+        // carries a trailing \n (or \r\n from CRLF sources), and without
+        // trimming it the word never matches any command — "/settings\n"
+        // used to fall through and get SENT TO THE MODEL as a message.
+        const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
         if (trimmed.len == 0) return .{ .word = "", .arg = "" };
         // word = first token; arg = the REST (multi-word args like
         // "/login <provider> <key>" or "/name my session" stay intact).
         const split_at = std.mem.indexOfScalar(u8, trimmed, ' ') orelse return .{ .word = trimmed, .arg = "" };
-        return .{ .word = trimmed[0..split_at], .arg = std.mem.trim(u8, trimmed[split_at + 1 ..], " \t") };
+        return .{ .word = trimmed[0..split_at], .arg = std.mem.trim(u8, trimmed[split_at + 1 ..], " \t\r\n") };
     }
 
     /// Dispatch one slash-command line (pi handleCommand). Public: the

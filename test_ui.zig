@@ -956,6 +956,111 @@ test "startup resume: picker opens, cancel exits, empty dir stays fresh" {
     try std.testing.expect(t.cmd_exit_requested);
 }
 
+// parseCmd trims trailing newlines: a pasted "/settings\n" must dispatch
+// as the /settings command, NOT fall through to send-as-message (a real
+// leak: one session's store holds a literal "/settings\n" user turn).
+test "parseCmd: trailing newline commands still dispatch" {
+    // Direct handleCommand probe: /settings with a trailing \n opens the
+    // settings selector instead of submitting a chat message.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    defer session.deinit();
+    var t = tui.TUI.init(io, alloc, &session, "test-model", "/tmp/sessions", "/tmp", null, null, .empty, null, null);
+    defer t.deinit();
+
+    const should_exit = t.handleCommand("/settings\n");
+    try std.testing.expect(!should_exit);
+    try std.testing.expect(t.menu_mode == .settings);
+    t.menu_mode = .hidden;
+
+    // CRLF variant too.
+    const should_exit2 = t.handleCommand("/clear\r\n");
+    try std.testing.expect(!should_exit2);
+    try std.testing.expect(t.menu_mode != .settings);
+    t.menu_mode = .hidden;
+    // And a genuinely unknown slash word still falls through (no selector).
+    const unknown = t.handleCommand("/definitely-not-a-cmd\n");
+    _ = unknown;
+    try std.testing.expect(t.menu_mode == .hidden);
+}
+
+// updateMenuViewport must page against the FULL list (sel_len) for
+// window-projected pickers: 90 sessions (SEL_MAX 256, projection 64) used
+// to freeze the /resume picker — menu_selected past 64 never scrolled the
+// window because the clamp compared against the projected menu_len.
+test "session picker viewport pages past the 64-row projection" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    defer session.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [1024]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const sdir = try std.fmt.allocPrint(alloc, "{s}/sess", .{root});
+    defer alloc.free(sdir);
+    const cwd = try std.fmt.allocPrint(alloc, "{s}/proj", .{root});
+    defer alloc.free(cwd);
+    std.Io.Dir.cwd().createDirPath(io, sdir) catch {};
+
+    // 90 real sessions (each with one user message so they are listed).
+    var i: usize = 0;
+    while (i < 90) : (i += 1) {
+        const st = try ss.Store.create(alloc, io, sdir, cwd, .{});
+        defer st.deinit();
+        var mu = cmsg.Message.init(alloc);
+        defer mu.deinit();
+        mu.role = .user;
+        var name_buf: [32]u8 = undefined;
+        const txt = try std.fmt.bufPrint(&name_buf, "session number {d}", .{i});
+        try mu.blocks.append(.{ .text = cmsg.Message.allocStr(alloc, txt) });
+        st.recordMessage(&mu);
+    }
+
+    var t = tui.TUI.init(io, alloc, &session, "test-model", sdir, cwd, null, null, .empty, null, null);
+    defer t.deinit();
+    t.beginStartupResume();
+    try std.testing.expect(t.menu_mode == .sessions);
+    try std.testing.expect(t.sel_len >= 90); // full list exceeds the 64 projection
+
+    // Walk the selection to the END of the 90-row list: the window must
+    // follow (menu_view_start slides so the tail rows render).
+    var guard: usize = 0;
+    while (t.menu_selected < t.sel_len - 1 and guard < 200) : (guard += 1) {
+        t.menu_selected += 1;
+        t.scrollSelMenu();
+    }
+    try std.testing.expectEqual(t.sel_len - 1, t.menu_selected);
+    const last_row = t.menu_view_start + t.menu_len - 1;
+    try std.testing.expect(last_row == t.menu_selected); // tail visible
+    try std.testing.expect(t.menu_view_start > 0); // window actually paged
+}
+
 // ---- Editor mouse selection ----
 
 test "editor selection: drag selects, selectionText extracts, insert replaces" {
