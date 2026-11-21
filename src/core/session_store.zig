@@ -734,6 +734,11 @@ pub const Store = struct {
     leaf_id: ?[]u8 = null,
     entries: std.array_list.Managed(EntryRef),
     file_buf: std.array_list.Managed(u8),
+    /// pi session-manager flushed flag (lazy file creation): the JSONL is
+    /// written only once a real conversation message (user/assistant)
+    /// exists — empty sessions never touch the disk, so quitting right
+    /// after launch (or -r cancel) leaks no files.
+    flushed: bool = false,
     /// Serializes appendLine (entries/file_buf/leaf_id mutation + persist)
     /// between the main thread (agent messages) and the watcher thread
     /// (slash commands like /name or /skill mid-turn).
@@ -864,11 +869,32 @@ pub const Store = struct {
         }
         try line.appendSlice("}\n");
         try st.file_buf.appendSlice(line.items);
-        st.persist();
+        // pi _persist: NO initial write — the file appears with the first
+        // real message (persist's lazy-flush gate below).
         return st;
     }
 
+    /// pi SessionManager._hasConversation: at least one message entry with
+    /// a user/assistant role. The role is matched against the entry line's
+    /// compact JSON ("role":"user") — tool messages never satisfy it.
+    fn hasConversation(self: *Store) bool {
+        for (self.entries.items) |e| {
+            if (e.kind != .message) continue;
+            if (std.mem.indexOf(u8, e.line, "\"role\":\"user\"") != null or
+                std.mem.indexOf(u8, e.line, "\"role\":\"assistant\"") != null) return true;
+        }
+        return false;
+    }
+
     fn persist(self: *Store) void {
+        // pi session-manager _persist: lazy file creation. Until the first
+        // flush the store lives only in memory (file_buf); an empty session
+        // (opened and quit, -r cancel) never creates a file, so sessions
+        // directories stay free of (unnamed) junk.
+        if (!self.flushed) {
+            if (!self.hasConversation()) return;
+            self.flushed = true;
+        }
         // Write to a sibling temp file, then rename over the target: a
         // crash mid-write can no longer leave a truncated/corrupt session
         // file behind (rename is atomic on POSIX). The tmp name includes
@@ -1993,13 +2019,20 @@ pub fn listForCwd(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8
     var out = std.array_list.Managed(SessionInfo).init(alloc);
     errdefer out.deinit();
     for (paths.items) |p| {
-        var buf: [1 << 16]u8 = undefined;
-        const data = std.Io.Dir.cwd().readFile(io, p, &buf) catch continue;
+        // Full file, unbounded: long sessions grow past any fixed stack
+        // buffer, and the old 64KB read silently DROPPED those files from
+        // the listing (catch continue) — the picker and -c both lost them.
+        const data = std.Io.Dir.cwd().readFileAlloc(io, p, alloc, .unlimited) catch continue;
+        defer alloc.free(data);
         // header = first line; name = last session_info with name
         var id: []u8 = "";
         var name: ?[]u8 = null;
         var count: usize = 0;
         var first_message: ?[]u8 = null;
+        // pi _persist lazy gate: a session file only exists once a real
+        // user/assistant message was written. Legacy eager-create junk
+        // (header-only files) is invisible to listings, resume and -c.
+        var has_conv = false;
         var lines = std.mem.splitScalar(u8, data, '\n');
         var first = true;
         while (lines.next()) |line_raw| {
@@ -2026,47 +2059,49 @@ pub fn listForCwd(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8
             first = false;
             if (std.mem.eql(u8, t, "message")) {
                 count += 1;
-                // First USER message text (pi session selector preview).
-                // Entry shape: {"type":"message", "message":{role, blocks}}.
-                if (first_message == null) {
-                    const mv = o.get("message") orelse continue;
-                    const mo = switch (mv) {
-                        .object => |x| x,
-                        else => continue,
+                const mv = o.get("message") orelse continue;
+                const mo = switch (mv) {
+                    .object => |x| x,
+                    else => continue,
+                };
+                var role: []const u8 = "";
+                if (mo.get("role")) |rv| {
+                    role = switch (rv) {
+                        .string => |s| s,
+                        else => "",
                     };
-                    if (mo.get("role")) |rv| {
-                        const role = switch (rv) {
-                            .string => |s| s,
-                            else => "",
-                        };
-                        if (std.mem.eql(u8, role, "user")) {
-                            const cv = mo.get("content") orelse continue;
-                            switch (cv) {
-                                .string => |x| first_message = sanitizePreview(alloc, x),
-                                .array => |arr| {
-                                    for (arr.items) |blk| {
-                                        switch (blk) {
-                                            .object => |bo| {
-                                                const bt = bo.get("type") orelse continue;
-                                                const bt_s = switch (bt) {
-                                                    .string => |x| x,
-                                                    else => continue,
-                                                };
-                                                if (!std.mem.eql(u8, bt_s, "text")) continue;
-                                                const txt = bo.get("text") orelse continue;
-                                                switch (txt) {
-                                                    .string => |x| first_message = sanitizePreview(alloc, x),
-                                                    else => {},
-                                                }
-                                                break;
-                                            },
+                }
+                const is_user = std.mem.eql(u8, role, "user");
+                // pi _hasConversation: only user/assistant messages make a
+                // session real; tool-message-only files are not listed.
+                if (is_user or std.mem.eql(u8, role, "assistant")) has_conv = true;
+                // First USER message text (pi session selector preview).
+                if (first_message == null and is_user) {
+                    const cv = mo.get("content") orelse continue;
+                    switch (cv) {
+                        .string => |x| first_message = sanitizePreview(alloc, x),
+                        .array => |arr| {
+                            for (arr.items) |blk| {
+                                switch (blk) {
+                                    .object => |bo| {
+                                        const bt = bo.get("type") orelse continue;
+                                        const bt_s = switch (bt) {
+                                            .string => |x| x,
+                                            else => continue,
+                                        };
+                                        if (!std.mem.eql(u8, bt_s, "text")) continue;
+                                        const txt = bo.get("text") orelse continue;
+                                        switch (txt) {
+                                            .string => |x| first_message = sanitizePreview(alloc, x),
                                             else => {},
                                         }
-                                    }
-                                },
-                                else => {},
+                                        break;
+                                    },
+                                    else => {},
+                                }
                             }
-                        }
+                        },
+                        else => {},
                     }
                 }
             }
@@ -2079,6 +2114,14 @@ pub fn listForCwd(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8
                     else => {},
                 };
             }
+        }
+        // Header-only / tool-only files: not sessions (pi never creates
+        // them; our legacy eager-create era left them behind).
+        if (!has_conv) {
+            if (name) |n| alloc.free(n);
+            if (first_message) |fm| alloc.free(fm);
+            alloc.free(id);
+            continue;
         }
         try out.append(.{
             .path = try alloc.dupe(u8, p),

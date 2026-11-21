@@ -338,7 +338,10 @@ pub const TUI = struct {
         .{ .kind = .theme, .label = "Theme", .desc = "Color theme for the interface (dark / light; custom themes via /themes)", .values = &.{ "dark", "light" } },
     };
     /// Selector row capacity (sessions/tree/fork pickers).
-    const SEL_MAX = 64;
+    // Modal picker capacity (sessions/tree/fork/trust). pi has no cap; 256
+    // covers large session directories (the old 64 silently truncated the
+    // /resume list — and the (sel/total) indicator with it).
+    const SEL_MAX = 256;
     /// One picker row: display name/desc + attached id (entry id or path).
     const SelRow = struct {
         name: [168]u8 = undefined,
@@ -1577,12 +1580,22 @@ pub const TUI = struct {
         self.editor.setText(text) catch return;
     }
 
-    /// Activate the selected menu entry (Enter). Returns should_exit.
     /// Enter in the open menu. Returns should_exit. Public: the startup
     /// --resume regression test drives the picker through this.
     pub fn menuActivate(self: *TUI) bool {
         if (self.menu_len == 0) return false;
-        const e = self.menu_items[self.menu_selected];
+        // Only the editor-completion menus index menu_items by the FULL
+        // list position (their menu_items mirror the whole list, 1:1).
+        // Modal pickers (sessions/tree/fork/trust/mcp) project a WINDOW of
+        // sel_rows into menu_items — the selection indexes sel_rows, so
+        // reading menu_items[menu_selected] there was an out-of-bounds
+        // read once the list outgrew the projection (now that SEL_MAX
+        // exceeds menu_items.len this would read past the array).
+        const in_window = self.menu_mode == .sessions or self.menu_mode == .tree or
+            self.menu_mode == .forksel or self.menu_mode == .trust or
+            self.menu_mode == .mcp or self.menu_mode == .mcp_server or
+            self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure;
+        const e: MenuEntry = if (in_window) .{ .name = "", .desc = "" } else self.menu_items[self.menu_selected];
         switch (self.menu_mode) {
             .commands => {
                 if (commandTakesArg(e.name)) {
@@ -5565,7 +5578,11 @@ pub const TUI = struct {
                 frame.append(self.alloc, ml) catch return;
             }
             if (self.menu_len > menu_h) {
-                const indicator = printOwned(self.alloc, FG_MUTED(), "  ({d}/{d})", .{ self.menu_selected + 1, self.menu_len }, ansi.RESET) catch return;
+                // pi SelectList indicator: (selected, TOTAL) — the total is
+                // the full filtered list (sel_len), not the projected
+                // window (menu_len) the old denominator used.
+                const total: usize = if (self.menu_mode == .sessions or self.menu_mode == .tree or self.menu_mode == .forksel or self.menu_mode == .trust) self.sel_len else self.menu_len;
+                const indicator = printOwned(self.alloc, FG_MUTED(), "  ({d}/{d})", .{ self.menu_selected + 1, total }, ansi.RESET) catch return;
                 frame.append(self.alloc, indicator) catch return;
             }
             if (self.menu_mode == .trust) {

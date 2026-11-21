@@ -186,5 +186,15 @@ check("empty dir: no picker", "Resume Session" not in scr3 and "Type to filter" 
 check("empty dir: fresh editor alive", any("─" in l for l in scr3.splitlines()))
 s3.quit()
 
+# ---- 6. lazy persist: a launched-and-quit TUI leaves NO file behind ----
+DASHDIR = f"{AGENT}/sessions/--{PROJ_DASH}--"
+before_count = len([f for f in os.listdir(DASHDIR) if f.endswith(".jsonl")])
+s4 = Session([])
+time.sleep(2.2)
+s4.quit()
+after_count = len([f for f in os.listdir(DASHDIR) if f.endswith(".jsonl")])
+check("lazy persist: quit w/o messages leaks no file", after_count == before_count,
+      f"{before_count} -> {after_count}")
+
 print("ALL PASS" if ok else "FAILED")
 raise SystemExit(0 if ok else 1)
