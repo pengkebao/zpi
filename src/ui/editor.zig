@@ -496,13 +496,33 @@ pub const Editor = struct {
                 var off: usize = 0;
                 for (wrapped[first..first + wr]) |vl| off += vl.len;
                 const s = if (l == b.start.line) @max(b.start.col, off) else off;
-                const e = if (l == b.end.line) @min(b.end.col, off + seg.len) else off + seg.len;
+                const is_end = (l == b.end.line);
+                const e = if (is_end) @min(b.end.col, off + seg.len) else off + seg.len;
                 if (e <= s) continue;
                 const col = wmod.visualWidth(seg[0..(s - off)]);
-                const width_sel = wmod.visualWidth(seg[(s - off)..(e - off)]);
-                // applySelectionHighlight takes (start_col, END col).
-                const hl = overlay.applySelectionHighlight(alloc, frame.items[base + fr], col, col + width_sel) catch continue;
+                // pi parity: middle rows highlight to full editor width
+                // (endCol = line.length after padding); end row highlights
+                // to the selection end column (endCol = end.col).
+                const end_col: usize = if (is_end)
+                    col + wmod.visualWidth(seg[(s - off)..(e - off)])
+                else
+                    width;
+                var row = frame.items[base + fr];
+                var padded: ?[]u8 = null;
+                const rw = wmod.visualWidth(row);
+                if (rw < end_col) {
+                    const p = alloc.alloc(u8, row.len + (end_col - rw)) catch continue;
+                    @memcpy(p[0..row.len], row);
+                    @memset(p[row.len..], ' ');
+                    padded = p;
+                    row = p;
+                }
+                const hl = overlay.applySelectionHighlight(alloc, row, col, end_col) catch {
+                    if (padded) |p| alloc.free(p);
+                    continue;
+                };
                 alloc.free(frame.items[base + fr]);
+                if (padded) |p| alloc.free(p);
                 frame.items[base + fr] = hl;
             }
         }

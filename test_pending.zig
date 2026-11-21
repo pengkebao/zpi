@@ -248,3 +248,46 @@ test "pending rows wrap long text and budget counts the same wraps" {
     try std.testing.expect(std.mem.indexOf(u8, frame2.items[0], "Steering: line one") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame2.items[1], "line two") != null);
 }
+
+test "steering drain: queued message emits steering_injected at injection, not queue time" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    defer session.deinit();
+
+    // Queueing alone must NOT surface a turn event (no orphan transcript
+    // blocks for messages that may be dequeued with alt+up).
+    session.queueSteering("STEER-INJECT");
+    try std.testing.expectEqual(@as(usize, 0), session.takeTurnEvents().len);
+
+    // Drain (what runPrompt does before each LLM request) injects the user
+    // message into the context AND emits steering_injected exactly once.
+    try session.drainSteeringIntoContext();
+    const events = session.takeTurnEvents();
+    defer session.alloc.free(events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("STEER-INJECT", events[0].steering_injected);
+
+    // The message really is in the context now.
+    const msgs = session.context.messages.items;
+    try std.testing.expect(msgs.len >= 1);
+    var found = false;
+    for (msgs) |m| {
+        if (m.role != .user) continue;
+        for (m.blocks.items) |b| {
+            if (std.mem.indexOf(u8, b.text, "STEER-INJECT") != null) found = true;
+        }
+    }
+    try std.testing.expect(found);
+}

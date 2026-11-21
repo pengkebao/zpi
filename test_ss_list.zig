@@ -82,6 +82,44 @@ test "lazy persist: empty store never writes a file; first message flushes" {
     try std.testing.expectEqualStrings("now it is real", list[0].first_message.?);
 }
 
+// /skill:name submits are persisted as the full `<skill>` expansion block;
+// the listing preview must collapse it to the args (or `skill: <name>`).
+test "listForCwd: skill block first message collapses to args / skill name" {
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const sdir = "/tmp/rpi_ss_list_skill/--tmp-fixture-skill--";
+    std.Io.Dir.cwd().createDirPath(io, sdir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, "/tmp/rpi_ss_list_skill") catch {};
+
+    // Bare invocation: block only, no trailing args.
+    const bare =
+        "{\"type\":\"session\",\"version\":3,\"id\":\"sk1\",\"cwd\":\"/tmp/fixture-skill\"}\n" ++
+        "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"<skill name=\\\"ziglang\\\" location=\\\"/x/SKILL.md\\\">\\nReferences are relative to /x.\\n\\n# Zig Programming\\n\\nlong body...\\n</skill>\"},\"timestamp\":1700000000000}\n";
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sdir ++ "/2024_01_01T00_00_00Z_sk1.jsonl", .data = bare }) catch return error.SkipZigTest;
+
+    // Invocation with trailing args (the real user intent).
+    const with_args =
+        "{\"type\":\"session\",\"version\":3,\"id\":\"sk2\",\"cwd\":\"/tmp/fixture-skill\"}\n" ++
+        "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"<skill name=\\\"pdf\\\" location=\\\"/y/SKILL.md\\\">\\nbody\\n</skill>\\n\\nhelp me merge these two pdfs\"},\"timestamp\":1700000001000}\n";
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sdir ++ "/2024_01_02T00_00_00Z_sk2.jsonl", .data = with_args }) catch return error.SkipZigTest;
+
+    const list = ss.listForCwd(alloc, io, "/tmp/rpi_ss_list_skill", "/tmp/fixture-skill") catch return error.SkipZigTest;
+    defer {
+        for (list) |info| {
+            alloc.free(info.path);
+            alloc.free(info.id);
+            if (info.name) |n| alloc.free(n);
+            if (info.first_message) |fm| alloc.free(fm);
+            alloc.free(info.timestamp);
+        }
+        alloc.free(list);
+    }
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    // Newest first: sk2 (with args) then sk1 (bare).
+    try std.testing.expectEqualStrings("help me merge these two pdfs", list[0].first_message.?);
+    try std.testing.expectEqualStrings("skill: ziglang", list[1].first_message.?);
+}
+
 test "listForCwd: header-only legacy files are invisible" {
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

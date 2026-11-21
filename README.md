@@ -6,6 +6,8 @@
 
 **零第三方依赖 · 单二进制 · 与 pi 配置/会话双向兼容**
 
+*杭州御码网络科技有限公司*
+
 zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP 工具生态、技能与提示模板、会话树与压缩 —— 用 Zig 标准库从零实现。没有 Node，没有运行时，编译产物就是一个可以扔进 `$PATH` 的可执行文件。
 
 ## 为什么是 Zig
@@ -34,7 +36,7 @@ zpi 把 pi 的完整交互体验 —— 流式 Markdown、差分渲染 TUI、MCP
   - **无轮次上限**（对齐 pi `agent-loop` 的 `while(true)`）：工具轮循环只在模型停止调用工具或用户 ESC 中断时结束，长任务不会被中途切断
 - **失败可见性**（不再静默死回合）：重试 / 自动压缩等恢复提示同时写入转写（灰色 `·` 行，不再 1.5 秒闪没）；回合失败时错误行自动滚入视口（钉底跟随），并持久化为会话条目——重启后红色内联重放，事后可追溯
 - MCP 客户端：stdio + HTTP 传输、OAuth 登录、工具注册与热重载、`zpi mcp add/remove/list` 全套管理
-- 技能（Skills）与提示模板（Prompts）：pi 同款发现机制与 `SKILL.md` 格式；`/skill:name` 调用时**完整技能体发给模型，但转写只占一行** `[skill] name (ctrl+o to expand)`——点击或 Ctrl+O 才展开正文（对齐 pi `SkillInvocationMessageComponent`，不再把整个 SKILL.md 刷屏）
+- 技能（Skills）与提示模板（Prompts）：pi 同款发现机制与 `SKILL.md` 格式；`/skill:name` 调用时**完整技能体发给模型，但转写只占一行** `[skill] name (ctrl+o to expand)`——点击或 Ctrl+O 才展开正文（对齐 pi `SkillInvocationMessageComponent`，不再把整个 SKILL.md 刷屏）；**会话列表预览智能折叠**：`/skill:name` 提交后首条 user 消息是整块 `<skill>` XML，会话列表自动折叠为 `skill: <name>`（裸调用）或用户实际输入的参数（带 args），不再显示一大坨 SKILL.md 头
 - 事件总线 + hooks.json 钩子（session_start / pre_tool_call / post_tool_call / compaction）
 
 **TUI**
@@ -188,9 +190,9 @@ zig run bench_markdown.zig  # markdown 渲染基准
 
 ## Roadmap
 
-- [ ] 图片输入（拖放；ctrl+v 粘贴图片已支持）
+- [x] 图片输入（ctrl+v 粘贴图片、拖放文件路径入输入框，均走 bracketed paste）
 - [ ] 会话分享 / 导出
-- [ ] 主题体系（多主题选择器）
+- [x] 主题体系（多主题选择器，`/themes` + `~/.pi/agent/themes/`）
 - [ ] Windows 终端支持
 - [ ] skills 校验诊断（`[Skill warnings]` 启动节）
 
@@ -198,7 +200,10 @@ zig run bench_markdown.zig  # markdown 渲染基准
 
 [MIT](LICENSE)
 
+© 2026 杭州御码网络科技有限公司
+
 ## 联系
 
+- 公司：杭州御码网络科技有限公司
 - 邮箱：84665381@qq.com
 - Issue：[github.com/pengkebao/zpi/issues](https://github.com/pengkebao/zpi/issues)

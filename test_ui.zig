@@ -1660,8 +1660,9 @@ test "editor geometry: the live queue shifts the editor rows and the cursor park
     t.redraw();
     const qrows = t.session.queuedPeekRows(t.width);
     try std.testing.expect(qrows >= 1);
-    // The editor's first row sits AFTER the live queue rows and the border.
-    try std.testing.expectEqual(t.transcript_h + qrows + 1, t.editor_frame_row);
+    // The editor's first row sits AFTER the live queue rows, the dequeue
+    // hint row (pi: “↳ alt+up to edit all queued messages”), and the border.
+    try std.testing.expectEqual(t.transcript_h + qrows + 2, t.editor_frame_row);
 }
 
 test "frame: selector chrome rows never exceed the width (desync regression)" {

@@ -533,10 +533,14 @@ fn parseCsi(params: []const u8, ss3: bool) ?Key {
         const mod = std.fmt.parseInt(usize, mod_part[0..colon], 10) catch 1;
         const modifier = mod -| 1;
         const is_ctrl = modifier & 4 != 0;
+        const is_alt = modifier & 2 != 0;
         const is_shift = modifier & 1 != 0;
+        // macOS terminals (Ghostty, iTerm2 with "Option as Meta" off, kitty
+        // protocol) send Option+arrows as CSI 1;<mod> A/B with the alt bit —
+        // dropping it made alt+up (dequeue) unreachable.
         return switch (final) {
-            'A' => verticalArrow(true, is_ctrl, is_shift, false),
-            'B' => verticalArrow(false, is_ctrl, is_shift, false),
+            'A' => verticalArrow(true, is_ctrl, is_shift, is_alt),
+            'B' => verticalArrow(false, is_ctrl, is_shift, is_alt),
             'C' => .right,
             'D' => .left,
             'H' => if (is_ctrl) .ctrl_home else .home,
@@ -1019,9 +1023,11 @@ test "parseKey ctrl+shift letters and ctrl arrows" {
     try expectKey(parseKey("\x1b[1;6B"), .ctrl_shift_down);
     try expectKey(parseKey("\x1b[57419;5u"), .ctrl_up);
     try expectKey(parseKey("\x1b[57420;6u"), .ctrl_shift_down);
-    // Other modifiers stay the plain arrow; left/right ignore them.
+    // Shift-only stays the plain arrow; alt is preserved (dequeue). Left/right
+    // ignore modifiers.
     try expectKey(parseKey("\x1b[1;2A"), .up);
-    try expectKey(parseKey("\x1b[1;3B"), .down);
+    try expectKey(parseKey("\x1b[1;3B"), .alt_down);
+    try expectKey(parseKey("\x1b[1;4A"), .alt_up);
     try expectKey(parseKey("\x1b[1;5C"), .right);
     try expectKey(parseKey("\x1b[1;5D"), .left);
     // Ctrl+Home/End, also with Shift held.

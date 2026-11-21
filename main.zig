@@ -1260,8 +1260,9 @@ pub fn main(init: std.process.Init) !void {
 
 
     // Build the sectioned system prompt (Phase D) + advertise skills (Phase H1).
-    const skills_list = try skills.discover(alloc, io, cfg.base_dir, cwd_abs, home_dir, project_trusted);
-    defer skills.freeAll(alloc, skills_list);
+    var skills_result = try skills.discover(alloc, io, cfg.base_dir, cwd_abs, home_dir, project_trusted);
+    defer skills_result.deinit(alloc);
+    const skills_list = skills_result.skills;
     var skills_block: ?[]u8 = null;
     defer {
         if (skills_block) |b| alloc.free(b);

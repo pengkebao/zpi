@@ -278,146 +278,16 @@ fn renderEdit(b: *Builder, view: ToolView, args: Args) !void {
     const lines = trimTrailingEmpty(try splitLines(b.arena, diff));
     if (lines.len == 0) return;
     try b.blank();
-    // Group the diff: a hunk of exactly one removed and one added line is a
-    // single-line modification — pi highlights the changed WORDS with
-    // inverse instead of coloring the whole lines (pi: renderIntraLineDiff).
-    var i: usize = 0;
-    while (i < lines.len) {
-        const kind = diffKind(lines[i]);
-        if (kind == .removed) {
-            var removed_end = i;
-            while (removed_end < lines.len and diffKind(lines[removed_end]) == .removed) removed_end += 1;
-            var added_end = removed_end;
-            while (added_end < lines.len and diffKind(lines[added_end]) == .added) added_end += 1;
-            const removed_count = removed_end - i;
-            const added_count = added_end - removed_end;
-            if (removed_count == 1 and added_count == 1) {
-                const old_line = lineContent(lines[i]);
-                const new_line = lineContent(lines[removed_end]);
-                if (wordDiffLines(b.arena, old_line, new_line) catch null) |pair| {
-                    defer b.arena.free(pair.removed);
-                    defer b.arena.free(pair.added);
-                    // Keep each row's `-N ` prefix; the word-level inverses
-                    // ride on the row color (7m/27m only touch the reverse bit).
-                    const rem = try std.fmt.allocPrint(b.arena, FG_DIFF_REMOVED ++ "{s}{s}", .{ lines[i][0 .. lines[i].len - old_line.len], pair.removed });
-                    const add = try std.fmt.allocPrint(b.arena, FG_DIFF_ADDED ++ "{s}{s}", .{ lines[removed_end][0 .. lines[removed_end].len - new_line.len], pair.added });
-                    try b.text("", rem);
-                    try b.text("", add);
-                    i = added_end;
-                    continue;
-                }
-            }
-            // Fallback: whole-line colors.
-            for (lines[i..added_end]) |l| try b.text(diffStyle(l), l);
-            i = added_end;
-            continue;
-        }
-        try b.text(diffStyle(lines[i]), lines[i]);
-        i += 1;
-    }
+    // Whole-line colors only: removed lines in red, added in green, context
+    // muted (pi: parseDiffLine + diffStyle). pi additionally runs
+    // renderIntraLineDiff (jsdiff word-level inverse) for 1:1 hunks; zpi
+    // skips it — with CJK table rows the scattered inverse fragments read
+    // as noise, and plain row colors convey the same information.
+    for (lines) |l| try b.text(diffStyle(l), l);
 }
 
-// ---- Intra-line (word) diff (pi: renderIntraLineDiff with jsdiff.diffWords) ----
-
-/// A whitespace-separated word / single punctuation token.
-const Token = struct { text: []const u8 };
-
-fn tokenizeWords(arena: std.mem.Allocator, line: []const u8) ![]Token {
-    var out: std.ArrayListUnmanaged(Token) = .empty;
-    var i: usize = 0;
-    while (i < line.len) {
-        const start = i;
-        if (std.ascii.isAlphanumeric(line[i]) or line[i] == '_') {
-            while (i < line.len and (std.ascii.isAlphanumeric(line[i]) or line[i] == '_')) i += 1;
-        } else if (line[i] < 0x80) {
-            i += 1; // single-byte punctuation / space
-        } else {
-            // Multi-byte (CJK etc.): one whole character per token, never a
-            // byte slice — inverse-video boundaries between tokens must not
-            // split a character (split bytes render as ? diamonds).
-            i += charLen(line, i);
-        }
-        try out.append(arena, .{ .text = line[start..i] });
-    }
-    return out.toOwnedSlice(arena);
-}
-
-const WordPair = struct { removed: []u8, added: []u8 };
-
-const INV_ON = "\x1b[7m";
-const INV_OFF = "\x1b[27m";
-
-/// Word-level diff of two lines, rendered with inverse on the changed tokens
-/// (pi: jsdiff.diffWords + theme.inverse). Returns null when either line is
-/// too long for the DP table — the caller keeps whole-line colors then.
-fn wordDiffLines(arena: std.mem.Allocator, old_line: []const u8, new_line: []const u8) !?WordPair {
-    const MAX_TOKENS = 400;
-    const a = try tokenizeWords(arena, old_line);
-    const b = try tokenizeWords(arena, new_line);
-    if (a.len > MAX_TOKENS or b.len > MAX_TOKENS) return null;
-
-    // LCS table (tokens compared by content).
-    const table = try arena.alloc(u16, (a.len + 1) * (b.len + 1));
-    defer arena.free(table);
-    @memset(table, 0);
-    var ai = a.len;
-    while (ai > 0) {
-        ai -= 1;
-        var bi = b.len;
-        while (bi > 0) {
-            bi -= 1;
-            table[ai * (b.len + 1) + bi] = if (std.mem.eql(u8, a[ai].text, b[bi].text))
-                table[(ai + 1) * (b.len + 1) + bi + 1] + 1
-            else
-                @max(table[(ai + 1) * (b.len + 1) + bi], table[ai * (b.len + 1) + bi + 1]);
-        }
-    }
-
-    // Walk the LCS path emitting per-side text: same runs plain, changed runs
-    // inverse. The leading whitespace of the first changed run stays outside
-    // the inverse (pi strips it so indentation is not highlighted).
-    var removed: std.ArrayListUnmanaged(u8) = .empty;
-    var added: std.ArrayListUnmanaged(u8) = .empty;
-    var first_removed = true;
-    var first_added = true;
-    ai = 0;
-    var bi: usize = 0;
-    const Ctx = struct {
-        fn appendChanged(list: *std.ArrayListUnmanaged(u8), al: std.mem.Allocator, value: []const u8, strip_leading_ws: *bool) !void {
-            var value_v = value;
-            if (strip_leading_ws.*) {
-                var k: usize = 0;
-                while (k < value_v.len and (value_v[k] == ' ' or value_v[k] == '\t')) k += 1;
-                if (k > 0) try list.appendSlice(al, value_v[0..k]);
-                value_v = value_v[k..];
-                strip_leading_ws.* = false;
-            }
-            if (value_v.len > 0) {
-                try list.appendSlice(al, INV_ON);
-                try list.appendSlice(al, value_v);
-                try list.appendSlice(al, INV_OFF);
-            }
-        }
-    };
-
-    while (ai < a.len or bi < b.len) {
-        if (ai < a.len and bi < b.len and std.mem.eql(u8, a[ai].text, b[bi].text)) {
-            try removed.appendSlice(arena, a[ai].text);
-            try added.appendSlice(arena, b[bi].text);
-            first_removed = false;
-            first_added = false;
-            ai += 1;
-            bi += 1;
-        } else if (bi >= b.len or (ai < a.len and table[(ai + 1) * (b.len + 1) + bi] >= table[ai * (b.len + 1) + bi + 1])) {
-            try Ctx.appendChanged(&removed, arena, a[ai].text, &first_removed);
-            ai += 1;
-        } else {
-            try Ctx.appendChanged(&added, arena, b[bi].text, &first_added);
-            bi += 1;
-        }
-    }
-    return .{ .removed = try removed.toOwnedSlice(arena), .added = try added.toOwnedSlice(arena) };
-}
+// (pi: renderIntraLineDiff with jsdiff.diffWords) — intentionally not
+// implemented; see renderEdit above.
 
 /// The diff row class (pi: parseDiffLine): `+N `, `-N ` are changes; an
 /// optional number after a space prefix is context; anything else "other".
@@ -634,12 +504,151 @@ const Builder = struct {
     }
 };
 
+/// SGR attribute state tracked while walking a logical line, replayed at
+/// continuation-row starts (pi: AnsiCodeTracker.getActiveCodes — without the
+/// replay, wrapped diff rows continue in default colors: white text instead
+/// of the diff color, white boxes under inverse word-diff markers).
+const SgrState = struct {
+    bold: bool = false,
+    dim: bool = false,
+    italic: bool = false,
+    underline: bool = false,
+    blink: bool = false,
+    inverse: bool = false,
+    hidden: bool = false,
+    strikethrough: bool = false,
+    fg: ?[]const u8 = null, // last fg sequence, e.g. "\x1b[38;2;234;127;129m"
+    bg: ?[]const u8 = null, // last bg sequence
+
+    fn clear(self: *SgrState) void {
+        self.* = .{};
+    }
+
+    /// Apply every SGR sequence contained in `s` (a style string or span
+    /// fragment text). Non-SGR escapes are ignored.
+    fn applyAll(self: *SgrState, s: []const u8) void {
+        var i: usize = 0;
+        while (i < s.len) {
+            if (s[i] != 0x1b) {
+                i += 1;
+                continue;
+            }
+            const e = escapeEnd(s, i);
+            self.applySeq(s[i..e]);
+            i = e;
+        }
+    }
+
+    fn applySeq(self: *SgrState, seq: []const u8) void {
+        if (seq.len < 3 or seq[1] != '[' or seq[seq.len - 1] != 'm') return;
+        const params = seq[2 .. seq.len - 1];
+        var i: usize = 0;
+        while (i < params.len) {
+            var j = i;
+            while (j < params.len and params[j] != ';') j += 1;
+            const p = params[i..j];
+            i = if (j < params.len) j + 1 else params.len;
+            if (p.len == 0) continue;
+            const n = std.fmt.parseInt(u32, p, 10) catch continue;
+            switch (n) {
+                0 => self.clear(),
+                1 => self.bold = true,
+                2 => self.dim = true,
+                3 => self.italic = true,
+                4 => self.underline = true,
+                5 => self.blink = true,
+                7 => self.inverse = true,
+                8 => self.hidden = true,
+                9 => self.strikethrough = true,
+                22 => {
+                    self.bold = false;
+                    self.dim = false;
+                },
+                23 => self.italic = false,
+                24 => self.underline = false,
+                25 => self.blink = false,
+                27 => self.inverse = false,
+                28 => self.hidden = false,
+                29 => self.strikethrough = false,
+                39 => self.fg = null,
+                49 => self.bg = null,
+                30...37, 90...97, 38 => {
+                    self.fg = seq;
+                    if (n == 38) i = skipColorSubParams(params, i);
+                },
+                40...47, 100...107, 48 => {
+                    self.bg = seq;
+                    if (n == 48) i = skipColorSubParams(params, i);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// After 38/48: skip the color definition params ("5;n" or "2;r;g;b")
+    /// so they are not misread as attribute codes.
+    fn skipColorSubParams(params: []const u8, i: usize) usize {
+        var j = i;
+        while (j < params.len and params[j] != ';') j += 1;
+        const kind = params[i..j];
+        const extra: usize = if (std.mem.eql(u8, kind, "2")) 3 else 1;
+        var skipped: usize = 0;
+        while (skipped < extra and j < params.len) : (skipped += 1) {
+            j += 1;
+            while (j < params.len and params[j] != ';') j += 1;
+        }
+        return if (j < params.len) j + 1 else params.len;
+    }
+
+    /// The active codes as a prefix for a continuation row (pi
+    /// getActiveCodes: attribute codes first, then fg, then bg). Null when
+    /// nothing is active.
+    fn replayCodes(self: *const SgrState, arena: std.mem.Allocator) !?[]const u8 {
+        const flags = [_]struct { on: bool, code: u8 }{
+            .{ .on = self.bold, .code = '1' },
+            .{ .on = self.dim, .code = '2' },
+            .{ .on = self.italic, .code = '3' },
+            .{ .on = self.underline, .code = '4' },
+            .{ .on = self.blink, .code = '5' },
+            .{ .on = self.inverse, .code = '7' },
+            .{ .on = self.hidden, .code = '8' },
+            .{ .on = self.strikethrough, .code = '9' },
+        };
+        var attr_buf: [16]u8 = undefined;
+        var attr_len: usize = 0;
+        for (flags) |f| {
+            if (!f.on) continue;
+            if (attr_len > 0) {
+                attr_buf[attr_len] = ';';
+                attr_len += 1;
+            }
+            attr_buf[attr_len] = f.code;
+            attr_len += 1;
+        }
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(arena);
+        if (attr_len > 0) {
+            try out.appendSlice(arena, "\x1b[");
+            try out.appendSlice(arena, attr_buf[0..attr_len]);
+            try out.appendSlice(arena, "m");
+        }
+        if (self.fg) |s| try out.appendSlice(arena, s);
+        if (self.bg) |s| try out.appendSlice(arena, s);
+        if (out.items.len == 0) return null;
+        return try out.toOwnedSlice(arena);
+    }
+};
+
 /// Split `spans` into rows of at most `width` columns. Breaks between
 /// characters; a character wider than the row still gets a row of its own.
 fn wrapSpans(arena: std.mem.Allocator, spans: []const Span, width: usize, out: *std.ArrayListUnmanaged(Row)) !void {
     var cur: std.ArrayListUnmanaged(Span) = .empty;
     var col: usize = 0;
+    var st = SgrState{};
     for (spans) |sp| {
+        // appendRow emits sp.style before every fragment; keep the tracker
+        // in sync so continuation rows replay the right codes.
+        st.applyAll(sp.style);
         var start: usize = 0;
         var i: usize = 0;
         while (i < sp.text.len) {
@@ -648,24 +657,49 @@ fn wrapSpans(arena: std.mem.Allocator, spans: []const Span, width: usize, out: *
             // fragments at row starts and left dangling CSIs that swallowed
             // the newline, joining rows into overlong lines.
             if (sp.text[i] == 0x1b) {
-                i = escapeEnd(sp.text, i);
+                const e = escapeEnd(sp.text, i);
+                st.applyAll(sp.text[i..e]);
+                i = e;
                 continue;
             }
             const n = charLen(sp.text, i);
             const w = wmod.visualWidth(sp.text[i .. i + n]);
             if (col + w > width and col > 0) {
-                if (i > start) try cur.append(arena, .{ .style = sp.style, .text = sp.text[start..i] });
+                if (i > start) {
+                    try cur.append(arena, .{ .style = sp.style, .text = sp.text[start..i] });
+                    // appendRow resets after each styled fragment.
+                    if (sp.style.len > 0) st.clear();
+                }
                 try out.append(arena, try cur.toOwnedSlice(arena));
                 cur = .empty;
                 col = 0;
                 start = i;
+                // pi wrapTextWithAnsi: a continuation row starts with the
+                // active SGR codes replayed, or the rest of the line renders
+                // in default colors.
+                if (try st.replayCodes(arena)) |prefix| {
+                    try cur.append(arena, .{ .text = prefix });
+                }
             }
             col += w;
             i += n;
         }
-        if (sp.text.len > start) try cur.append(arena, .{ .style = sp.style, .text = sp.text[start..] });
+        if (sp.text.len > start) {
+            try cur.append(arena, .{ .style = sp.style, .text = sp.text[start..] });
+            // appendRow resets after each styled fragment.
+            if (sp.style.len > 0) st.clear();
+        }
     }
-    try out.append(arena, try cur.toOwnedSlice(arena));
+    // A break at the very end leaves only the replay prefix: drop the
+    // content-less trailing row instead of rendering a blank box row.
+    var has_visible = false;
+    for (cur.items) |s| {
+        if (wmod.visibleWidthEsc(s.text) > 0) {
+            has_visible = true;
+            break;
+        }
+    }
+    if (has_visible) try out.append(arena, try cur.toOwnedSlice(arena));
 }
 
 /// Join the rows into the final block: a blank spacer row, then the box rows
@@ -701,7 +735,11 @@ fn appendRow(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), row: Ro
         } else {
             try out.appendSlice(alloc, sp.text);
         }
-        used += wmod.visualWidth(sp.text);
+        // Styled spans embed ANSI escapes (word-diff inverse markers): the
+        // escapes are zero-width, so plain visualWidth over-counts and the
+        // row would lose its trailing background padding (pi pads to full
+        // width because theme.bg wraps the whole padded line).
+        used += wmod.visibleWidthEsc(sp.text);
     }
     if (width > used) try out.appendNTimes(alloc, ' ', width - used);
     try out.appendSlice(alloc, RESET);
@@ -1190,10 +1228,13 @@ test "edit: shows the colored diff without the success line" {
     }, .{ .width = 40 });
     defer t.allocator.free(block);
     try expectRows(&.{ "", "", " edit a.txt", "", "  1 keep", " -2 old", " +2 new", "" }, block);
-    // A 1:1 modification pair gets word-level inverse on the changed token.
-    try t.expect(std.mem.indexOf(u8, block, FG_DIFF_REMOVED ++ "-2 " ++ INV_ON ++ "old" ++ INV_OFF) != null);
-    try t.expect(std.mem.indexOf(u8, block, FG_DIFF_ADDED ++ "+2 " ++ INV_ON ++ "new" ++ INV_OFF) != null);
+    // Whole-line colors only — no word-level inverse (intentional pi
+    // deviation: CJK rewrites render as inverse noise).
+    try t.expect(std.mem.indexOf(u8, block, FG_DIFF_REMOVED ++ "-2 old") != null);
+    try t.expect(std.mem.indexOf(u8, block, FG_DIFF_ADDED ++ "+2 new") != null);
     try t.expect(std.mem.indexOf(u8, block, FG_DIFF_CONTEXT ++ " 1 keep") != null);
+    // No inverse-video sequences anywhere in the block.
+    try t.expect(std.mem.indexOf(u8, block, "\x1b[7m") == null);
 }
 
 test "edit: an error is shown in the error color" {
@@ -1327,10 +1368,9 @@ test "diffStyle follows the diff line format" {
 }
 
 test "edit diff: wrap never breaks inside ANSI sequences or CJK chars" {
-    // A long removed line with CJK + an inverse word-diff span. The wrap must
-    // keep every escape sequence whole (no literal "27m"/"[27m" fragments at
-    // row starts) and never split a multi-byte character (split bytes render
-    // as ? diamonds).
+    // A long removed line with CJK. The wrap must keep every escape sequence
+    // whole (no literal "27m"/"[27m" fragments at row starts) and never split
+    // a multi-byte character (split bytes render as ? diamonds).
     const block = try render(t.allocator, .{
         .name = "edit",
         .args = "{\"path\":\"x.md\"}",

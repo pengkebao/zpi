@@ -985,8 +985,9 @@ pub const TUI = struct {
                 self.alloc.free(desc);
             };
         }
-        const skills_list = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir, self.project_trusted) catch return;
-        defer skills.freeAll(self.alloc, skills_list);
+        var skills_result = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir, self.project_trusted) catch return;
+        defer skills_result.deinit(self.alloc);
+        const skills_list = skills_result.skills;
         for (skills_list) |sk| {
             // pi: skills come from user or project dirs; tag by which root
             // owns the file (pi sourceInfo.scope: project = cwd, else user).
@@ -4544,11 +4545,12 @@ pub const TUI = struct {
                                         agent.requestAbort();
                                     }
                                 } else {
+                                    // pi: a queued steering message shows ONLY as the
+                                    // dim "Steering:" pending row until it is injected
+                                    // into the context (steering_injected turn event →
+                                    // user block). Rendering it at queue time left
+                                    // orphan blocks when alt+up dequeued the message.
                                     self.session.queueSteering(text);
-                                    self.addUserMessage(text);
-                                    self.render_mutex.lock(self.io) catch {};
-                                    self.sv.scrollToEnd(ss.nowMs(self.io));
-                                    self.render_mutex.unlock(self.io);
                                 }
                                 self.redrawCached();
                             }
@@ -5271,7 +5273,11 @@ pub const TUI = struct {
         }
         const live_q_h: usize = live_q_rows.items.len;
         const compact_q_h: usize = compact_q_rows.items.len;
-        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + th_h + sc_h + mcp_h + compact_q_h + live_q_h + login_h;
+        // pi updatePendingMessagesDisplay: a dim hint row under the queued
+        // messages — “↳ alt+up to edit all queued messages”. Budgeted like
+        // the queue rows so the frame never overruns the terminal.
+        const q_hint_h: usize = if (live_q_h > 0) 1 else 0;
+        const fixed_bottom = editor_h + 4 + menu_h + count_line + trust_head + trust_foot + settings_h + ms_h + ts_h + th_h + sc_h + mcp_h + compact_q_h + live_q_h + q_hint_h + login_h;
         const transcript_h = if (self.height > fixed_bottom) self.height - fixed_bottom else 1;
 
         var frame: std.ArrayListUnmanaged([]u8) = .empty;
@@ -5370,6 +5376,13 @@ pub const TUI = struct {
                 return;
             };
         }
+        if (q_hint_h > 0) {
+            const hint = self.alloc.dupe(u8, "\x1b[2m  ↳ alt+up to edit all queued messages\x1b[0m") catch return;
+            frame.append(self.alloc, hint) catch {
+                self.alloc.free(hint);
+                return;
+            };
+        }
 
         // 2. Top border (shows spinner + "Working" when busy).
         const top_border = self.topBorderLine() catch return;
@@ -5451,7 +5464,7 @@ pub const TUI = struct {
         // count BOTH queues or the cursor parks on a transcript row and the
         // mouse maps clicks to the wrong editor rows while a message is
         // queued.
-        const q_h = compact_q_h + live_q_h;
+        const q_h = compact_q_h + live_q_h + q_hint_h;
         self.editor_frame_row = transcript_h + q_h + 1;
         self.editor_vis_top = vis_top;
         self.editor_visible_rows = end - vis_top;
@@ -8630,10 +8643,11 @@ pub const TUI = struct {
             }
             w.appendSlice(self.alloc, "\n") catch return null;
         }
-        const skills_list = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir, self.project_trusted) catch {
+        var skills_result = skills.discover(self.alloc, self.io, agent_dir, self.cwd_abs, self.home_dir, self.project_trusted) catch {
             return out.toOwnedSlice(self.alloc) catch null;
         };
-        defer skills.freeAll(self.alloc, skills_list);
+        defer skills_result.deinit(self.alloc);
+        const skills_list = skills_result.skills;
         if (skills_list.len > 0) {
             const hdr = std.fmt.allocPrint(self.alloc, "{s}[Skills]\x1b[0m\n", .{accent}) catch return null;
             defer self.alloc.free(hdr);
@@ -8675,6 +8689,24 @@ pub const TUI = struct {
                     w.appendSlice(self.alloc, line) catch return null;
                 }
             }
+        }
+        // pi showLoadedResources: [Skill warnings] section when diagnostics
+        // exist (bad names, overlong descriptions, name collisions, read
+        // failures). Warnings never block skill loading — pi same.
+        if (skills_result.diagnostics.len > 0) {
+            const warn = theme.fgStr(.warning);
+            const hdr = std.fmt.allocPrint(self.alloc, "{s}[Skill warnings]\x1b[0m\n", .{warn}) catch return null;
+            defer self.alloc.free(hdr);
+            w.appendSlice(self.alloc, hdr) catch return null;
+            for (skills_result.diagnostics) |d| {
+                const path_line = std.fmt.allocPrint(self.alloc, "{s}  {s}\x1b[0m\n", .{ warn, d.path }) catch return null;
+                defer self.alloc.free(path_line);
+                w.appendSlice(self.alloc, path_line) catch return null;
+                const msg_line = std.fmt.allocPrint(self.alloc, "{s}    {s}\x1b[0m\n", .{ warn, d.message }) catch return null;
+                defer self.alloc.free(msg_line);
+                w.appendSlice(self.alloc, msg_line) catch return null;
+            }
+            w.appendSlice(self.alloc, "\n") catch return null;
         }
         return out.toOwnedSlice(self.alloc) catch null;
     }
@@ -8851,8 +8883,9 @@ pub const TUI = struct {
         const space = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
         const skill_name = rest[0..space];
         const args = if (space < rest.len) std.mem.trim(u8, rest[space + 1 ..], " ") else "";
-        const list = skills.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs, self.home_dir, self.project_trusted) catch return null;
-        defer skills.freeAll(self.alloc, list);
+        var list_result = skills.discover(self.alloc, self.io, self.agent_dir_for_templates(), self.cwd_abs, self.home_dir, self.project_trusted) catch return null;
+        defer list_result.deinit(self.alloc);
+        const list = list_result.skills;
         for (list) |s| {
             if (!std.mem.eql(u8, s.name, skill_name)) continue;
             const body = skills.loadBody(self.alloc, self.io, s.file_path) orelse return null;
@@ -8872,8 +8905,9 @@ pub const TUI = struct {
     /// the number of visible skills. Returns an error string on failure.
     fn reloadResources(self: *TUI) !void {
         const cfg = self.cfg orelse return;
-        const list = try skills.discover(self.alloc, self.io, cfg.base_dir, self.cwd_abs, self.home_dir, self.project_trusted);
-        defer skills.freeAll(self.alloc, list);
+        var list_result = try skills.discover(self.alloc, self.io, cfg.base_dir, self.cwd_abs, self.home_dir, self.project_trusted);
+        defer list_result.deinit(self.alloc);
+        const list = list_result.skills;
         const block = try skills.formatForPrompt(self.alloc, list);
         defer {
             if (block) |b| self.alloc.free(b);
@@ -9710,6 +9744,13 @@ pub const TUI = struct {
                 .tool_update => |u| self.updatePendingTool(u),
                 .tool_result => |r| self.finishTool(r),
                 .compaction => |info| self.addCompactionBlock(info),
+                .steering_injected => |t| {
+                    defer self.session.alloc.free(t);
+                    self.addUserMessage(t);
+                    self.render_mutex.lock(self.io) catch {};
+                    self.sv.scrollToEnd(ss.nowMs(self.io));
+                    self.render_mutex.unlock(self.io);
+                },
                 .note => |n| {
                     defer self.session.alloc.free(n);
                     self.note("\x1b[90m{s}\x1b[0m", .{n});

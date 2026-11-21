@@ -32,12 +32,12 @@ zpi 扩展系统             →  src/ext/                   (扩展点、钩子
 
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
-| prompt → LLM → tools → LLM 循环 | ✅ | ✅ | 上限 50 轮 |
+| prompt → LLM → tools → LLM 循环 | ✅ | ✅ | **无轮数上限**（对齐 pi agent-loop 的 `while (true)`——模型持续调用工具就一直跑，只有用户中止/错误才停；曾为 50 轮，后对齐 pi 去除） |
 | 流式输出（text delta） | ✅ | ✅ | SSE 逐行解析（包级节奏） |
 | 流式 tool_call 增量合并 | ✅ | ✅ | index 合并 |
 | thinking/reasoning 块 | ✅ | ✅ | reasoning_content/reasoning/reasoning_text 三形态；TUI Ctrl+T 折叠 |
 | thinking 级别 + thinkingLevelMap | ✅ | ✅ | off…xhigh/max 循环（shift+tab）+ `--thinking` CLI（显式优先）+ `provider/model:level` 后缀（pi splitThinkingSuffix strict 语义）+ thinkingFormat 三形态（default=reasoning_effort 直传 / zai=thinking:{type} / qwen=enable_thinking）+ thinkingLevelMap 映射 + models.json thinkingFormat/supportsReasoningEffort（三态，zai 域名 URL 自动检测）|
-| steering（运行中插话） | ✅ | ✅ | Enter 队列；每轮 LLM 请求前注入（drainSteeringIntoContext） |
+| steering（运行中插话） | ✅ | ✅ | Enter 队列；每轮 LLM 请求前注入（drainSteeringIntoContext）；**渲染时机对齐 pi**：排队时只显示 dim `Steering:` 待发行 + `↳ alt+up to edit all queued messages` 提示行，注入 context 时（`steering_injected` turn event）才进转录区——alt+up 撤回不留孤儿块 |
 | follow-up（任务结束后续跑） | ✅ | ✅ | Alt+Enter 队列（运行中）；空闲时 = 普通提交（pi handleFollowUp 尾分支） |
 | 中断（Escape / Ctrl+C） | ✅ | ✅ | HTTP 流停止；已流出 thinking/text 保留；未执行 tool_call 补 "aborted by user" 错误结果（wire 合法） |
 | usage/cost 统计 | ✅ | ✅ | stream_options.include_usage；input/output/cached/cost 累计 |
@@ -56,7 +56,7 @@ zpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | `--system-prompt` / `--append-system-prompt` | ✅ | ✅ | 整体覆盖 / addendum 段 |
 | @file 附件（文本+图片） | ✅ | ✅ | CLI 位置参数 `@path`：文本 `<file name>` 包裹（BOM 剥离）、图片魔数检测 → base64 ImageBlock 入首条消息（pi processFileArguments/buildInitialMessage 组装顺序 stdin→fileText→prompt） |
 | 图片消息（base64 ImageContent） | ✅ | ✅ | ImageBlock 全链路（@file 图片 + read 工具图片）；wire image_url data URI |
-| 粘贴图片 / 拖放 | ✅ | ✅ 图片粘贴（拖放留待） | ctrl+v（pi app.clipboard.pasteImage；Windows 下 alt+v 同 pi windowsKeybindings）：macOS osascript PNGf hex 解码；Windows/WSL PowerShell Clipboard::GetImage → Save %TEMP% → 读回（WSL 经 wslpath 转换读 /mnt）；文本回退 pbpaste/Get-Clipboard/xclip；路径插入编辑器，模型经 read 工具读图（pi 同款"临时文件+路径"流）；拖放需终端上报协议，留待。注：Windows 分支代码就位，随整个应用的 Windows 移植里程碑启用（TUI 终端层目前 POSIX 专属） |
+| 粘贴图片 / 拖放 | ✅ | ✅ | 图片粘贴 ctrl+v（alt+v Windows）：macOS osascript PNGf hex 解码；Windows/WSL PowerShell Clipboard::GetImage → Save %TEMP% → 读回（WSL 经 wslpath 转换读 /mnt）；文本回退 pbpaste/Get-Clipboard/xclip；路径插入编辑器，模型经 read 工具读图（pi 同款"临时文件+路径"流）。**拖放已覆盖**：现代终端（Ghostty/iTerm2）拖文件 = bracketed paste 文件路径，zpi 的 bracketed paste（`ESC[200~…201~` 单键块）已处理，无额外协议需求。注：Windows 分支代码就位，随整个应用的 Windows 移植里程碑启用（TUI 终端层目前 POSIX 专属） | ctrl+v（pi app.clipboard.pasteImage；Windows 下 alt+v 同 pi windowsKeybindings）：macOS osascript PNGf hex 解码；Windows/WSL PowerShell Clipboard::GetImage → Save %TEMP% → 读回（WSL 经 wslpath 转换读 /mnt）；文本回退 pbpaste/Get-Clipboard/xclip；路径插入编辑器，模型经 read 工具读图（pi 同款"临时文件+路径"流）；拖放需终端上报协议，留待。注：Windows 分支代码就位，随整个应用的 Windows 移植里程碑启用（TUI 终端层目前 POSIX 专属） |
 | 管道 stdin 并入首条 prompt | ✅ | ✅ | 非 TTY stdin 读入并入首条；interactive 下有 stdin 降级 print（pi readPipedStdin + resolveAppMode） |
 | 未识别 `/命令` 作为消息发送 | ✅ | ✅ | 本轮修复：`--no-session` 下 store 检查拦截所有 `/xxx` 的 bug；未识别 slash 命令（含粘贴的 /tmp 路径）作为普通消息发送（pi 语义） |
 | `!cmd` 输出进会话 / `!!` 静默执行 | ✅ | ✅ | shell.exec（30s 上限）→ bashExecution 消息（pi JSONL 格式 command/output/exitCode/excludeFromContext）→ wire user 文本（bashExecutionToText）；`!!` 排除；回放渲染 |
@@ -85,14 +85,14 @@ zpi 扩展系统             →  src/ext/                   (扩展点、钩子
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
 | JSONL 持久化（v3 树结构 id/parentId） | ✅ | ✅ | `~/.pi/agent/sessions/--path--/<ts>_<uuid>.jsonl`；分支树 + branchMessages |
-| 会话头/消息/压缩/分支摘要/自定义条目 | ✅ | ❌ | entry 类型全集见 session-format.md |
+| 会话头/消息/压缩/分支摘要/自定义条目 | ✅ | ✅ | B2：session header / message（AgentMessage 全量 block）/ compaction / branch-summary / custom-message（entry 类型全集见 session-format.md） |
 | `--continue` 最近会话 | ✅ | ✅ | |
-| `--resume` 选择器 | ✅ | ⚠️ | CLI 有 --resume/--session <id>；交互选择器在 TUI /resume |
+| `--resume` 选择器 | ✅ | ✅ | CLI `--resume`（无参）启动即开选择器（`startup_resume`，pi SessionSelectorHeader 提示行）；TUI `/resume [id]` 同选择器；`--session <path|id>` 直进 |
 | `--session`/`--fork`/`--no-session`/`--name`/`--session-dir` | ✅ | ✅ | 支持 path 或 partial id |
-| `/new` `/resume` `/name` `/session` `/tree` `/fork` `/clone` `/import` | ✅ | ⚠️ | 缺 /clone /import |
+| `/new` `/resume` `/name` `/session` `/tree` `/fork` `/clone` `/import` | ✅ | ✅ | /clone（store.fork + switchToStore）、/import（复制 JSONL 进 sessions dir + 切换，保留 id/cwd）均已实现 |
 | 树导航 + 分支摘要 | ✅ | ✅ | /tree=交互选择器（leaf 链+图标+预览+视口滚动）；选中点分支 → **LLM 生成被弃路径摘要** → branch_summary entry（pi branchWithSummary）→ transcript 重建；选中 leaf 提示 "Already at this point" |
-| /export（HTML/JSONL）、/copy、/share（gist/radius） | ✅ | ❌ | 均未实现；复制场景由 ctrl+x（选区/最后回复，OSC52）覆盖 |
-| 会话按 cwd 分组、选择器搜索/改名/删除 | ✅ | ✅ | /resume=modal 选择器：↑↓+视口、**输入实时过滤**（id+name 大小写不敏感）、**ctrl+d 删除**（pi SessionSelector 语义）、Enter 恢复（重建 context+transcript，回放 model_change/thinking_level） |
+| /export（HTML/JSONL）、/copy、/share（gist/radius） | ✅ | ⚠️ | /export ✅（默认 .html = exportHtml，.jsonl = store 原文复制）；/copy ✅（最后 assistant 文本 → 剪贴板）；ctrl+x（选区/最后回复，OSC52）✅；/share 占位（需 Radius/gist 后端，K3） |
+| 会话按 cwd 分组、选择器搜索/改名/删除 | ✅ | ✅ | /resume=modal 选择器：↑↓+视口、**输入实时过滤**（id+name 大小写不敏感）、**ctrl+d 删除**（pi SessionSelector 语义）、Enter 恢复（重建 context+transcript，回放 model_change/thinking_level）；**列表预览智能折叠**：首条 user 消息若是 `<skill>` 块则显示 `skill: <name>`（有 args 显示 args），否则截断文本（`userPreview`/`skillPreview`，对齐 pi 会话列表不露原始 XML） |
 
 ### 5. 压缩（Compaction）
 
@@ -151,15 +151,15 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 | `/settings` 对话框、`/debug` | ✅ | ✅ | **pi SettingsSelectorComponent 全对齐（35 项）**：渲染在**编辑器边框内**（搜索行/条目/计数 (n/35)/空行/描述/键位提示行——pi SettingsList.renderMainList 逐行复刻）；**Type to search**（editor 即搜索框）+ Enter/Space 循环值 + Esc 关闭；条目=pi 全集原序原文 desc；真实生效项=Auto-compact/Skill commands/Autocomplete max/Steering/Follow-up/Hide thinking/Default project trust/Fullscreen scrollbar/Copy on select/Wheel scrolling，其余占位（Enter 提示 not implemented）；**切换静默**（pi 无 "set to" note，行内值即反馈）且 **Auto-compact 同步 session.compaction 副本**（footer "(auto)" 标记与 maybeAutoCompact 立即生效）；改动即 persistSettings；**模态选择器边框固定蓝**（pi theme.border：settings/scoped/sessions/tree/fork/mcp/trust 打开时 BORDER_INFO 蓝，退出恢复 thinking 档位色——idle 紫/high 紫等）；编辑器补 **`> ` prompt**（wrap 缩进+光标 inset）；/debug（隐藏命令）：终端尺寸 + 渲染行 + 会话 JSONL → /tmp/zpi-debug-*.log |
 | `!cmd` / `!!cmd`、`@file` 补全、Tab 路径补全 | ✅ | ✅ | !cmd/!!cmd ✅；**@file 实时菜单** ✅（输入 `@token` 即弹：token 边界检测（@ 在行首/空白后、无空格）、目录部分进入子目录、fuzzy 过滤+目录加权+深度排序、目录带 `/` 补全、选择后抑制重弹（token 相同不再弹出）、Tab/Enter 应用、Esc 关闭、继续输入实时过滤——pi autocomplete `@` 触发语义；**Tab 在无菜单时手动（重新）打开 @ 菜单**（含目录内二次补全：@zebra_dir/ + Tab → 列出目录内文件）；简化：无 fd 工具递归遍历（仅 cwd+子目录进入））；CLI `@file` 位置参数 ✅ |
 | Ctrl+G 外部编辑器 | ✅ | ✅ | $EDITOR/VISUAL，挂起→编辑→恢复全量重绘 |
-| 运行中输入（steering/follow-up/Escape 中断） | ✅ | ✅ | Escape/Ctrl+C 中断✅；**steering 队列**✅（运行中 Enter → 下一 LLM 请求前注入 context，pi getSteeringMessages 语义）；**follow-up 队列**✅（alt+enter 排队 → 回合结束自动续跑为新回合，pi followUpQueue）；**alt+up/alt+v 恢复排队消息到编辑器**✅（app.message.dequeue）；运行中编辑器 live（watcher 分发编辑器键，光标常驻输入框） |
+| 运行中输入（steering/follow-up/Escape 中断） | ✅ | ✅ | Escape/Ctrl+C 中断✅；**steering 队列**✅（运行中 Enter → 下一 LLM 请求前注入 context，pi getSteeringMessages 语义；渲染时机 = 注入时（`steering_injected` 事件），排队期仅 `Steering:` 待发行）；**follow-up 队列**✅（alt+enter 排队 → 回合结束自动续跑为新回合，pi followUpQueue）；**alt+up/alt+v 恢复排队消息到编辑器**✅（app.message.dequeue；含 macOS CSI 1;<mod> A/B alt 位解析修复——Ghostty/iTerm2 的 Option+↑ 此前被当普通 ↑）；待发行下方 dim 提示行 `↳ alt+up to edit all queued messages`（pi updatePendingMessagesDisplay）；运行中编辑器 live（watcher 分发编辑器键，光标常驻输入框） |
 | Ctrl+O 折叠工具输出、Ctrl+T 隐藏 thinking | ✅ | ✅ | Ctrl+O 预览↔全文；Ctrl+T 全局显隐 + 单块点击折叠 |
 | 页脚（cwd、session、model、context%、cost） | ✅ | ✅ | cwd+git 分支+session 名；↑↓R/W/CH$、ctx% 变色+(auto)；右侧 (provider) model • thinking |
-| 启动 header（欢迎 + 已加载资源清单） | ✅ | 🚧 | 欢迎头✅：文档首块（pi headerContainer 语义，继续会话钉底不可见）、compact 文案（wordmark+版本+快捷键+onboarding）；技能已加载并进系统提示（`skills.zig`）；"已加载资源清单"（Context/Skills/Extensions）header 展示 ⏳ |
+| 启动 header（欢迎 + 已加载资源清单） | ✅ | ✅ | 欢迎头✅：文档首块（pi headerContainer 语义，继续会话钉底不可见）、compact 文案（wordmark+版本+快捷键+onboarding）；技能已加载并进系统提示（`skills.zig`）；**已加载资源清单**✅：`[Prompts]`/`[Skills]` 紧凑名列表（compact 排序折叠 / expanded 带 [user]/[project] scope，pi showLoadedResources 的 formatCompactList 语义）；**`[Skill warnings]` 段**✅（warning 色，path+message 两行/条，pi 同构——skills.zig `DiscoverResult.diagnostics`：name 校验/description 超长/同名冲突/读失败，warning 不阻断加载） |
 | 会话继续界面回放（-c/-r） | ✅ | ✅ | replaySession 对齐 pi renderInitialMessages：user/assistant/thinking 块 + 工具块按 id 配对回填 |
 | markdown 渲染 + 代码高亮 + diff 视图 | ✅ | ✅ | markdown 全块（标题/列表/嵌套/表格全边框/引用/hr/链接）；轻量代码高亮；diff 行级红绿 + **word 级反色（1:1 修改对，pi renderIntraLineDiff 语义）**；**OSC8 终端超链接**（链接+裸 URL；tmux/dumb 自动关闭，断行重开，truncateToWidth OSC 撕裂修复）；**LaTeX→unicode**（latex.zig：符号表/frac/sqrt/上下标/\left\right/\text；块级 $$…$$、\[…\ 与内联 $…$、\(…\；流式未闭合按原文渲染）；**流式块级增量渲染（自研增强）**；简化：无 pi 的 2D 分数堆叠排版（超宽回退原文同为 pi 行为） |
-| 主题系统（JSON 主题文件、/settings 切换） | ✅ | ⚠️ | theme.zig 仅颜色枚举 |
+| 主题系统（JSON 主题文件、/settings 切换） | ✅ | ✅ | **H3**：内置 dark/light（对齐 pi 1.5.0 theme JSON 色值）+ 自定义主题发现/加载（`~/.pi/agent/themes/*.json`，`listCustomThemes`/`loadCustomTheme`）；**`/themes` 选择器**（pi ThemeSelector：内置+自定义列表、过滤、Enter 应用）；`/settings` Theme 项（dark/light 切换）；settings.json `theme` 键持久化（dark/light/自定义名） |
 | 快捷键管理器（keybindings.json） | ✅ | ✅ | Action 全集（含滚动/搜索/菜单/本轮 7 个新键位）、keybindings.json 加载覆盖、pi 默认键位 |
-| 鼠标、IME、OSC8 链接 | ✅ | 🚧 | 鼠标✅：点击折叠、拖拽选区、松开复制（OSC52）、滚轮加速、水平滚轮过滤（pi parity）；IME/OSC8 ⏳ |
+| 鼠标、IME、OSC8 链接 | ✅ | ✅ | 鼠标✅：点击折叠、拖拽选区、松开复制（OSC52）、滚轮加速、水平滚轮过滤（pi parity）；**OSC8 终端超链接**✅（markdown.zig：链接+裸 URL，tmux/dumb 自动关闭，断行重开）；IME ✅（KeyReader 重组器消费 IME 提交批次，拼音 E2E 验证） |
 
 ### 8. 进程模式
 
@@ -177,9 +177,9 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
 | 扩展：registerTool / 命令 / 事件钩子（tool_call 拦截）/ 自定义渲染 / UI 组件 | ✅ TS 进程内 | ❌ | 决策点：Zig 动态库 or 内嵌脚本解释器，见 Phase 9 |
-| Skills（SKILL.md、agentskills.io 规范、/skill:name、按需加载） | ✅ | ✅ | `skills.zig`：4 处发现（agent/skills、~/.agents/skills、cwd/.pi/skills、cwd/.agents/skills）+ 递归（含 SKILL.md 目录=根）+ 最小 frontmatter 解析 + 名字校验 + 无描述跳过 + 同名去重；系统提示 `<available_skills>` 广告；`/skill:name [args]` 读正文包 `<skill>` 块发送（pi invokeSkill）；`/skill:<tab>` 补全；**转写折叠渲染**（pi SkillInvocationMessageComponent：一行 `[skill] name`，点击/Ctrl+O 展开，args 独立 user 消息，`-c` 回放同样折叠）；6 单测 + E2E |
+| Skills（SKILL.md、agentskills.io 规范、/skill:name、按需加载） | ✅ | ✅ | `skills.zig`：4 处发现（agent/skills、~/.agents/skills、cwd/.pi/skills、cwd/.agents/skills）+ 递归（含 SKILL.md 目录=根）+ 最小 frontmatter 解析 + 名字校验 + 无描述跳过 + 同名去重；系统提示 `<available_skills>` 广告；`/skill:name [args]` 读正文包 `<skill>` 块发送（pi invokeSkill）；`/skill:<tab>` 补全；**转写折叠渲染**（pi SkillInvocationMessageComponent：一行 `[skill] name`，点击/Ctrl+O 展开，args 独立 user 消息，`-c` 回放同样折叠）；**`[Skill warnings]` 诊断**✅（`DiscoverResult{skills, diagnostics}`：name 校验/description 超长/同名冲突/读失败 → 欢迎头 warning 色段，warning 不阻断加载，pi skills.js 同构）；7 单测 + E2E |
 | Prompt templates（Markdown、$1/$@/默认值） | ✅ | ✅ | Phase D：agent-dir/prompts + cwd/.pi/prompts；`/name args` 展开 $1..$n/$@/$ARGUMENTS/${N:-default}/${@:N[:L]}（bash 引号解析）；未识别 slash 回退模板 |
-| 主题 JSON 文件 | ✅ | ⚠️ | theme.zig 仅硬编码 ANSI 暗色；JSON 主题发现/加载 + /settings 切换 + truecolor 迁移 ⏳（H3） |
+| 主题 JSON 文件 | ✅ | ✅ | **H3**：内置 dark/light + `~/.pi/agent/themes/*.json` 自定义主题（发现/加载/应用全链路）；`/themes` 选择器 + `/settings` Theme 项 + settings.json `theme` 持久化（pi 兼容键名） |
 | Pi packages（npm/git/local 安装分发、`pi install/remove/update/list`） | ✅ | ❌ | 依赖扩展机制成型 |
 | `/reload` 热重载 | ✅ | ✅ | 重新发现技能 + 重建系统提示 + 更新 context（模板本就每次提交时新鲜发现，无需缓存） |
 
@@ -199,11 +199,11 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 
 | 功能 | pi | rpi-zig | 说明 |
 |---|---|---|---|
-| settings.json（模型/工具/会话/压缩/交互/主题…） | ✅ 全量 | ⚠️ | 目前只读 defaultProvider/defaultModel |
+| settings.json（模型/工具/会话/压缩/交互/主题…） | ✅ 全量 | ✅ | 消费键：defaultProvider/defaultModel/steeringMode/followUpMode/fullscreenScrollbar/fullscreenCopyOnSelect/fullscreenWheelLines/tuiMode/defaultProjectTrust/defaultThinkingLevel/theme/defaultTools/compaction{enabled,reserveTokens,keepRecentTokens}/showImages + 写入（persistSettings 保留未知字段）；/settings 可切换项即时生效 + 持久化 |
 | 项目级 `.pi/settings.json`、`.pi/mcp.json`、`.pi/extensions/` | ✅ | ⚠️ | **trust 门控已落地**：trusted 时加载项目 settings/mcp/skills/prompts；extensions 待 Phase I |
 | 配置优先级 CLI > env > 项目 > 用户 | ✅ | ⚠️ | 项目 `.pi/settings.json`（trusted）覆盖用户级（defaultProvider/defaultModel/defaultTools/defaultProjectTrust/fullscreen*/compaction）；CLI --tools 仍最高；**defaultTools 项目覆盖在 ask 场景需重启生效**（CLI --tools 时跳过） |
 | 项目信任（trust prompt、`/trust`、`-a/-na`） | ✅ | ✅ | pi trust-manager/project-trust 完整移植（`src/core/trust.zig`）：`trust.json` `{abs-path: true|false}`（键排序+尾换行）；**get 沿祖先链就近继承**（父信任覆盖子项目）；门控资源检测（`.pi/{settings,mcp}.json/extensions/skills/prompts/themes/SYSTEM.md/APPEND_SYSTEM.md` + cwd 祖先链 `.agents/skills`）；resolve 顺序 = CLI override(`--approve/-a`、`--no-approve/-na`) > 存档 > 无门控资源默认信任 > defaultProjectTrust 设置(ask/always/never) > **TUI 交互提示**（pi TrustSelector 五选项：Trust / Trust parent / Trust session-only / Do not trust / Do not trust session-only；面板含 cwd/Saved decision/Current session）；**Trust 热加载**（项目 mcp 重连+工具重注册+过滤重放 + skills/prompts 刷新，reload 钩子 main→TUI 回调）；`/trust` 重选（pi showTrustSelector）；项目 skills/prompts discover 加 `include_project` 参数门控 |
-| 环境变量（PI_CODING_AGENT_DIR✅、SESSION_DIR、PI_OFFLINE…） | ✅ | ⚠️ | |
+| 环境变量（PI_CODING_AGENT_DIR✅、SESSION_DIR、PI_OFFLINE…） | ✅ | ⚠️ | PI_CODING_AGENT_DIR（+RPI_ 别名）✅、--session-dir ✅；$ZPI_HTTP_IDLE_TIMEOUT_MS/$ZPI_HTTP_DATA_TIMEOUT_MS 看门狗调参 ✅；PI_OFFLINE 等其余待用 |
 
 ## 二、复刻路线图（按依赖顺序排列）
 
@@ -238,14 +238,14 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 
 > **验证**：暗号召回 E2E（压缩后模型仍召回 `BLUE-FOX-42`）；文件跟踪（readFiles 正确记录 `marker.txt`）；JSONL 有效；压缩路径 0 泄漏。修复：`Message.clone` 未复制 `usage`（导致 `--continue` 后估算偏低）。
 
-### Phase D — 上下文组装（~1k 行）
+### Phase D — 上下文组装（~1k 行）✅ 完成（D1–D5）
 - [x] D1 系统 prompt 分节结构（`src/core/system_prompt.zig`：preamble/tools/rules/addendum/project_context/cwd，对齐 pi `system-prompt.js`）；sections 持久化补丁 ⏳（随扩展系统）
 - [x] D2 AGENTS.override.md/AGENTS.md/CLAUDE.md 发现（agent 目录全局 + cwd 祖先链 root→cwd，去重）
-- [ ] D3 `@file` 附件（文本+图片 base64）
-- [ ] D4 `!cmd`/`!!cmd`（TUI）
-- [x] D5 `--system-prompt`（整体覆盖）/`--append-system-prompt`（addendum 段）；管道 stdin 并入 prompt ⏳
+- [x] D3 `@file` 附件（文本+图片 base64）：CLI 位置参数，文本 `<file name>` 包裹、图片魔数检测 → ImageBlock（见矩阵 §2）
+- [x] D4 `!cmd`/`!!cmd`（TUI）：shell.exec → bashExecution 消息 → wire 文本，`!!` 排除出 context（见矩阵 §2）
+- [x] D5 `--system-prompt`（整体覆盖）/`--append-system-prompt`（addendum 段）；管道 stdin 并入 prompt（非 TTY 读入并入首条，interactive 降级 print）
 
-> **D 已完成**：`buildSystemPrompt` + `loadProjectContextFiles`（E2E 验证：AGENTS.md 暗号召回、祖先链、CLAUDE.md 回退、覆盖/追加标志、0 泄漏）。D3/D4 属输入处理，独立推进。
+> **D 已完成**：`buildSystemPrompt` + `loadProjectContextFiles`（E2E 验证：AGENTS.md 暗号召回、祖先链、CLAUDE.md 回退、覆盖/追加标志、0 泄漏）；D3/D4/D5 均已落地（见矩阵 §2）。
 
 ### Phase E — 工具对齐（~2k 行）【E1/E5/E6 是跨平台硬性要求】
 - [x] E1 Shell 抽象层：`src/tools/shell.zig`（unix `/bin/sh -c` / windows `powershell -NoProfile -Command`）；双 reader 线程读管道 + 主线程 10ms 轮询 timeout/abort；`kill`/`wait` 互斥清理管道
@@ -275,14 +275,14 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 - [x] E8 Message 图片 content block + provider 编码
 - [ ] E9 路径审计：代码里手工 '/' 分隔的地方全部改走 `std.fs.path`
 
-### Phase F — Provider 扩展（~2.5k 行）
-- [ ] F1 anthropic-messages（SSE、tool_use、cache_control）
-- [ ] F2 openai-responses、google-generative-ai
-- [ ] F3 thinking 级别机制（thinkingLevelMap、预算 clamp、`--thinking`、`:level` 后缀）
-- [ ] F4 模型模糊匹配 + `--provider` + `--api-key` + `--models` 作用域 + enabledModels 轮换
-- [ ] F5 内置目录扩充（按需：anthropic/openai/deepseek/moonshotai-cn/qwen-token-plan-cn/minimax-cn/kimi-coding…）
-- [ ] F6 `pi auth check/print-api-key` 子命令；OAuth 可最后（radius 依赖 pi.dev）
-- [ ] F7 compat 消费：thinkingFormat（zai/qwen-chat-template/deepseek…）、samplingParams
+### Phase F — Provider 扩展（~2.5k 行）✅ 完成（F1–F5/F7，Phase 6 交付；仅 F6 OAuth/auth 子命令待 J6）
+- [x] F1 anthropic-messages（SSE、tool_use、thinking budget；cache_control 待真模型联调）
+- [x] F2 openai-responses、google-generative-ai
+- [x] F3 thinking 级别机制（thinkingLevelMap、预算 clamp、`--thinking`、`:level` 后缀、thinkingFormat 三形态）
+- [x] F4 模型模糊匹配 + `--provider` + `--api-key` + `--models` 作用域（resolveModelPattern：精确/ambiguous/fuzzy/alias 优先/custom-id fallback）
+- [x] F5 内置目录扩充：catalog.json 生成式内置 23 家 provider / ~700 模型（tools/gen_catalog.py，见矩阵 §6）
+- [ ] F6 `pi auth check/print-api-key` 子命令；OAuth 可最后（radius 依赖 pi.dev；/login /logout 的 api_key 类已完成）
+- [x] F7 compat 消费：thinkingFormat（zai/qwen/deepseek）+ thinkingLevelMap + cost/images；strict/mid-convo/cache-control 类待真模型联调
 
 ### Phase G — TUI 对齐（~4k 行，最大单体）
 - [~] G1 组件系统：✅ Text/VStack/Spacer/Box（component.zig）+ ScrollView（scroll_view.zig，批次 9）；待 SelectList/Loader/Input 独立组件
@@ -305,11 +305,11 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
   - **`/model` 选择器**：列出 models.json 全部模型（名称+provider），模糊过滤，Enter 热切换（新建 provider + 换 session.model/provider/thinking_level + 状态行更新）；`/model <name>` 直接切换；owned_provider 生命周期管理（deinit 释放）
   - E2E：'/'→菜单出现；'he'→过滤到 /help；Enter→执行；'/model '→模型菜单；Tab 补全；down+Enter→热切换成功（状态行更新）；markdown 渲染（fence+样式）✓；50 UI + 52 泄漏测试 + 全部旧 E2E 回归通过
 - [x] G4 `/` 命令菜单（模糊搜索）、`/model` 选择器；`/thinking` 保留 /think 形式；/settings 待 Phase H
-- [~] G5 页脚全家桶：✅ cwd/session8/model/ctx%/cost + `/exit` 提示；待启动 header（cwd + model + session 信息）
+- [x] G5 页脚全家桶：✅ cwd/session8/model/ctx%/cost + `/exit` 提示 + 启动 header（欢迎头 + 已加载资源清单 + [Skill warnings]，见矩阵 §7）
 - [x] G6 markdown/代码高亮 ✅（见批次 3）+ **批次 7：表格渲染**：管道表格（`| a | b |` + 分隔行）→ 对齐列（box-drawing `│ ├ ┼`、列宽=可见宽最大值、超宽自适应收缩、单元格支持 inline 样式、ANSI 感知截断）；E2E：真实模型表格 → `│/├/┼` 边框 + 单元格对齐 ✓
 - **批次 5：diff 渲染 + 工具块**：tool_info 分流到 stream_tool（不再混入 assistant 文本）；`addToolActivity` 彩色渲染（`● 工具名` accent + 参数截断、diff `+`行绿 `-`行红、Successfully 绿/error 红、`...` 暗色、逐行截断）；E2E：真实模型 edit → 红删/绿增/工具头/摘要全出现；待 Ctrl+O 折叠、Ctrl+T thinking 开关、表格
 - [x] G7 keybindings.json（keybindings.zig，16 测试）：11 个可配置 action（newline/submit/clear_editor_exit/external_editor/menu_*/toggle_tools/toggle_thinking）；pi 格式（`action: key | [keys]`，提及即整组替换默认）；parseKeyStr（ctrl/alt/shift 修饰 + 命名键 + alt+enter→char）；run loop 全部走 bindings + canonical 键翻译（newline→shift_enter、submit→enter、**未绑定的 enter→换行 fallback**）；文件缺失→默认。附带修 **IXON bug**（Ctrl+S 被 tty 流控制吞掉导致重绑 submit 失效）。E2E（PI_CODING_AGENT_DIR 隔离）：submit=ctrl+s → enter 不提交、ctrl+s 提交 ✓；`/hotkeys` 待做
-- [ ] G8 主题 JSON + `--use-theme`；steering/follow-up/Escape 的交互接线
+- [x] G8 主题 JSON（H3：内置 dark/light + 自定义 themes/*.json + /themes 选择器）；steering/follow-up/Escape 的交互接线（批次 4/11 + steering 深度对齐批次：watcher 分发、queueSteering/queueFollowUp、ESC 恢复队列、alt+up dequeue、`steering_injected` 渲染时机）
 - **批次 8 ✅（TUI 内容显示对齐 pi，对照 pi 1.5.0 渲染源码逐项核对）**：
   - **回合事件日志**（`agent.zig` `TurnEvent`：thinking/text/tool_start/tool_result/compaction/note，按发生顺序）：TUI 事件到达即渲染——**工具执行过程可见**（pending 灰框 → 结果原地变绿/红，对齐 pi ToolExecutionComponent）；回合内顺序与 pi 一致（文本→工具→文本交错），不受 auto-compact 重建影响；print 模式 stderr 输出不变。`ToolResult.duration_ms`（并行执行器逐工具计时）
   - **工具块**（新 `src/ui/tool_block.zig`，23 测试）：前置空行 + 全宽背景 Box（pending/success/error 三态，pi 精确 RGB）+ per-tool 头部（`$ cmd (timeout Ns)` 粗体 / `read path:5-14` 路径紫+行范围黄 / `edit|write path` / `grep /pat/ in path (glob) limit N` / `find` / `ls` / 未知工具 key=value≤100 字符）；折叠预览对齐 pi（bash 尾 5 视觉行+hint、grep 15、find/ls 20、write 10、read 成功仅头部、错误前 10 行）；`Took 4.2s/1m 30s`；edit 只显示 diff（红删/绿增/muted 上下文），write 预览写入内容；输出 sanitize（剥 ANSI/控制字符/tab→3 空格）；Ctrl+O 切预览↔全文（记录 scrollback 索引原地重渲染）
@@ -428,11 +428,12 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 - **工具块 diff/长行渲染修复（CJK + ANSI 折行损坏）**（用户反馈截图：diff 视图行首漏出 `27m`/`[27m` 字面碎片、白底续行顶到第 0 列、CJK 变 `?` 菱形串）：两处根因都在 `tool_block.zig`——① `wrapSpans` 逐字符折行**不认识 ANSI 转义序列**：`\x1b[27m` 的 ESC 计 0 列但 `[27m` 计 4 列可见宽，行超宽时还能从序列**中间**断开（行尾悬半个 CSI → 终端把后续 `\n` 也吞进参数里，两行拼成一超长行——这正是续行顶到第 0 列的来源）。修复：循环里 ESC 序列整体跳过（`escapeEnd`），零宽原子单元；② `tokenizeWords`（word-diff 反色分词）按**字节**分词：CJK 行每字节一个 token，LCS 路径的反色区间（`ESC[7m…ESC[27m`）切进多字节字符中间 → 终端渲染 `?` 菱形。修复：多字节字符（`charLen`）整体一个 token，反色边界永不切字符。验证：tool_block 25 测试（+2：edit diff 管线断言无转义碎片/无 `?`/内容完整；wrapSpans 单测断言剥离转义后零残留且行宽 ≤ 上限）；pty E2E 4/4（mock 模型对中文 markdown 发 edit 调用：回合完成出 diff、无 `27m`/`[7m` 碎片、无 `?` 菱形、CJK 内容完整）；全套件 613 过
 - **Steering 队列行折行 + 压缩时光标错位**（用户反馈截图：① `Steering:` 后两行内容只显示一行；② 压缩时硬件光标停在 `Compacting context...` 边框行而非编辑框）：两处根因——① pending 行（`renderLiveQueue`/`renderCompactQueue`）把队列文本拼成单行后 `truncateToWidth` 硬截断，且布局预算按**消息条数**（`queuedPeekLen`/`compact_queue.items.len`）而非折行后行数计算。修复：`appendPendingRows` 用 `wrapPlain`（显式换行保留 + 空格断行 + CJK 宽度感知）折行，首行带 `Steering: `/`Follow-up: ` 标签、续行缩进对齐；预算改用 `session.queuedPeekRows(width)`（agent.zig 新增，按 label 宽度 10/11 扣减后数折行）与 `compactQueueRows()`；② `cursor_row = transcript_h + 1 + …` 漏了 `compact_q_h`——压缩时队列行插在 transcript 与顶边框之间，光标整体偏高。修复：`cursor_row` 补 `+ compact_q_h`。验证：test_pending 157（+1：长消息折行 >1 行、内容完整、预算==渲染行数、多行保留换行）；全套件 614 过；用户实机确认
 - **HTTP 错误详情展示（对齐 pi 的 `Error: <status>: <body>`）**（用户反馈：请求失败时 TUI 只显示笼统的 `[error: HttpError]`，无法诊断）：对照 pi-ai `error-body.js`/`formatProviderError` + `assistant-message.js`（红色 `theme.fg("error")` 纯文本）实现——① **provider 层**：四 provider 非 2xx 时 `last_error_buf` 写 `"<status>: <body>"`（`sse.zig postSse` 新增 `err_len` 参数同步长度，修复 SSE 系 provider `last_error_len` 从未更新导致 `lastErrorText()` 恒空的既有 bug；openai 自读路径同格式）；**SSE 流内错误**：anthropic/google/responses 的 `event:error` 与 openai 兼容服务器的 `{"error":{"message":...}}` chunk（choices 缺失分支）捕获 message 进 `storeErrorText`（`?[]const u8`，null 清空，pub 供 `AnyProvider` 分发）；② **agent 层**：每轮 LLM 前 `setLastError(null)` 清残留；传输失败（连 HTTP 响应都没有，buffer 为空）补 `transport error: <name>`（`setLastErrorIfEmpty`）；③ **TUI 层**：`addErrorLine` = 空行 + `Error: <detail>` 红色块（`FG_ERROR`），纯文本（`.plain` 源，防原始 HTTP body 破坏 markdown 布局）+ `wrapPlain` 按内容宽度折行 + 两侧 1 列 padding（`.plain` 在 resize 时保留原渲染，颜色不丢）；三处 `[error: {name}]` 调用点替换。验证：假 401 服务器（隔离 PI_CODING_AGENT_DIR + models.json 指向 127.0.0.1）`-p` 输出 `401: {"error": {"message": "Invalid API key provided: ..."}}` 全详情；全套件 644 过
+- **macOS Option+↑ 解析修复 + 排队提示行 + steering 渲染时机对齐 pi**（用户实测：alt+up 撤销无效 + 任务入队后内容区提前显示 + 缺提示行）：三个问题——① **keys.zig `CSI 1;<mod> A/B` 分支把 alt 位硬编码为 false**：macOS 终端（Ghostty/iTerm2）的 Option+方向键走 `ESC[1;3 A` 序列，alt 位被丢弃 → Option+↑ 被当普通 ↑，dequeue 分支永不触发（kitty 57419 路径本来就对，legacy 路径漏了）；修复后 `ESC[1;4A`→alt_up、`ESC[1;3B`→alt_down（旧测试固化了 bug 行为，已更新）；② **待发行提示行**（pi updatePendingMessagesDisplay）：排队消息下方补 dim `↳ alt+up to edit all queued messages`（计入帧高度预算 + 编辑器几何 q_h，editor_frame_row 测试期望 +1）；③ **steering 渲染时机**（用户实测：入队即显示进内容区，alt+up 撤回后残留孤儿块）：watcher Enter 分支不再 `addUserMessage`，改为 `drainSteeringIntoContext` 注入 context 时发新 `TurnEvent.steering_injected` → TUI 此刻才渲染 user 块 + 钉底——排队期只有 `Steering:` 待发行，撤回不留痕（pi 语义）。验证：test_ui 299 / test_pending 212（新增 drain 时机单测：入队无事件、drain 后恰好 1 个 steering_injected、消息进 context）
 ### Phase H — 资源系统（~1.5k 行）
 - [x] H1 Skills：`skills.zig` 发现/解析/校验/去重 + 系统提示广告 + `/skill:name` + `/skill:<tab>` + 6 单测 + E2E（`15ade5a`）
 - [x] H2 Prompt templates：Phase D 完成（发现/$1/$@/默认值/未识别 slash 回退）
-- [ ] H3 主题文件发现与加载（JSON 主题 + /settings 切换）
-- [ ] H4 `.pi/` 项目配置 + trust 门控（`-a/-na`、`/trust`）
+- [x] H3 主题文件发现与加载（JSON 主题 + /settings 切换）：内置 dark/light（对齐 pi 1.5.0 theme JSON）+ `~/.pi/agent/themes/*.json` 自定义主题（`listCustomThemes`/`loadCustomTheme`）+ `/themes` 选择器（pi ThemeSelector）+ `/settings` Theme 项 + settings.json `theme` 持久化
+- [x] H4 `.pi/` 项目配置 + trust 门控（`-a/-na`、`/trust`）：trusted 时加载项目 settings/mcp/skills/prompts；trust.json 祖先链继承 + TUI TrustSelector 五选项 + Trust 热加载（见矩阵 §11）
 - [x] H5 `/reload`：重载技能 + 重建系统提示 + 更新 context
 
 ### Phase I — 扩展系统（~1.5k 行，零依赖方案）
@@ -459,8 +460,8 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 ### Phase K — JSON/RPC 模式与分发（~2k 行）
 - [x] K1 `--mode json`：事件全集（agent_start/turn_*/message_*/tool_*/compaction/...）
 - [x] K2 `--mode rpc`：命令集（prompt/steer/follow_up/abort/clear_queue/new_session/get_state/set_model/cycle_model/get_available_models/set_thinking_level/cycle_thinking_level/get_available_thinking_levels/set_steering_mode/set_follow_up_mode/compact/set_auto_compaction/set_auto_retry/bash/abort_bash/get_session_stats/export_html/switch_session/fork/clone/get_fork_messages/get_entries/get_tree/get_last_assistant_text/set_session_name/get_messages/get_commands）+ 事件流复用 K1 + Python E2E 20 步全过（mock SSE，/tmp/e2e_rpc/test.py）+ test_rpc.zig 单测。实现：src/core/rpc.zig（stdin 线程解析入队 + 主循环执行 + 1 字节流式读避免 SSE 批处理 bug；Job 字段 dup 防悬垂；prompt 响应在 turn 结束后发出）
-- [ ] K3 `/share`（gist 最小实现，radius 可选）、`/bug`（可裁剪）
-- [ ] K4 子命令收尾：`pi config`、`pi list`、`--export`、`--version`、`--help` 全量对齐；package 安装（npm 源最小化 = tarball HTTP 下载 + std.tar 解包，无 npm 进程依赖）
+- [~] K3 `/bug` ✅（issue 链接+描述）；`/share`（gist/radius 后端）待做
+- [~] K4 子命令收尾：`--version` ✅、`zpi mcp list/add/remove/login/logout` ✅、`--list-models` ✅；`pi config`/`pi list`/`--export`/`--help` 全量对齐待做；package 安装（npm 源最小化 = tarball HTTP 下载 + std.tar 解包，无 npm 进程依赖）待做
 - [ ] K5 **跨平台矩阵发布**：darwin/linux/windows × x86_64/aarch64 六个静态二进制；windows 终端 raw mode 用 Win32 Console API（OS API 不算依赖）；HOME→USERPROFILE；CI 矩阵构建
 - [ ] K6 `pi update` 自更新（可裁剪：检查 release 版本号 + 替换自身二进制）
 
@@ -494,7 +495,7 @@ parse 请求体掩盖——google E2E 抓到 parts 数组 `[,` 非法 JSON）；
 | Double-escape action (double-escape-action) | `doubleEscapeAction` | 空编辑器双 Esc 的动作（清除/退出） | — |
 | Tree filter mode (tree-filter-mode) | `treeFilterMode` | /tree 打开时的默认过滤 | — |
 | TUI mode (tui-mode) | `tuiMode` | regular 模式（终端原生 scrollback） | 已完成（K5）|
-| Theme (theme) | `theme`/`lightTheme`/`darkTheme` | H3 主题 JSON + picker（切值后重载配色） | H3 |
+| Theme (theme) | `theme`/`lightTheme`/`darkTheme` | ✅ 已完成（H3：内置 dark/light + 自定义 JSON + /themes picker + settings 持久化） | H3 |
 
 接线模板：① config.applySettingsValue 解析对应键 → 真实字段；②
 settingsApplyNext 占位分支迁移到字段写入 + persistSettings；③ 消费点
@@ -544,9 +545,9 @@ fs_wheel_lines。
 | /session /name /new /tree /fork /resume | ✓ | ✓ | 已实现 |
 | /compact [hint] | ✓ | ✓ | 已实现（runCompaction + auto-compact 阈值） |
 | /changelog | ✓ | — | 无版本日志体系，不适用 |
-| /export /copy /share | ✓ | /copy 未做 | 缺口（copy/export 低成本可加） |
-| /themes /settings /skills /trust /login /logout /scoped-models /mcp | ✓ | — | /settings ✅、/skills（`/skill:name`）✅、/mcp ✅；/themes /trust /login /logout /scoped-models 暂缓（依赖主题/trust/扩展体系） |
-| /bug /debug /clone /import /reload /fork-easter-eggs | ✓ | — | 暂缓 |
+| /export /copy /share | ✓ | ✓ | /export（HTML/.jsonl）✓、/copy ✓、/share 占位（需后端，K3） |
+| /themes /settings /skills /trust /login /logout /scoped-models /mcp | ✓ | ✓ | /settings ✅、/skills（`/skill:name`）✅、/mcp ✅、/trust ✅、/login /logout ✅（api_key 类，OAuth 待 J6）、/scoped-models ✅、/themes ✅（内置 dark/light + 自定义 JSON） |
+| /bug /debug /clone /import /reload /fork-easter-eggs | ✓ | ✓ | /bug ✅（issue 链接+描述）、/debug ✅、/clone ✅、/import ✅、/reload ✅；fork-easter-eggs 不适用 |
 
 ### 全局键位（主界面）
 
@@ -565,13 +566,13 @@ fs_wheel_lines。
 | app.editor.external | ctrl+g | ✓ | 已实现（$EDITOR） |
 | app.message.copy | ctrl+x | ✓ | 本轮实现（选区优先，否则最后回复） |
 | app.message.followUp / dequeue | alt+enter / alt+up | ✓ | 已实现（follow-up 队列 + 全量恢复回编辑器） |
-| app.clipboard.pasteImage | ctrl+v | — | 暂缓（图片输入管线） |
+| app.clipboard.pasteImage | ctrl+v | ✓ | 已实现（图片粘贴 + 拖放 = bracketed paste 路径） |
 | app.session.toggleNamedFilter | ctrl+n | — | 暂缓（session selector 过滤） |
 | tui.altScreen.search / nextPrompt / previousPrompt | ctrl+shift+f 等 | ✓ | 已实现（搜索框 + 高亮 + 导航） |
 | tui.altScreen.* 滚动（pageUp/Down、ctrl+home/end、half/line 可配） | ✓ | ✓ | 已实现 |
 | prompt_previous/next（用户消息跳转） | ctrl+up/down | ✓ | 已实现 |
 | editor：多行、history（ctrl+up）、kill-ring、undo、word-nav | ✓ | 部分 | undo/kill-ring 暂缓 |
-| 文件拖放 / 图片粘贴 | ✓ | — | 暂缓 |
+| 文件拖放 / 图片粘贴 | ✓ | ✓ | 已实现（图片粘贴 ctrl+v；拖放 = bracketed paste 路径） |
 
 ### 交互与渲染
 

@@ -32,6 +32,31 @@ pub const Skill = struct {
     disable_model_invocation: bool,
 };
 
+/// One validation diagnostic (pi skills.js diagnostics): a warning-level
+/// message tied to a skill file path. The welcome header renders these as
+/// the `[Skill warnings]` section.
+pub const Diagnostic = struct {
+    message: []u8, // owned
+    path: []u8, // owned
+};
+
+/// discover() result: the loaded skills plus the validation diagnostics
+/// (pi loadSkills → { skills, diagnostics }).
+pub const DiscoverResult = struct {
+    skills: []Skill,
+    diagnostics: []Diagnostic,
+
+    /// Free everything (both lists and all owned strings).
+    pub fn deinit(self: *DiscoverResult, alloc: std.mem.Allocator) void {
+        freeAll(alloc, self.skills);
+        for (self.diagnostics) |d| {
+            alloc.free(d.message);
+            alloc.free(d.path);
+        }
+        alloc.free(self.diagnostics);
+    }
+};
+
 /// Discover skills from all configured locations. Returns an owned slice.
 pub fn discover(
     alloc: std.mem.Allocator,
@@ -43,7 +68,7 @@ pub fn discover(
     /// cwd/.agents/skills and cwd ancestors) are skipped — only user-level
     /// skills load.
     include_project: bool,
-) ![]Skill {
+) !DiscoverResult {
     // Discovered skills, deduped by name (first wins — pi keeps the first
     // discovered on a collision). A plain list + linear scan keeps ownership
     // simple: every Skill's strings are freed exactly once.
@@ -75,14 +100,16 @@ pub fn discover(
     while (r < collected.items.len) : (r += 1) {
         const s = collected.items[r];
         var dup = false;
+        var dup_winner: ?[]const u8 = null;
         for (collected.items[0..w]) |o| {
             if (std.mem.eql(u8, o.name, s.name)) {
                 dup = true;
+                dup_winner = o.file_path;
                 break;
             }
         }
         if (dup) {
-            diags.collision(s.name, s.file_path);
+            diags.collision(s.name, s.file_path, dup_winner orelse "");
             freeOne(alloc, s);
             continue;
         }
@@ -94,12 +121,17 @@ pub fn discover(
     }
 
     // Ownership of the surviving items transfers to the caller.
-    const result = collected.toOwnedSlice() catch {
+    const skill_list = collected.toOwnedSlice() catch {
         for (collected.items) |s| freeOne(alloc, s);
         collected.deinit();
         return error.OutOfMemory;
     };
-    return result;
+    const diag_list = diags.toOwnedSlice() catch {
+        for (skill_list) |s| freeOne(alloc, s);
+        alloc.free(skill_list);
+        return error.OutOfMemory;
+    };
+    return DiscoverResult{ .skills = skill_list, .diagnostics = diag_list };
 }
 
 fn addLoc(alloc: std.mem.Allocator, locs: *std.array_list.Managed([]u8), base: []const u8, sub: []const u8) !void {
@@ -120,7 +152,7 @@ fn scanDir(
     const skill_md_path = try std.fs.path.join(alloc, &.{ dir, "SKILL.md" });
     defer alloc.free(skill_md_path);
     if (statIsFile(io, skill_md_path)) {
-        if (loadSkillFromFile(alloc, io, skill_md_path, dir)) |s| {
+        if (loadSkillFromFile(alloc, io, skill_md_path, dir, diags)) |s| {
             try out.append(s);
         }
         return; // skill root: do not recurse further
@@ -141,7 +173,7 @@ fn scanDir(
             try scanDir(alloc, io, full, false, out, diags);
         } else if (include_root_files and (e.kind == .file or e.kind == .sym_link) and std.mem.endsWith(u8, e.name, ".md")) {
             if (statIsFile(io, full)) {
-                if (loadSkillFromFile(alloc, io, full, dir)) |s| {
+                if (loadSkillFromFile(alloc, io, full, dir, diags)) |s| {
                     try out.append(s);
                 }
             }
@@ -156,18 +188,33 @@ fn statIsFile(io: std.Io, path: []const u8) bool {
 }
 
 /// Parse one SKILL.md / standalone .md into a Skill (null when invalid).
-fn loadSkillFromFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8, dir: []const u8) ?Skill {
-    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch return null;
+/// Validation failures are recorded in `diags` (pi: warnings, still loaded
+/// when the description is present).
+fn loadSkillFromFile(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    dir: []const u8,
+    diags: *Diagnostics,
+) ?Skill {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch {
+        diags.add(path, "failed to read skill file");
+        return null;
+    };
     defer alloc.free(raw);
 
-    var fm = Frontmatter.parse(raw, alloc) catch return null;
+    var fm = Frontmatter.parse(raw, alloc) catch {
+        diags.add(path, "failed to parse frontmatter");
+        return null;
+    };
     defer fm.deinit();
     const fm_name = fm.get("name");
     const fm_desc = fm.get("description");
     const disable = fm.get("disable-model-invocation");
 
     const has_desc = fm_desc != null and std.mem.trim(u8, fm_desc.?, " \t\r\n").len > 0;
-    if (!has_desc) return null; // pi: skills without a description are not loaded
+    // pi: skills without a description are silently skipped (no warning).
+    if (!has_desc) return null;
 
     // name: frontmatter name, else parent dir name.
     const parent = std.fs.path.dirname(path) orelse ".";
@@ -176,8 +223,16 @@ fn loadSkillFromFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8, dir
 
     // Validate name (pi: warnings, but we still load; a name that is empty is fatal).
     if (name.len == 0) return null;
+    var name_msgs: [8][]const u8 = undefined;
+    const name_errs = validateName(name, &name_msgs);
+    for (name_msgs[0..name_errs]) |m| diags.add(path, m);
 
     const desc = std.mem.trim(u8, fm_desc.?, " \t\r\n");
+    if (desc.len > MAX_DESCRIPTION_LENGTH) {
+        const m = std.fmt.allocPrint(alloc, "description exceeds {d} characters ({d})", .{ MAX_DESCRIPTION_LENGTH, desc.len }) catch return null;
+        defer alloc.free(m);
+        diags.add(path, m);
+    }
     const desc_owned = alloc.dupe(u8, desc) catch return null;
     errdefer alloc.free(desc_owned);
     const name_owned = alloc.dupe(u8, name) catch return null;
@@ -297,18 +352,47 @@ fn escapeXml(out: *std.array_list.Managed(u8), s: []const u8) !void {
 
 const Diagnostics = struct {
     alloc: std.mem.Allocator,
-    list: std.array_list.Managed([]u8),
+    list: std.array_list.Managed(Diagnostic),
 
     fn init(alloc: std.mem.Allocator) Diagnostics {
         return .{ .alloc = alloc, .list = .init(alloc) };
     }
     fn deinit(self: *Diagnostics) void {
-        for (self.list.items) |m| self.alloc.free(m);
+        for (self.list.items) |d| {
+            self.alloc.free(d.message);
+            self.alloc.free(d.path);
+        }
         self.list.deinit();
     }
-    fn collision(self: *Diagnostics, name: []const u8, path: []const u8) void {
-        const m = std.fmt.allocPrint(self.alloc, "skill name \"{s}\" collision at {s}", .{ name, path }) catch return;
-        self.list.append(m) catch self.alloc.free(m);
+    fn toOwnedSlice(self: *Diagnostics) ![]Diagnostic {
+        const items = self.list.toOwnedSlice() catch return error.OutOfMemory;
+        self.list = .init(self.alloc);
+        self.alloc = undefined;
+        return items;
+    }
+    /// Record a warning for one skill file. The message and path are duped
+    /// (callers pass borrows into the scan loop).
+    fn add(self: *Diagnostics, path: []const u8, message: []const u8) void {
+        const m = self.alloc.dupe(u8, message) catch return;
+        const p = self.alloc.dupe(u8, path) catch {
+            self.alloc.free(m);
+            return;
+        };
+        self.list.append(Diagnostic{ .message = m, .path = p }) catch {
+            self.alloc.free(m);
+            self.alloc.free(p);
+        };
+    }
+    fn collision(self: *Diagnostics, name: []const u8, loser_path: []const u8, winner_path: []const u8) void {
+        const m = std.fmt.allocPrint(self.alloc, "\"{s}\" collision: {s} (skipped); loaded from {s}", .{ name, loser_path, winner_path }) catch return;
+        const p = self.alloc.dupe(u8, loser_path) catch {
+            self.alloc.free(m);
+            return;
+        };
+        self.list.append(Diagnostic{ .message = m, .path = p }) catch {
+            self.alloc.free(m);
+            self.alloc.free(p);
+        };
     }
 };
 
@@ -509,8 +593,9 @@ test "discover scans agent + project dirs recursively" {
     const cwd = try std.fs.path.join(alloc, &.{ root, "proj" });
     defer alloc.free(cwd);
 
-    const found = try discover(alloc, io, agent_dir, cwd, null, true);
-    defer freeAll(alloc, found);
+    var result = try discover(alloc, io, agent_dir, cwd, null, true);
+    defer result.deinit(alloc);
+    const found = result.skills;
 
     // Expect exactly: pdf-tools, deep-skill, hidden-skill, proj-skill (nodesc skipped).
     try std.testing.expectEqual(@as(usize, 4), found.len);
@@ -524,6 +609,49 @@ test "discover scans agent + project dirs recursively" {
         if (std.mem.eql(u8, s.name, "nodesc")) has_nodesc = true;
     }
     try std.testing.expect(!has_nodesc);
+    // No diagnostics expected: no collisions, no bad names, no read failures.
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.len);
+}
+
+test "discover: name/description violations produce diagnostics, skill still loads" {
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const root = try alloc.dupe(u8, "/tmp/zpi-skill-diag-test");
+    defer alloc.free(root);
+    _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const agent_dir = try std.fs.path.join(alloc, &.{ root, "agent" });
+    defer alloc.free(agent_dir);
+    const cwd = try std.fs.path.join(alloc, &.{ root, "proj" });
+    defer alloc.free(cwd);
+
+    // Bad name (leading hyphen + uppercase) but valid description → loaded WITH warning.
+    try writeFile(alloc, io, try join3(alloc, root, "agent/skills/Bad-Skill", "SKILL.md"),
+        "---\nname: -UPPER\ndescription: Bad but loads.\n---\nbody");
+    // Overlong description (>1024) → loaded WITH warning.
+    const long_desc = try alloc.alloc(u8, 1100);
+    defer alloc.free(long_desc);
+    for (long_desc) |*c| c.* = 'y';
+    const md = std.fmt.allocPrint(alloc, "---\nname: longdesc\ndescription: {s}\n---\nbody", .{ long_desc }) catch unreachable;
+    defer alloc.free(md);
+    try writeFile(alloc, io, try join3(alloc, root, "agent/skills/longdesc", "SKILL.md"), md);
+
+    var result = try discover(alloc, io, agent_dir, cwd, null, true);
+    defer result.deinit(alloc);
+    // Both skills load despite the warnings (pi: warnings don't block loading).
+    try std.testing.expect(findSkill(result.skills, "-UPPER") != null);
+    try std.testing.expect(findSkill(result.skills, "longdesc") != null);
+    // And at least one diagnostic per skill mentioning the file path.
+    try std.testing.expect(result.diagnostics.len >= 2);
+    var saw_bad_name = false;
+    var saw_long_desc = false;
+    for (result.diagnostics) |d| {
+        if (std.mem.indexOf(u8, d.message, "name") != null) saw_bad_name = true;
+        if (std.mem.indexOf(u8, d.message, "description") != null) saw_long_desc = true;
+    }
+    try std.testing.expect(saw_bad_name);
+    try std.testing.expect(saw_long_desc);
 }
 
 /// Write `content` to `path`, creating parent dirs. `path` is an owned slice

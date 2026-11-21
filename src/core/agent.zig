@@ -70,6 +70,11 @@ pub const TurnEvent = union(enum) {
     /// partialResult — the card shows streaming output while the command
     /// runs). `output` is the FULL output so far, not a delta.
     tool_update: ToolUpdate,
+    /// A queued steering message was injected into the context (pi: the
+    /// steering drain before each LLM request). The TUI renders it as a user
+    /// block NOW — while queued it only shows as the dim "Steering:" pending
+    /// row, so a dequeued (alt+up) message never leaves an orphan block.
+    steering_injected: []u8,
 
     pub const ToolStart = struct {
         id: []u8,
@@ -121,6 +126,7 @@ pub const TurnEvent = union(enum) {
                 alloc.free(u.id);
                 alloc.free(u.output);
             },
+            .steering_injected => |s| alloc.free(s),
         }
     }
 };
@@ -462,9 +468,11 @@ pub const Session = struct {
 
     /// Append queued steering messages to the context as user messages
     /// (pi: the steering drain before each LLM request). Called on the agent
-    /// thread between tool-call rounds. The TUI already rendered them when
-    /// they were queued — no turn events here.
-    fn drainSteeringIntoContext(self: *Session) !void {
+    /// thread between tool-call rounds. Each injected message emits a
+    /// steering_injected turn event — the TUI renders the user block at THIS
+    /// moment (not at queue time), so a message dequeued with alt+up before
+    /// injection never appears in the transcript.
+    pub fn drainSteeringIntoContext(self: *Session) !void {
         const texts = try self.drainSteering();
         defer {
             for (texts) |t| self.alloc.free(t);
@@ -489,6 +497,8 @@ pub const Session = struct {
             user_msg.timestamp_ms = ss.nowMs(self.io);
             try user_msg.blocks.append(.{ .text = try self.alloc.dupe(u8, t) });
             try self.appendAndRecord(&user_msg);
+            const ev_copy = self.alloc.dupe(u8, t) catch continue;
+            self.pushTurnEvent(.{ .steering_injected = ev_copy });
         }
     }
 

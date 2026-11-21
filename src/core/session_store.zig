@@ -2079,7 +2079,7 @@ pub fn listForCwd(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8
                 if (first_message == null and is_user) {
                     const cv = mo.get("content") orelse continue;
                     switch (cv) {
-                        .string => |x| first_message = sanitizePreview(alloc, x),
+                        .string => |x| first_message = userPreview(alloc, x),
                         .array => |arr| {
                             for (arr.items) |blk| {
                                 switch (blk) {
@@ -2092,7 +2092,7 @@ pub fn listForCwd(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8
                                         if (!std.mem.eql(u8, bt_s, "text")) continue;
                                         const txt = bo.get("text") orelse continue;
                                         switch (txt) {
-                                            .string => |x| first_message = sanitizePreview(alloc, x),
+                                            .string => |x| first_message = userPreview(alloc, x),
                                             else => {},
                                         }
                                         break;
@@ -2134,6 +2134,32 @@ pub fn listForCwd(alloc: std.mem.Allocator, io: std.Io, sessions_dir: []const u8
         });
     }
     return out.toOwnedSlice();
+}
+
+/// Preview of a user message for the session list: a `/skill:name` submit
+/// is persisted as the full `<skill name="..." location="...">SKILL.md
+/// body</skill>\n\n<args>` block (pi _expandSkillCommand), and a raw 200-char
+/// slice of that XML is useless.  Collapse it: trailing args become the
+/// preview (the real user intent); a bare invocation shows `skill: <name>`.
+/// Non-skill text falls back to the plain preview.
+fn userPreview(alloc: std.mem.Allocator, text: []const u8) ?[]u8 {
+    if (skillPreview(alloc, text)) |sp| return sp;
+    return sanitizePreview(alloc, text);
+}
+
+/// Match the pi skill-expansion shape and return the collapsed preview, or
+/// null when the text is not a skill block (caller falls back).
+fn skillPreview(alloc: std.mem.Allocator, text: []const u8) ?[]u8 {
+    if (!std.mem.startsWith(u8, text, "<skill ")) return null;
+    const tag = std.mem.indexOf(u8, text, "name=\"") orelse return null;
+    const after = text[tag + "name=\"".len..];
+    const name_end = std.mem.indexOfScalar(u8, after, '"') orelse return null;
+    const name = after[0..name_end];
+    // pi expansion ends with "\n</skill>", optionally followed by "\n\n<args>".
+    const close = std.mem.indexOf(u8, text, "</skill>") orelse return null;
+    const args = std.mem.trim(u8, text[close + "</skill>".len..], " \t\r\n");
+    if (args.len > 0) return sanitizePreview(alloc, args);
+    return std.fmt.allocPrint(alloc, "skill: {s}", .{name}) catch null;
 }
 
 /// Trim control characters and cap the preview length (pi selector).
