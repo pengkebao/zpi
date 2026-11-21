@@ -925,6 +925,42 @@ pub const Session = struct {
         return 1000 * @as(i64, @intCast(std.math.pow(u64, 2, @max(attempt, 1) - 1)));
     }
 
+    /// Backoff for the Nth agent-layer transport retry (pi retryAssistantCall
+    /// baseDelayMs=2000): 2s, 4s, 8s. The provider layer has already done its
+    /// own short-backoff retries by the time this runs.
+    pub fn transportRetryDelayMs(attempt: usize) i64 {
+        return 2000 * @as(i64, @intCast(std.math.pow(u64, 2, @max(attempt, 1) - 1)));
+    }
+
+    /// pi isRetryableAssistantError (RETRYABLE_PROVIDER_ERROR_PATTERN):
+    /// transport-level round failures worth a second budget at the agent
+    /// layer. Zig collapses the whole fetch/connect/stream failure surface
+    /// into a handful of errors, so this is an allowlist over those; HTTP
+    /// status errors carry no Zig error (the provider retries them itself
+    /// and surfaces HttpError only after ITS budget is exhausted — retrying
+    /// again here matches pi, where a failed response IS an error message
+    /// re-judged by the same pattern list).
+    pub fn isRetryableTransportError(e: anyerror) bool {
+        return switch (e) {
+            error.HttpError, // provider budget exhausted (transport or retryable status)
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.NetworkUnreachable,
+            error.BrokenPipe,
+            error.EndOfStream,
+            error.StreamTooLong,
+            error.TimedOut,
+            error.WouldBlock,
+            error.UnknownNetwork,
+            error.NameServerFailure,
+            error.TemporaryNameServerFailure,
+            error.UnknownHostName,
+            => true,
+            else => false,
+        };
+    }
+
     /// Auto-compact at a turn boundary if the context exceeds the budget.
     fn maybeAutoCompact(self: *Session) !void {
         const ctx_tokens = compact.estimateContextTokens(self.context.messages.items);
@@ -1062,6 +1098,41 @@ pub const Session = struct {
                     self.emit(.tool_info, "\n[auto-compact: context overflow — compacting and retrying]\n");
                     _ = self.runCompactionReasoned(null, "overflow") catch {};
                     continue; // rebuild wire messages against the compacted context
+                } else if (isRetryableTransportError(e) and self.retry_attempt < self.retry_max) {
+                    // pi retryAssistantCall: a transient transport failure
+                    // (connect refused, stream drop, 5xx) retries at the AGENT
+                    // layer too — the provider already retried 3× with short
+                    // backoff; this second budget (3×, 2s/4s/8s) survives a
+                    // gateway blip lasting tens of seconds without killing
+                    // the turn. The failed round left no assistant message,
+                    // so the same round is rebuilt and re-requested.
+                    self.retry_attempt += 1;
+                    text_buf.deinit();
+                    thinking_buf.deinit();
+                    tool_calls.deinit();
+                    var rb: [96]u8 = undefined;
+                    const rmsg = std.fmt.bufPrint(&rb, "\n[connection lost ({s}) — retrying {d}/{d}]\n", .{ @errorName(e), self.retry_attempt, self.retry_max }) catch "\n[connection lost — retrying]\n";
+                    self.emit(.tool_info, rmsg);
+                    const delay_ms = Session.transportRetryDelayMs(self.retry_attempt);
+                    var slept: i64 = 0;
+                    while (slept < delay_ms) {
+                        if (self.isAborted()) {
+                            text_buf.deinit();
+                            thinking_buf.deinit();
+                            tool_calls.deinit();
+                            return error.Aborted;
+                        }
+                        const step: i64 = @min(200, delay_ms - slept);
+                        std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(step), .real) catch break;
+                        slept += step;
+                    }
+                    if (self.isAborted()) {
+                        text_buf.deinit();
+                        thinking_buf.deinit();
+                        tool_calls.deinit();
+                        return error.Aborted;
+                    }
+                    continue; // rebuild wire messages, re-request the round
                 } else {
                     // Keep what streamed before the failure on screen.
                     self.recordText(.thinking, thinking_buf.items);

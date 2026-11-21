@@ -88,6 +88,26 @@ test "emptyRetryDelayMs is exponential 1s,2s,4s" {
     try std.testing.expectEqual(@as(i64, 1000), agent.Session.emptyRetryDelayMs(0));
 }
 
+test "transportRetryDelayMs is exponential 2s,4s,8s (pi baseDelayMs=2000)" {
+    try std.testing.expectEqual(@as(i64, 2000), agent.Session.transportRetryDelayMs(1));
+    try std.testing.expectEqual(@as(i64, 4000), agent.Session.transportRetryDelayMs(2));
+    try std.testing.expectEqual(@as(i64, 8000), agent.Session.transportRetryDelayMs(3));
+    try std.testing.expectEqual(@as(i64, 2000), agent.Session.transportRetryDelayMs(0));
+}
+
+test "isRetryableTransportError allowlists transient failures only" {
+    // transport-level failures get the second (agent-layer) retry budget
+    try std.testing.expect(agent.Session.isRetryableTransportError(error.HttpError));
+    try std.testing.expect(agent.Session.isRetryableTransportError(error.ConnectionRefused));
+    try std.testing.expect(agent.Session.isRetryableTransportError(error.ConnectionResetByPeer));
+    try std.testing.expect(agent.Session.isRetryableTransportError(error.EndOfStream));
+    try std.testing.expect(agent.Session.isRetryableTransportError(error.TimedOut));
+    // deterministic / user-caused errors fail fast (no retry)
+    try std.testing.expect(!agent.Session.isRetryableTransportError(error.Aborted));
+    try std.testing.expect(!agent.Session.isRetryableTransportError(error.OutOfMemory));
+    try std.testing.expect(!agent.Session.isRetryableTransportError(error.EmptyResponse));
+}
+
 test "blocksAreAllThinking detects thinking-only rounds" {
     const msg = @import("src/core/message.zig");
     const alloc = std.heap.page_allocator;
