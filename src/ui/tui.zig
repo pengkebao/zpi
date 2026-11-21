@@ -4986,7 +4986,17 @@ pub const TUI = struct {
             self.scroll_glyphs = &.{};
         }
         // Stale content can sit beyond the new size (shrink); only a hard
-        // clear removes it.
+        // clear removes it. \x1b[2J wipes TEXT only — Kitty placements are a
+        // floating layer the clear does not touch, so sweep them first (pi
+        // fullRender(clear) deletes placements BEFORE the 2J). Placement
+        // sweep only (d=a): data + geometry stay registered, the next paint
+        // re-anchors with a ~50-byte a=p instead of re-uploading.
+        {
+            var dab: [32]u8 = undefined;
+            const das = image.deleteAllPlacementsInto(&dab);
+            if (das.len > 0) self.writeRaw(das);
+        }
+        self.kitty_ids.clearRetainingCapacity();
         self.writeRaw("\x1b[2J");
         self.updateMenu();
         return true;
@@ -5077,12 +5087,17 @@ pub const TUI = struct {
             for (self.prev_lines.items) |l| self.alloc.free(l);
             self.prev_lines.clearRetainingCapacity();
             self.prev_transcript_h = 0;
-            // The hard clear wipes every placement from the screen (and the
-            // model forgets its rows); the registry goes with it (pi
-            // resetRenderState clears kittyImageMetadata with previousLines).
+            // The hard clear: sweep the floating placements FIRST (2J wipes
+            // text only, the Kitty layer survives it), then clear. Data and
+            // geometry stay registered (pi keeps kittyImageMetadata across
+            // clears whose lines are rebuilt); the next paint re-anchors
+            // with a ~50-byte a=p — no 385KB re-upload.
+            {
+                var dab2: [32]u8 = undefined;
+                const das2 = image.deleteAllPlacementsInto(&dab2);
+                if (das2.len > 0) self.writeRaw(das2);
+            }
             self.kitty_ids.clearRetainingCapacity();
-            self.kitty_meta.clearRetainingCapacity();
-            self.kitty_uploaded.clearRetainingCapacity();
             _ = self.writeRaw("\x1b[2J");
         }
         _ = self.refreshSize();
@@ -6994,6 +7009,9 @@ pub const TUI = struct {
         // only ids ABSENT from the new frame are deleted. The deletes go at
         // the TOP of the frame, before any paint.
         var new_ids: []u32 = &[_]u32{};
+        var any_anchors = false; // frame paints ≥1 kitty placement
+        var reanchor_only = false; // frame has uploaded images to re-anchor
+        var swept = false; // a d=a wipe went out — image rows must re-anchor
         if (self.kitty_ids.items.len > 0) {
             new_ids = self.collectKittyIds(new_lines[0..@min(n, self.height)]) catch &[_]u32{};
             var stale: [64]u32 = undefined;
@@ -7011,13 +7029,25 @@ pub const TUI = struct {
                     stale_count += 1;
                 }
             }
-            if (stale_count > 0) {
-                var db: [64]u8 = undefined;
-                for (stale[0..stale_count]) |sid| {
-                    frame_out.appendSlice(self.alloc, image.deleteKittyInto(&db, sid)) catch return;
-                    _ = self.kitty_meta.remove(sid);
-                    _ = self.kitty_uploaded.remove(sid);
+            // Does the frame re-anchor any already-uploaded image? Those
+            // paints are preceded by ONE d=a sweep (below).
+            for (new_ids) |nid| {
+                if (self.kitty_uploaded.contains(nid)) {
+                    reanchor_only = true;
+                    break;
                 }
+            }
+            // Stale placements (image lines that left the frame): ONE d=a
+            // sweep deletes every placement while KEEPING the uploaded data
+            // (pi deleteAllKittyPlacements). Never d=I here: uppercase I
+            // frees the DATA and forces a 385KB re-transmission when the
+            // image scrolls back into view; meta + uploaded marks survive,
+            // so the paint loop can re-anchor (a=p) at any time.
+            if (stale_count > 0) {
+                var da0: [32]u8 = undefined;
+                frame_out.appendSlice(self.alloc, image.deleteAllPlacementsInto(&da0)) catch return;
+                any_anchors = true;
+                swept = true;
             }
         }
         var shifted = false;
@@ -7035,6 +7065,19 @@ pub const TUI = struct {
         // floating placement from its text (pi blocks the scroll path for
         // every multi-row placement regardless of viewport fit).
         const has_image = frameHasImage(new_lines, n);
+        // Re-anchor prelude (pi prepareKittyScreen): when the frame carries
+        // an ALREADY-UPLOADED image, wipe every placement first with ONE
+        // d=a sweep — data survives — then the paint loop re-anchors via
+        // a=p. This is what makes a=p safe on the main screen: there is no
+        // stale placement left to ghost-stack over the transcript or the
+        // editor (the per-id d=I delete tried first freed the DATA too and
+        // blanks rendered — uppercase I frees uploaded bytes).
+        if (reanchor_only or (has_image and self.kitty_uploaded.count() > 0)) {
+            var da: [32]u8 = undefined;
+            frame_out.appendSlice(self.alloc, image.deleteAllPlacementsInto(&da)) catch return;
+            any_anchors = true;
+            swept = true;
+        }
         if (th > 0 and th == self.prev_transcript_h and !has_image) {
             // The scroll_top movement between the previous painted frame and
             // this one; null after a forced full repaint (no prior frame).
@@ -7127,9 +7170,13 @@ pub const TUI = struct {
             else if (shifted)
                 true
             else
-                (row >= first_changed.? and row <= last_changed and
+                ((row >= first_changed.? and row <= last_changed and
                     (row >= self.prev_lines.items.len or
-                        !std.mem.eql(u8, self.prev_lines.items[row], new_lines[row])));
+                        !std.mem.eql(u8, self.prev_lines.items[row], new_lines[row]))) or
+                    // A frame that swept placements (d=a) must RE-ANCHOR
+                    // every image row it still shows — an unchanged image
+                    // row the diff skips would stay swept and vanish.
+                    (swept and image.isImageLine(new_lines[row])));
             if (!need) continue;
             // A Kitty image row is painted specially (pi fullRender image
             // branch): move to the row, emit the sequence (it reserves its
@@ -7149,6 +7196,19 @@ pub const TUI = struct {
                 var crop_buf: ?[]u8 = null;
                 defer if (crop_buf) |cb| self.alloc.free(cb);
                 const r_total = image.rowsOf(painted_line) orelse 1;
+                // NO GEOMETRY, NO PAINT: without kitty_meta the crop below
+                // cannot clip the placement to the viewport, and an uncropped
+                // multi-row placement floats OVER the editor chrome (observed:
+                // the image covering the input box after a hard clear). A
+                // blank row keeps the transcript aligned; the very next
+                // re-encode (refreshImageEntry registers geometry) paints it.
+                if (image.imageId(painted_line)) |pid| {
+                    if (self.kitty_meta.get(pid) == null) {
+                        self.paintRow(&frame_out, row, "", last_painted != null and last_painted.? + 1 == row);
+                        last_painted = row;
+                        continue;
+                    }
+                }
                 if (image.imageId(painted_line)) |pid| {
                     if (self.kitty_meta.get(pid)) |meta| {
                         // Bottom clip: rows of the placement that fit between
@@ -7177,6 +7237,27 @@ pub const TUI = struct {
                         }
                     }
                 }
+                // pi diff paint (image branch): pre-clear EVERY row the
+                // placement reserves BEFORE emitting the sequence — the
+                // placement is a floating layer over whatever text already
+                // occupies those screen rows (the previous frame's message
+                // lines, spinner, ...). Without the wipe, the image paints
+                // OVER the old text and both show through (bug: image
+                // covering history). Computed AFTER the crop so the band is
+                // the rows this placement REALLY occupies (never past the
+                // viewport bottom) — clearing the uncropped span would wipe
+                // the editor chrome below the transcript.
+                {
+                    const r_now = image.rowsOf(painted_line) orelse 1;
+                    const band: usize = @min(r_now, self.height -| row);
+                    var wipe: usize = 1;
+                    while (wipe < band) : (wipe += 1) {
+                        var wv: [16]u8 = undefined;
+                        const wl = ansi.moveTo(&wv, @intCast(row + wipe + 1), 1);
+                        frame_out.appendSlice(self.alloc, wv[0..wl]) catch return;
+                        frame_out.appendSlice(self.alloc, ansi.CLEAR_EOL) catch return;
+                    }
+                }
                 var mv: [16]u8 = undefined;
                 const ml = ansi.moveTo(&mv, @intCast(row + 1), 1);
                 frame_out.appendSlice(self.alloc, mv[0..ml]) catch return;
@@ -7186,7 +7267,10 @@ pub const TUI = struct {
                 // `a=p` command (same i/r/y/h controls) instead of
                 // re-transmitting the whole payload every frame. The full
                 // a=T goes out exactly once per encode (fresh id or re-encode
-                // clears the mark); it also MARKS the upload.
+                // clears the mark); it also MARKS the upload. The stale
+                // placements were wiped by the ONE d=a sweep at the top of
+                // the frame — a=p CREATES placements (it never moves the old
+                // ones), so the sweep is what keeps exactly one copy alive.
                 if (image.imageId(painted_line)) |pid2| {
                     if (self.kitty_uploaded.contains(pid2)) {
                         if (image.placementOnly(self.alloc, painted_line)) |pl| {
@@ -7194,6 +7278,7 @@ pub const TUI = struct {
                             crop_buf = pl;
                             painted_line = pl;
                         } else |_| {}
+                        any_anchors = true;
                     }
                 }
                 frame_out.appendSlice(self.alloc, painted_line) catch return;

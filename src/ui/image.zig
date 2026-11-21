@@ -337,7 +337,21 @@ pub fn placementOnly(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
 /// Format a delete-by-id sequence into `buf` (pi deleteKittyImage: frees the
 /// placement and its image data); returns the used prefix.
 pub fn deleteKittyInto(buf: []u8, image_id: u32) []const u8 {
+    // pi deleteKittyImage: UPPERCASE d=I frees the placement AND the image
+    // data — use only when the image is leaving the frame for good (stale
+    // cleanup). A follow-up a=p re-anchor of the same id would reference
+    // freed data and render NOTHING (observed: streaming frames dropped the
+    // image entirely). Re-anchoring flows delete placements only (d=a).
     const s = std.fmt.bufPrint(buf, "\x1b_Ga=d,d=I,i={d},q=2\x1b\\", .{image_id}) catch return "";
+    return s;
+}
+
+/// Delete every Kitty placement while KEEPING the uploaded image data (pi
+/// deleteAllKittyPlacements, alt-screen prepareKittyScreen). This is the
+/// re-anchor prelude: wipe all floating placements, then re-emit a=p for
+/// the images still in the frame. Byte-cheap (~20 bytes) and id-agnostic.
+pub fn deleteAllPlacementsInto(buf: []u8) []const u8 {
+    const s = std.fmt.bufPrint(buf, "\x1b_Ga=d,d=a,q=2\x1b\\", .{}) catch return "";
     return s;
 }
 

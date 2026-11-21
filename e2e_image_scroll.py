@@ -204,12 +204,58 @@ try:
         n_p = sum(1 for a in ats if a[5] == 'p')
         checks.append(("OK" if n_p >= 6 else "FAIL",
                        f"re-anchors: {n_p} (>=6 wheel notches)"))
-        # the re-anchor y params must be strictly monotonic (the crop window
-        # tracks the scroll one step per wheel notch)
+        # the re-anchor y params must track the scroll: NEVER increase while
+        # scrolling up, with >=6 strict decrease steps (one per wheel notch).
+        # Identical consecutive ys are legal (swept idle frames re-anchor the
+        # same scroll position); an INCREASE means the crop jumped backwards.
         ys = [a[4] for a in ats if a[5] == 'p']
-        mono = all(y2 < y1 for y1, y2 in zip(ys, ys[1:]))
-        checks.append(("OK" if (ys and mono) or len(ys) <= 1 else "FAIL",
-                       f"re-anchor crop ys: {ys} (must decrease monotonically while scrolling up)"))
+        noninc = all(y2 <= y1 for y1, y2 in zip(ys, ys[1:]))
+        strict = sum(1 for y1, y2 in zip(ys, ys[1:]) if y2 < y1)
+        checks.append(("OK" if (ys and noninc and strict >= 6) else "FAIL",
+                       f"re-anchor crop ys: {ys} (non-increasing, {strict} strict steps while scrolling up)"))
+        # GHOST-LAYER GUARD: a=p CREATES a placement (it does not move the
+        # old one) — every frame that emits a=p must carry a d=a sweep
+        # (delete-all-placements, data kept) at its top, or each re-anchor
+        # leaves one more floating copy stacked over the transcript/editor
+        # (observed: three image layers after a few wheel notches).
+        missing_sweep = 0
+        for a in [x for x in ats if x[5] == 'p']:
+            fr = frames[a[0]]
+            has_sweep = b"\x1b_Ga=d,d=a,q=2\x1b\\" in fr or b"\x1b_Ga=d,d=a\x1b\\" in fr
+            # the sweep must precede the FIRST a=p in the frame
+            if has_sweep:
+                sweep_at = fr.find(b"\x1b_Ga=d,d=a")
+                first_p = fr.find(b"\x1b_Ga=p")
+                if first_p != -1 and sweep_at > first_p:
+                    has_sweep = False
+            if not has_sweep:
+                missing_sweep += 1
+        checks.append(("OK" if missing_sweep == 0 else "FAIL",
+                       "every a=p frame carries a preceding d=a sweep" if missing_sweep == 0
+                       else f"{missing_sweep} a=p frames WITHOUT a d=a sweep (ghost layers)"))
+        # DATA-FREEDOM GUARD: an a=p re-anchor referencing data freed by a
+        # d=I renders NOTHING (uppercase I frees uploaded bytes) — a d=I for
+        # a live id in the frame followed by an a=p of the SAME id within
+        # the same frame is the streaming-blank bug.
+        data_free_then_anchor = 0
+        for a in [x for x in ats if x[5] == 'p']:
+            fr = frames[a[0]]
+            for chunk in fr.split(b"\x1b_G"):
+                if not chunk.startswith(b"a=d,d=I,i="):
+                    continue
+                hdr_end = chunk.find(b"\x1b\\")
+                hdr = chunk[:hdr_end]
+                iv = None
+                for part in hdr.split(b","):
+                    if part.startswith(b"i="):
+                        iv = part[2:]
+                if iv and (b"\x1b_Ga=p" in chunk or b"\x1b_Ga=T" in chunk) :
+                    tail = chunk[hdr_end:]
+                    if (b"\x1b_Ga=p" in tail or b"\x1b_Ga=T" in tail) and (b",i=" + iv + b"," in hdr or hdr.endswith(b"i=" + iv)):
+                        data_free_then_anchor += 1
+        checks.append(("OK" if data_free_then_anchor == 0 else "FAIL",
+                       "no d=I-then-re-anchor (data-freed blank) sequences" if data_free_then_anchor == 0
+                       else f"{data_free_then_anchor} d=I followed by re-anchor of the same id (blank render)"))
     ok = all(k == "OK" for k, _ in checks)
     for k, msg in checks:
         print(f"{k} {msg}")
