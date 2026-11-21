@@ -740,6 +740,12 @@ pub const TUI = struct {
     /// registry): cell rows + source pixel height, needed by cropKitty to map
     /// a viewport crop onto source pixel rows. Owned.
     kitty_meta: std.AutoHashMapUnmanaged(u32, image.Meta) = .empty,
+    /// Ids whose image DATA has been transmitted to the terminal this
+    /// session (pi uploadedKittyImages): once set, repaints re-anchor the
+    /// placement with a ~50-byte `a=p` command instead of re-sending the
+    /// whole payload. A fresh encode (resize, show_images flip) re-uploads —
+    /// pi's transmissionGeneration — so the key is removed there.
+    kitty_uploaded: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// `/skill:name` invocations of the transcript (see SkillEntry).
     skill_invocations: std.ArrayListUnmanaged(SkillEntry) = .empty,
     /// Scrollback indices of thinking blocks, for Ctrl+T.
@@ -4694,6 +4700,7 @@ pub const TUI = struct {
         self.watch_captured.deinit(self.alloc);
         self.kitty_ids.deinit(self.alloc);
         self.kitty_meta.deinit(self.alloc);
+        self.kitty_uploaded.deinit(self.alloc);
         for (self.slash_extras.items) |*e| {
             self.alloc.free(e.name);
             self.alloc.free(e.desc);
@@ -5075,6 +5082,7 @@ pub const TUI = struct {
             // resetRenderState clears kittyImageMetadata with previousLines).
             self.kitty_ids.clearRetainingCapacity();
             self.kitty_meta.clearRetainingCapacity();
+            self.kitty_uploaded.clearRetainingCapacity();
             _ = self.writeRaw("\x1b[2J");
         }
         _ = self.refreshSize();
@@ -6853,15 +6861,19 @@ pub const TUI = struct {
 
     /// True when a frame row is an encoded Kitty image line whose placement
     /// still reserves visual rows below its model row (pi:
-    /// getKittyImageReservedRows > 1): those rows must not scroll natively —
-    /// the placement is a floating layer and would desync from its text. A
-    /// fully-cropped image reserves one row and paints as plain text.
-    pub fn frameHasImage(lines: []const []const u8, n: usize, viewport_h: usize) bool {
+    /// getKittyImageReservedRows > 1, checked WITHOUT a viewport fit test —
+    /// pi blocks the native-scroll path for every multi-row placement no
+    /// matter where it sits): those rows must not scroll natively — the
+    /// placement is a floating layer anchored at a screen row and a DECSTBM
+    /// scroll would desync it from its text (the image would stay behind at
+    /// its anchor while the text moves, i.e. the "height was never reserved"
+    /// misalignment). A fully-cropped image (r=1) paints as plain text.
+    pub fn frameHasImage(lines: []const []const u8, n: usize) bool {
         var i: usize = 0;
         while (i < n) : (i += 1) {
             if (image.isImageLine(lines[i])) {
                 const r = image.rowsOf(lines[i]) orelse 1;
-                if (r > 1 and i + r <= viewport_h) return true;
+                if (r > 1) return true;
             }
         }
         return false;
@@ -7004,6 +7016,7 @@ pub const TUI = struct {
                 for (stale[0..stale_count]) |sid| {
                     frame_out.appendSlice(self.alloc, image.deleteKittyInto(&db, sid)) catch return;
                     _ = self.kitty_meta.remove(sid);
+                    _ = self.kitty_uploaded.remove(sid);
                 }
             }
         }
@@ -7017,13 +7030,11 @@ pub const TUI = struct {
         // behind, misaligning them. When an image is in the frame, skip native
         // scroll and let the per-row CUP repaint reposition it (re-emitting the
         // sequence with the same placement id moves it; pi fullRenders here).
-        // Images whose rows fit below their frame row (post height-cap, or
-        // cropped to the viewport) reserve visual space and must not scroll:
-        // frameHasImage counts only those (a mostly-cropped image reserves
-        // one row and paints as plain text). The clip is the transcript
-        // viewport (pi paintBox clips to the ScrollView rect): placements
-        // never reach the chrome rows below it.
-        const has_image = frameHasImage(new_lines, n, th);
+        // Images reserve visual rows below their frame row (post height-cap,
+        // or cropped to the viewport) — native scroll would desync the
+        // floating placement from its text (pi blocks the scroll path for
+        // every multi-row placement regardless of viewport fit).
+        const has_image = frameHasImage(new_lines, n);
         if (th > 0 and th == self.prev_transcript_h and !has_image) {
             // The scroll_top movement between the previous painted frame and
             // this one; null after a forced full repaint (no prior frame).
@@ -7170,7 +7181,27 @@ pub const TUI = struct {
                 const ml = ansi.moveTo(&mv, @intCast(row + 1), 1);
                 frame_out.appendSlice(self.alloc, mv[0..ml]) catch return;
                 frame_out.appendSlice(self.alloc, ansi.CLEAR_EOL) catch return;
+                // pi prepareKittyScreen: once the image DATA is on the
+                // terminal, repaints re-anchor the placement with a ~50-byte
+                // `a=p` command (same i/r/y/h controls) instead of
+                // re-transmitting the whole payload every frame. The full
+                // a=T goes out exactly once per encode (fresh id or re-encode
+                // clears the mark); it also MARKS the upload.
+                if (image.imageId(painted_line)) |pid2| {
+                    if (self.kitty_uploaded.contains(pid2)) {
+                        if (image.placementOnly(self.alloc, painted_line)) |pl| {
+                            if (crop_buf) |cb| self.alloc.free(cb);
+                            crop_buf = pl;
+                            painted_line = pl;
+                        } else |_| {}
+                    }
+                }
                 frame_out.appendSlice(self.alloc, painted_line) catch return;
+                if (image.imageId(painted_line)) |pid3| {
+                    if (!self.kitty_uploaded.contains(pid3)) {
+                        self.kitty_uploaded.put(self.alloc, pid3, {}) catch {};
+                    }
+                }
                 const r = image.rowsOf(painted_line) orelse 1;
                 const last: usize = @min(n, row + r);
                 // Advance at most to the screen bottom (moving past it would
@@ -8249,6 +8280,10 @@ pub const TUI = struct {
                     break :blk nid;
                 };
                 const seq = image.encodeKitty(self.session.alloc, data, id, size.columns, size.rows) catch return;
+                // Fresh bytes must be re-transmitted (pi transmissionGeneration
+                // bump): drop the uploaded mark so the paint loop sends the
+                // full a=T again instead of a=p re-anchor.
+                _ = self.kitty_uploaded.remove(id);
                 // Register the placement geometry (pi registerKittyImageMetadata)
                 // so viewport crops can map cell rows onto source pixel rows.
                 self.kitty_meta.put(self.alloc, id, .{

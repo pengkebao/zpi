@@ -295,6 +295,45 @@ pub fn cropKitty(alloc: std.mem.Allocator, line: []const u8, meta: Meta, hidden_
     return out.toOwnedSlice(alloc) catch null;
 }
 
+/// Build a placement-only command from an encoded Kitty line (pi
+/// getKittyImagePlacement → replacementLine): the first chunk's header
+/// keeps only placement-relevant controls (a is dropped, everything else
+/// survives: i/p/x/y/w/h/X/Y/c/r/C/U/z/P/Q/H/V) and the ENTIRE payload
+/// (all chunks) is dropped — the terminal re-anchors the already-uploaded
+/// image data at the cursor instead of re-transmitting it. Returns null
+/// when the line is not a Kitty image. Caller owns the returned slice.
+pub fn placementOnly(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
+    if (!isImageLine(line)) return error.NotAnImage;
+    const params_start = mem.indexOf(u8, line, "\x1b_G") orelse return error.NotAnImage;
+    const ps = params_start + 3; // skip ESC _ G
+    const params_end = mem.indexOfScalarPos(u8, line, ps, ';') orelse return error.NotAnImage;
+    const KEEP = "i p x y w h X Y c r C U z P Q H V";
+    var keep: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keep.deinit(alloc);
+    var kit = mem.splitScalar(u8, KEEP, ' ');
+    while (kit.next()) |k| try keep.append(alloc, k);
+    var hdr: std.ArrayListUnmanaged(u8) = .empty;
+    defer hdr.deinit(alloc);
+    try hdr.appendSlice(alloc, "\x1b_Ga=p,q=2");
+    var it = mem.splitScalar(u8, line[ps..params_end], ',');
+    while (it.next()) |kv| {
+        if (kv.len == 0) continue;
+        const key = kv[0..1];
+        var kept = false;
+        for (keep.items) |k| {
+            if (mem.eql(u8, key, k)) {
+                kept = true;
+                break;
+            }
+        }
+        if (!kept) continue;
+        try hdr.append(alloc, ',');
+        try hdr.appendSlice(alloc, kv);
+    }
+    try hdr.appendSlice(alloc, "\x1b\\");
+    return hdr.toOwnedSlice(alloc);
+}
+
 /// Format a delete-by-id sequence into `buf` (pi deleteKittyImage: frees the
 /// placement and its image data); returns the used prefix.
 pub fn deleteKittyInto(buf: []u8, image_id: u32) []const u8 {
@@ -512,4 +551,20 @@ test "cropKitty rewrites header and keeps payload" {
     try std.testing.expectEqual(@as(u32, 7), imageId(cropped) orelse 0);
     // Full window is a no-op (the caller paints the line as-is).
     try std.testing.expectEqual(@as(?[]u8, null), cropKitty(alloc, seq, .{ .columns = 10, .rows = 6, .width_px = 100, .height_px = 60 }, 0, 6));
+}
+
+test "placementOnly keeps controls, drops payload" {
+    const alloc = std.heap.page_allocator;
+    const seq = try encodeKitty(alloc, "QUJD", 7, 34, 24);
+    defer alloc.free(seq);
+    const p = try placementOnly(alloc, seq);
+    defer alloc.free(p);
+    try std.testing.expectEqualStrings("\x1b_Ga=p,q=2,C=1,c=34,r=24,i=7\x1b\\", p);
+    // cropped lines keep their y/h crop window
+    const cropped = cropKitty(alloc, seq, .{ .columns = 34, .rows = 24, .width_px = 100, .height_px = 200 }, 4, 12) orelse return error.NoCrop;
+    defer alloc.free(cropped);
+    const pc = try placementOnly(alloc, cropped);
+    defer alloc.free(pc);
+    try std.testing.expectEqualStrings("\x1b_Ga=p,q=2,C=1,c=34,i=7,y=33,h=101,r=12\x1b\\", pc);
+    try std.testing.expectError(error.NotAnImage, placementOnly(alloc, "hello"));
 }

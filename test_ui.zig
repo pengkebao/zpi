@@ -1932,20 +1932,21 @@ test "image: tall image height-capped at pi defaultMaxHeight (meta registered)" 
     // plain text again (native DECSTBM scroll stays safe).
     const one = image.cropKitty(alloc, e.image_line.?, meta.?, 0, 1) orelse return error.NoCrop;
     defer alloc.free(one);
-    try std.testing.expect(!tui.TUI.frameHasImage(&[_][]const u8{one}, 1, 20));
+    try std.testing.expect(!tui.TUI.frameHasImage(&[_][]const u8{one}, 1));
 }
 
-test "frameHasImage: only view-fitting placements block native scroll" {
-    // An image whose rows fit below its frame row reserves visual space:
-    // native DECSTBM scroll would desync the floating placement.
+test "frameHasImage: every multi-row placement blocks native scroll" {
+    // pi getKittyImageReservedRows > 1 blocks the scroll path regardless of
+    // viewport fit: the placement is a floating layer anchored at a screen
+    // row — a DECSTBM scroll moves the text but not the image, and the
+    // reservation visibly breaks (the "height was never reserved" bug).
     const fit = [_][]const u8{ "", "", "", "", "", "\x1b_Ga=T,f=100,q=2,C=1,c=10,r=10,i=1;x\x1b\\" };
-    try std.testing.expect(tui.TUI.frameHasImage(&fit, fit.len, 20));
-    // r=30 at row 5 does not fit a 20-row viewport: paint crops it to fit,
-    // and the frame the diff sees carries the cropped header — the raw
-    // oversized line never reserves (this shape cannot reach the scroller).
+    try std.testing.expect(tui.TUI.frameHasImage(&fit, fit.len));
+    // Even a placement taller than the viewport (paint will crop it) blocks:
+    // the frame line still carries r=30, so scroll must stay off.
     const overflow = [_][]const u8{ "", "", "", "", "", "\x1b_Ga=T,f=100,q=2,C=1,c=10,r=30,i=1;x\x1b\\" };
-    try std.testing.expect(!tui.TUI.frameHasImage(&overflow, overflow.len, 20));
+    try std.testing.expect(tui.TUI.frameHasImage(&overflow, overflow.len));
     // A fully-cropped image reserves one row: plain text for the scroller.
     const cropped = [_][]const u8{"\x1b_Ga=T,f=100,q=2,C=1,c=10,y=18,h=18,r=1,i=1;x\x1b\\"};
-    try std.testing.expect(!tui.TUI.frameHasImage(&cropped, cropped.len, 20));
+    try std.testing.expect(!tui.TUI.frameHasImage(&cropped, cropped.len));
 }
