@@ -1382,7 +1382,12 @@ pub fn main(init: std.process.Init) !void {
                     break :blk st;
                 }
             }
-            if (continue_last or resume_mode) {
+            // pi: -c continues the most recent session; -r in print mode
+            // (and piped stdin) keeps the old continue-most-recent behavior
+            // (a selector cannot run without a TTY). Interactive -r does NOT
+            // come through here: the TUI picker swaps the store in after the
+            // user picks (cli/session-picker.js).
+            if (continue_last or (resume_mode and print_mode)) {
                 const list = ss.listForCwd(alloc, io, sessions_dir, cwd_abs) catch &.{};
                 defer {
                     for (list) |info| {
@@ -1405,6 +1410,13 @@ pub fn main(init: std.process.Init) !void {
                     break :blk st;
                 }
                 std.debug.print("[session: no previous session for {s}]\n", .{cwd_abs});
+            }
+            // pi: interactive --resume opens the TUI session picker
+            // (cli/session-picker.js) — nothing is created before the user
+            // picks, so -r skips the placeholder store entirely (a leaked
+            // empty session would pollute the picker and the directory).
+            if (resume_mode and !print_mode) {
+                break :blk null;
             }
             const st = ss.Store.create(alloc, io, sessions_dir, cwd_abs, .{
                 .name = session_name,
@@ -1559,6 +1571,12 @@ pub fn main(init: std.process.Init) !void {
         // Persisted history → visible transcript (pi: renderInitialMessages
         // runs whenever the session has messages — continue/resume/--session).
         t.replaySession();
+        // pi --resume (cli/session-picker.js): interactive mode presents the
+        // session picker after the trust gate; the store swaps in on Enter
+        // (Esc exits 0). main deliberately left session.store unset above.
+        if (resume_mode and !print_mode) {
+            t.beginStartupResume();
+        }
         t.run() catch |e| {
             std.debug.print("[TUI error: {s}]\n", .{@errorName(e)});
         };

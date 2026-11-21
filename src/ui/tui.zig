@@ -933,6 +933,11 @@ pub const TUI = struct {
     /// Pending trust prompt: when set, the main loop shows the trust modal
     /// (pi TrustSelectorComponent) before processing any other key.
     trust_prompt: ?TrustPrompt = null,
+    /// pi --resume (cli/session-picker.js): main leaves the store unset and
+    /// sets this before run(); the TUI opens the /resume selector after the
+    /// trust gate. Enter swaps the picked store in; Esc exits 0 ("No session
+    /// selected"). In-session /resume keeps this false.
+    startup_resume: bool = false,
     /// main-provided reload hook: re-runs project-resource loading after a
     /// trust decision (project mcp connect + tool registration).
     trust_reload_ctx: ?*anyopaque = null,
@@ -1394,6 +1399,11 @@ pub const TUI = struct {
         // Truncate preview to available width (right side + spacing).
         const right_w = wmod.visualWidth(right);
         const avail = @max(10, width -| 2 -| right_w -| 2);
+        // Visible width accumulates here: color/bold escapes around the
+        // preview are zero-width, so measuring the finished line with
+        // visualWidth used to count their BYTES as columns and mis-align
+        // the right column by the escape length.
+        var left_w: usize = 2; // cursor "› " or "  "
         var used: usize = 0;
         var ci: usize = 0;
         while (ci < preview.len) {
@@ -1402,10 +1412,10 @@ pub const TUI = struct {
             clean.appendSlice(preview[ci .. ci + cw]) catch return error.OutOfMemory;
             ci += cw;
             used += 1;
+            left_w += wmod.visualWidth(preview[ci - cw .. ci]);
         }
         clean.appendSlice(reset) catch return error.OutOfMemory;
         // Right-align the dim right part.
-        const left_w = wmod.visualWidth(clean.items);
         const spacing = if (width > left_w + right_w) width - left_w - right_w else 1;
         var pad_buf: [512]u8 = undefined;
         const pads: usize = @min(spacing, pad_buf.len);
@@ -1568,7 +1578,9 @@ pub const TUI = struct {
     }
 
     /// Activate the selected menu entry (Enter). Returns should_exit.
-    fn menuActivate(self: *TUI) bool {
+    /// Enter in the open menu. Returns should_exit. Public: the startup
+    /// --resume regression test drives the picker through this.
+    pub fn menuActivate(self: *TUI) bool {
         if (self.menu_len == 0) return false;
         const e = self.menu_items[self.menu_selected];
         switch (self.menu_mode) {
@@ -1679,6 +1691,12 @@ pub const TUI = struct {
                 self.menu_mode = .hidden;
                 const new_st = ss.Store.open(self.alloc, self.io, path) catch {
                     self.note("resume failed: cannot open {s}", .{path});
+                    // pi --resume: the picker is the only way to get a store;
+                    // a failed open back into the picker beats an empty TUI.
+                    if (self.startup_resume) {
+                        self.openSessionsMenu();
+                        self.redraw();
+                    }
                     return false;
                 };
                 const id_copy: []const u8 = self.alloc.dupe(u8, new_st.id) catch "";
@@ -1690,6 +1708,7 @@ pub const TUI = struct {
                     self.switchToStore(new_st);
                     self.note("\x1b[90mresumed session\x1b[0m", .{});
                 }
+                self.startup_resume = false;
                 return false;
             },
             .tree => {
@@ -5140,8 +5159,11 @@ pub const TUI = struct {
             self.menu_mode != .mcp_tools and self.menu_mode != .mcp_exposure and
             self.menu_mode != .login_select and self.menu_mode != .login_key and
             self.menu_mode != .logout_select) @min(self.menu_len, self.menuMaxVisible()) else 0;
-        // Session/tree pickers append a hint row after the entries.
+        // Session/tree pickers append a hint row after the entries; the
+        // startup --resume picker also carries a "Resume Session" title
+        // (pi SessionSelectorHeader.render).
         if (self.menu_mode == .sessions or self.menu_mode == .tree) menu_h += 1;
+        if (self.menu_mode == .sessions and self.startup_resume) menu_h += 1;
         // MCP manager chrome: title(+details) + items + hint inside borders.
         const mcp_h: usize = if (self.menu_mode == .mcp or self.menu_mode == .mcp_server or
             self.menu_mode == .mcp_tools or self.menu_mode == .mcp_exposure) self.mcpViewHeight() else 0;
@@ -5497,6 +5519,11 @@ pub const TUI = struct {
         if (menu_h > 0) {
             const col_min: usize = if (self.menu_mode == .commands or self.menu_mode == .models) 12 else 32;
             const col_max: usize = if (self.menu_mode == .commands or self.menu_mode == .models) 32 else 32;
+            if (self.menu_mode == .sessions and self.startup_resume) {
+                // pi SessionSelectorHeader: accent title above the list.
+                const title = std.fmt.allocPrint(self.alloc, "\x1b[1m\x1b[38;2;167;152;215mResume Session\x1b[0m", .{}) catch return;
+                frame.append(self.alloc, title) catch return;
+            }
             if (self.menu_mode == .trust) {
                 if (self.trust_prompt) |tp| {
                     const accent = "\x1b[38;2;167;152;215m";
@@ -5523,7 +5550,12 @@ pub const TUI = struct {
                 }
             }
             self.updateMenuViewport(menu_h);
-            for (0..menu_h) |v| {
+            // Startup picker: the title row appended above is part of the
+            // menu_h budget, so the row loop emits one fewer line (items +
+            // hint) — otherwise every frame is one row taller than the
+            // terminal and the screen net-scrolls (stale-row desync).
+            const menu_rows: usize = if (self.menu_mode == .sessions and self.startup_resume) menu_h - 1 else menu_h;
+            for (0..menu_rows) |v| {
                 // menu_items is the projected window (modal pickers project
                 // their sel_rows through refreshSelMenu), so v is the
                 // window-relative index for both paths.
@@ -9134,6 +9166,41 @@ pub const TUI = struct {
         }
     }
 
+    /// pi --resume (selectSession): open the session picker right after the
+    /// trust gate; Esc exits 0 ("No session selected"), Enter resumes the
+    /// picked store. Public: main sets startup_resume and run() calls this.
+    pub fn beginStartupResume(self: *TUI) void {
+        self.startup_resume = true;
+        // Startup order (pi): the trust ask resolves BEFORE selectSession.
+        // With a trust prompt up, defer — endTrustPrompt opens the picker.
+        if (self.menu_mode == .trust) return;
+        self.openStartupResumePicker();
+    }
+
+    /// Populate and open the startup picker; an empty directory keeps the
+    /// fresh session (pi would show an empty list — the picker only runs
+    /// when SessionManager.list yields entries we can offer).
+    fn openStartupResumePicker(self: *TUI) void {
+        const list = ss.listForCwd(self.alloc, self.io, self.sessions_dir, self.cwd_abs) catch &.{};
+        defer self.freeSessionList(list);
+        if (list.len == 0) {
+            self.startup_resume = false;
+            self.note("\x1b[90mno previous sessions for this directory — starting fresh\x1b[0m", .{});
+            return;
+        }
+        self.openSessionsMenu();
+    }
+
+    /// Startup picker cancel (Esc): pi prints "No session selected" and
+    /// exits 0 — quit through the normal /exit path (deferred terminal
+    /// restore; main retires whatever store is current, here none). Public:
+    /// the startup-resume regression test drives it directly.
+    pub fn startupResumeCancel(self: *TUI) void {
+        self.startup_resume = false;
+        self.menu_mode = .hidden;
+        self.cmd_exit_requested = true;
+    }
+
     /// Enter in the trust selector: persist per kind (session-only choices
     /// skip the store), flip project_trusted, run the main-provided reload
     /// hook, then close (pi saveProjectTrustPromptResult + resource reload).
@@ -9172,6 +9239,10 @@ pub const TUI = struct {
         self.menu_mode = .hidden;
         self.refreshSlashExtras();
         self.reloadResources() catch {};
+        // pi --resume: selectSession runs after the trust ask resolves.
+        if (self.startup_resume) {
+            self.openStartupResumePicker();
+        }
         self.redraw();
         _ = from_command;
     }
@@ -10657,6 +10728,14 @@ pub const TUI = struct {
 
         self.redraw();
 
+        // pi --resume (cli/session-picker.js selectSession): the session
+        // picker opens after the trust gate resolves. With no trust ask
+        // pending it runs now; otherwise endTrustPrompt opens it.
+        if (self.startup_resume and self.menu_mode != .trust) {
+            self.openStartupResumePicker();
+            self.redraw();
+        }
+
         var oc: agent.OutputContext = .{ .fn_ptr = outputCallback, .user_data = @ptrCast(self) };
         self.session.output_cb = &oc;
         // The transcript is built from the agent's turn events.
@@ -11606,6 +11685,14 @@ pub const TUI = struct {
                     self.redraw();
                     continue;
                 } else if (self.bindings.matches(key, .menu_close)) {
+                    // pi SessionSelector.onCancel: startup --resume cancel
+                    // means the user declined to pick ("No session
+                    // selected", exit 0); the in-session /resume picker
+                    // just closes back to the current conversation.
+                    if (self.menu_mode == .sessions and self.startup_resume) {
+                        self.startupResumeCancel();
+                        continue;
+                    }
                     self.menu_mode = .hidden;
                     self.redraw();
                     continue;

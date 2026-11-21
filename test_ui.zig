@@ -878,6 +878,84 @@ test "session: leafChain previews + branchAt/forkAt + thinking entries" {
     try std.testing.expectEqualStrings("abandoned path summary", chain3[1].preview[0..chain3[1].preview_len]);
 }
 
+// ---- Startup --resume picker (pi cli/session-picker.js) ----
+
+// Drive beginStartupResume for a TUI pointed at `sdir`/`cwd`: with sessions
+// present it opens the .sessions picker; with none it stays hidden.
+test "startup resume: picker opens, cancel exits, empty dir stays fresh" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.heap.page_allocator;
+    var model: config.Config.Model = .{
+        .provider = try alloc.dupe(u8, "test"),
+        .id = try alloc.dupe(u8, "test-id"),
+        .name = try alloc.dupe(u8, "test-model"),
+        .base_url = try alloc.dupe(u8, "http://localhost:8080/v1"),
+        .api_key = try alloc.dupe(u8, ""),
+        .api = try alloc.dupe(u8, "openai-completions"),
+    };
+    const provider = try aiprovider.buildFromModel(alloc, io, &model);
+    var registry = tools.Registry.init(alloc);
+    try tools.registerAll(&registry);
+    var session = try agent.Session.init(alloc, io, &model, &registry, provider, "test");
+    defer session.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [1024]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const sdir = try std.fmt.allocPrint(alloc, "{s}/sess", .{root});
+    defer alloc.free(sdir);
+    const cwd = try std.fmt.allocPrint(alloc, "{s}/proj", .{root});
+    defer alloc.free(cwd);
+
+    var t = tui.TUI.init(io, alloc, &session, "test-model", sdir, cwd, null, null, .empty, null, null);
+    defer t.deinit();
+
+    // Empty directory: -r stays a fresh session (picker suppressed).
+    t.beginStartupResume();
+    try std.testing.expect(!t.startup_resume);
+    try std.testing.expect(t.menu_mode == .hidden);
+
+    // One recorded session → the picker opens with the title-budgeted view.
+    std.Io.Dir.cwd().createDirPath(io, sdir) catch {};
+    const st = try ss.Store.create(alloc, io, sdir, cwd, .{});
+    defer st.deinit();
+    var mu = cmsg.Message.init(alloc);
+    defer mu.deinit();
+    mu.role = .user;
+    try mu.blocks.append(.{ .text = cmsg.Message.allocStr(alloc, "resume me") });
+    st.recordMessage(&mu);
+
+    t.beginStartupResume();
+    try std.testing.expect(t.startup_resume);
+    try std.testing.expect(t.menu_mode == .sessions);
+    try std.testing.expect(t.sel_len >= 1);
+    try std.testing.expect(t.menu_len >= 1);
+
+    // Enter path: menuActivate on the row swaps the store in and clears the
+    // startup flag (session starts empty; main left it unset for -r).
+    const activated = t.menuActivate();
+    try std.testing.expect(!activated);
+    try std.testing.expect(t.menu_mode == .hidden);
+    try std.testing.expect(!t.startup_resume);
+    try std.testing.expect(session.store != null);
+    try std.testing.expect(session.context.messages.items.len >= 1);
+    const resumed = session.store.?;
+    try std.testing.expect(std.mem.indexOf(u8, resumed.path, sdir) != null);
+    resumed.deinit();
+    session.store = null;
+
+    // Cancel path (Esc): flags cleared, exit requested (pi "No session
+    // selected", exit 0).
+    t.beginStartupResume();
+    try std.testing.expect(t.menu_mode == .sessions);
+    t.startupResumeCancel();
+    try std.testing.expect(!t.startup_resume);
+    try std.testing.expect(t.menu_mode == .hidden);
+    try std.testing.expect(t.cmd_exit_requested);
+}
+
 // ---- Editor mouse selection ----
 
 test "editor selection: drag selects, selectionText extracts, insert replaces" {
