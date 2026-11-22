@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const msg = @import("message.zig");
 const ai = @import("../ai/openai.zig");
 const aiprovider = @import("../ai/provider.zig");
+const sse = @import("../ai/sse.zig");
 const events = @import("events.zig");
 const tools = @import("../tools/registry.zig");
 const config = @import("config.zig");
@@ -1108,7 +1109,8 @@ pub const Session = struct {
                     self.emit(.tool_info, "\n[auto-compact: context overflow — compacting and retrying]\n");
                     _ = self.runCompactionReasoned(null, "overflow") catch {};
                     continue; // rebuild wire messages against the compacted context
-                } else if (isRetryableTransportError(e) and self.retry_attempt < self.retry_max) {
+                } else if (isRetryableTransportError(e) and self.retry_attempt < self.retry_max and
+                    !sse.isQuotaExhausted(self.provider.lastErrorText())) {
                     // pi retryAssistantCall: a transient transport failure
                     // (connect refused, stream drop, 5xx) retries at the AGENT
                     // layer too — the provider already retried 3× with short
@@ -1120,8 +1122,19 @@ pub const Session = struct {
                     text_buf.deinit();
                     thinking_buf.deinit();
                     tool_calls.deinit();
-                    var rb: [96]u8 = undefined;
-                    const rmsg = std.fmt.bufPrint(&rb, "\n[connection lost ({s}) — retrying {d}/{d}]\n", .{ @errorName(e), self.retry_attempt, self.retry_max }) catch "\n[connection lost — retrying]\n";
+                    // The provider's lastErrorText carries the concrete
+                    // reason (HTTP status + server body, or the transport
+                    // error name) — show it so a retry is never a mystery.
+                    var detail_buf: [512]u8 = undefined;
+                    const detail = sse.formatDetail(self.provider.lastErrorText(), &detail_buf, 300);
+                    const en = @errorName(e);
+                    var what_buf: [400]u8 = undefined;
+                    const what_full = if (detail.len > 0)
+                        std.fmt.bufPrint(&what_buf, "{s}: {s}", .{ en, detail }) catch en
+                    else
+                        en;
+                    var rb: [1024]u8 = undefined;
+                    const rmsg = std.fmt.bufPrint(&rb, "\n[connection lost ({s}) — retrying {d}/{d}]\n", .{ what_full, self.retry_attempt, self.retry_max }) catch "\n[connection lost — retrying]\n";
                     self.emit(.tool_info, rmsg);
                     const delay_ms = Session.transportRetryDelayMs(self.retry_attempt);
                     var slept: i64 = 0;

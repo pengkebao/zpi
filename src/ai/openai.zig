@@ -6,6 +6,7 @@ const msg = @import("../core/message.zig");
 const config = @import("../core/config.zig");
 const json = @import("json.zig");
 const stream_guard = @import("stream_guard.zig");
+const sse = @import("sse.zig");
 
 /// Debug: when set (main.zig reads $ZPI_DEBUG_BODY), every outgoing
 /// chat-completions body is written to this path for inspection
@@ -43,6 +44,13 @@ pub const OpenAiProvider = struct {
 
     pub fn lastErrorText(self: *const OpenAiProvider) []const u8 {
         return self.last_error_buf[0..self.last_error_len];
+    }
+
+    /// Record a transport failure reason (connect/send/head error name) so
+    /// the retry notice can show WHAT happened, not just that it failed.
+    fn noteTransport(self: *OpenAiProvider, comptime fmt: []const u8, args: anytype) void {
+        const s = std.fmt.bufPrint(&self.last_error_buf, fmt, args) catch return;
+        self.last_error_len = s.len;
     }
 
     /// Store a mid-stream error message (pi: errorMessage from the SSE
@@ -105,14 +113,23 @@ pub const OpenAiProvider = struct {
         /// Emit a retry notice through the session's output callback (TUI
         /// shows it in the scrollback; print mode ignores tool_info).
         fn notifyRetry(self: *OpenAiProvider, session: anytype, attempt: usize, outcome: StreamOutcome) void {
-            _ = self;
             const what = switch (outcome) {
                 .transport_error => "transport error",
                 .retryable_status => "retryable status",
                 else => "error",
             };
-            var buf: [96]u8 = undefined;
-            const m = std.fmt.bufPrint(&buf, "\n[connection lost ({s}) — retrying {d}/{d}]\n", .{ what, attempt, max_retries - 1 }) catch return;
+            // postSse records the concrete reason in lastErrorText (HTTP
+            // status + body, or the transport error name) — show it so a
+            // retry is never a mystery: which status, what the server said.
+            var detail_buf: [512]u8 = undefined;
+            const detail = sse.formatDetail(self.lastErrorText(), &detail_buf, 300);
+            var what_buf: [400]u8 = undefined;
+            const what_full = if (detail.len > 0)
+                std.fmt.bufPrint(&what_buf, "{s}: {s}", .{ what, detail }) catch what
+            else
+                what;
+            var buf: [1024]u8 = undefined;
+            const m = std.fmt.bufPrint(&buf, "\n[connection lost ({s}) — retrying {d}/{d}]\n", .{ what_full, attempt, max_retries - 1 }) catch return;
             session.emit(.tool_info, m);
         }
 
@@ -174,6 +191,11 @@ pub const OpenAiProvider = struct {
             const retryable = outcome == .transport_error or
                 (outcome == .retryable_status and !had_output);
             if (!retryable) return error.HttpError;
+            // Exhausted quota/billing (weekly/monthly cap, insufficient
+            // credits): retrying cannot help until the window resets —
+            // stop now (no "retrying" notice) and let the agent surface
+            // the server's message (which usually carries the reset time).
+            if (sse.isQuotaExhausted(self.lastErrorText())) return error.HttpError;
             // pi onRetryableError: surface the retry so a mid-turn stall is
             // never a silent pause ("Working" with nothing happening).
             self.notifyRetry(session, attempt, outcome);
@@ -230,8 +252,14 @@ pub const OpenAiProvider = struct {
                 std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = body_items }) catch {};
             }
         }
-        request.sendBodyComplete(@constCast(body_items)) catch return .transport_error;
-        var response = request.receiveHead(&[_]u8{}) catch return .transport_error;
+        request.sendBodyComplete(@constCast(body_items)) catch |err| {
+            self.noteTransport("send failed: {s}", .{@errorName(err)});
+            return .transport_error;
+        };
+        var response = request.receiveHead(&[_]u8{}) catch |err| {
+            self.noteTransport("no response: {s}", .{@errorName(err)});
+            return .transport_error;
+        };
 
         if (response.head.status != .ok) {
             var rbuf: [4096]u8 = undefined;
@@ -301,6 +329,7 @@ pub const OpenAiProvider = struct {
                 error.EndOfStream, error.ReadFailed => {
                     if (session.isAborted()) return .ok;
                     std.debug.print("error: SSE stream ended without [DONE]\n", .{});
+                    self.noteTransport("stream ended without a completion marker: {s}", .{@errorName(err)});
                     return .transport_error;
                 },
                 error.StreamTooLong => {
