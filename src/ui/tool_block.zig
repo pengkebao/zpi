@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const wmod = @import("width.zig");
+const image = @import("image.zig");
 
 // ---- pi dark theme (okhsl converted to sRGB with pi-tui's color pipeline) ----
 const RESET = "\x1b[0m";
@@ -71,6 +72,10 @@ pub const Options = struct {
     expanded: bool = false,
     /// Home directory, shown as `~` in paths.
     home: ?[]const u8 = null,
+    /// Working directory for resolving relative tool paths (OSC 8 links).
+    cwd: ?[]const u8 = null,
+    /// The terminal forwards OSC 8 hyperlinks (pi getCapabilities().hyperlinks).
+    hyperlinks: bool = false,
     /// Display text of the expand keybinding, for the "to expand" hints.
     expand_key: []const u8 = "ctrl+o",
 };
@@ -482,6 +487,10 @@ const Builder = struct {
 
     /// A file path in accent color with the home directory shortened. A missing
     /// path shows `fallback`, or "..." while the argument is still streaming.
+    /// When the terminal forwards OSC 8 (pi renderToolPath/linkPath), the
+    /// visible path is wrapped in a `file://` hyperlink — Ghostty/Kitty/
+    /// WezTerm/iTerm2 make it clickable, opening the file in the OS default
+    /// app (images land in the macOS preview app).
     fn pathSpan(self: *Builder, arg: ArgStr, fallback: ?[]const u8) !Span {
         const raw: []const u8 = switch (arg) {
             .invalid => return .{ .style = FG_ERROR, .text = "[invalid arg]" },
@@ -489,7 +498,21 @@ const Builder = struct {
             .value => |v| v,
         };
         const value = if (raw.len > 0) raw else (fallback orelse return .{ .style = FG_OUTPUT, .text = "..." });
-        return .{ .style = FG_ACCENT, .text = try shortenHome(self.arena, try sanitizeLine(self.arena, value), self.opts.home) };
+        const shown = try shortenHome(self.arena, try sanitizeLine(self.arena, value), self.opts.home);
+        if (!self.opts.hyperlinks) return .{ .style = FG_ACCENT, .text = shown };
+        // Resolve against the cwd for relative paths, then percent-encode
+        // into a file:// URL (pi linkPath: pathToFileURL(resolvePath(...))).
+        const is_abs = std.mem.startsWith(u8, value, "/") or (value.len >= 2 and value[1] == ':');
+        if (is_abs) {
+            const url = try image.pathToFileUrl(self.arena, value);
+            const linked = try image.hyperlink(self.arena, shown, url);
+            return .{ .style = FG_ACCENT, .text = linked };
+        }
+        const cwd = self.opts.cwd orelse return .{ .style = FG_ACCENT, .text = shown };
+        const joined = try std.fmt.allocPrint(self.arena, "{s}/{s}", .{ cwd, value });
+        const url = try image.pathToFileUrl(self.arena, joined);
+        const linked = try image.hyperlink(self.arena, shown, url);
+        return .{ .style = FG_ACCENT, .text = linked };
     }
 
     /// The search root of grep/find, in output color; defaults to ".".
@@ -519,6 +542,7 @@ const SgrState = struct {
     strikethrough: bool = false,
     fg: ?[]const u8 = null, // last fg sequence, e.g. "\x1b[38;2;234;127;129m"
     bg: ?[]const u8 = null, // last bg sequence
+    link: ?[]const u8 = null, // active OSC 8 hyperlink URL (points into the row text)
 
     fn clear(self: *SgrState) void {
         self.* = .{};
@@ -540,6 +564,13 @@ const SgrState = struct {
     }
 
     fn applySeq(self: *SgrState, seq: []const u8) void {
+        if (seq.len >= 7 and seq[1] == ']' and std.mem.eql(u8, seq[2..5], "8;;")) {
+            // OSC 8 hyperlink: \x1b]8;;<url>\x1b\\ opens, \x1b]8;;\x1b\\ closes.
+            // The URL points into the row text (arena-owned, lives on).
+            const body = seq[5 .. seq.len - 2];
+            self.link = if (body.len == 0) null else body;
+            return;
+        }
         if (seq.len < 3 or seq[1] != '[' or seq[seq.len - 1] != 'm') return;
         const params = seq[2 .. seq.len - 1];
         var i: usize = 0;
@@ -598,6 +629,12 @@ const SgrState = struct {
             while (j < params.len and params[j] != ';') j += 1;
         }
         return if (j < params.len) j + 1 else params.len;
+    }
+
+    /// The OSC 8 close sequence, to end a link that a wrap left dangling
+    /// (pi getActiveOsc8Close).
+    fn linkClose() []const u8 {
+        return "\x1b]8;;\x1b\\";
     }
 
     /// The active codes as a prefix for a continuation row (pi
@@ -667,9 +704,19 @@ fn wrapSpans(arena: std.mem.Allocator, spans: []const Span, width: usize, out: *
             if (col + w > width and col > 0) {
                 if (i > start) {
                     try cur.append(arena, .{ .style = sp.style, .text = sp.text[start..i] });
-                    // appendRow resets after each styled fragment.
-                    if (sp.style.len > 0) st.clear();
                 }
+                // Capture the active link before the fragment reset clears
+                // the state: the wrap left it open on this row (close it —
+                // pi getActiveOsc8Close — so it cannot bleed into the next
+                // physical row) and it restarts on the continuation row (pi
+                // getActiveCodes re-emits the hyperlink), keeping the whole
+                // wrapped path one clickable range.
+                const active_link = st.link orelse "";
+                if (i > start and active_link.len > 0) {
+                    try cur.append(arena, .{ .text = SgrState.linkClose() });
+                }
+                // appendRow resets after each styled fragment.
+                if (sp.style.len > 0) st.clear();
                 try out.append(arena, try cur.toOwnedSlice(arena));
                 cur = .empty;
                 col = 0;
@@ -679,6 +726,9 @@ fn wrapSpans(arena: std.mem.Allocator, spans: []const Span, width: usize, out: *
                 // in default colors.
                 if (try st.replayCodes(arena)) |prefix| {
                     try cur.append(arena, .{ .text = prefix });
+                }
+                if (active_link.len > 0) {
+                    try cur.append(arena, .{ .text = try std.fmt.allocPrint(arena, "\x1b]8;;{s}\x1b\\", .{active_link}) });
                 }
             }
             col += w;
@@ -1129,6 +1179,40 @@ test "read: a successful read is one header row with the line range" {
     try expectRows(&.{ "", "", " read ~/p/main.zig:5-14", "" }, block);
     try t.expect(std.mem.indexOf(u8, block, FG_ACCENT ++ "~/p/main.zig") != null);
     try t.expect(std.mem.indexOf(u8, block, FG_WARNING ++ ":5-14") != null);
+}
+
+test "read: the path is an OSC 8 file link when hyperlinks are on" {
+    const block = try render(t.allocator, .{
+        .name = "read",
+        .args = "{\"file_path\":\"/home/u/p/pic.png\"}",
+        .result = "ok",
+    }, .{ .width = 60, .home = "/home/u", .cwd = "/home/u/p", .hyperlinks = true });
+    defer t.allocator.free(block);
+    // The visible text is plain; the file:// URL rides in the OSC 8 escapes.
+    try t.expect(std.mem.indexOf(u8, block, FG_ACCENT ++ "\x1b]8;;file:///home/u/p/pic.png\x1b\\~/p/pic.png\x1b]8;;\x1b\\") != null);
+    try t.expect(std.mem.indexOf(u8, block, "file:///") != null);
+}
+
+test "read: relative path resolves against cwd for the link" {
+    const block = try render(t.allocator, .{
+        .name = "read",
+        .args = "{\"file_path\":\"a b.png\"}",
+        .result = "ok",
+    }, .{ .width = 60, .home = "/home/u", .cwd = "/home/u/p", .hyperlinks = true });
+    defer t.allocator.free(block);
+    // Space in the relative path is percent-encoded in the file:// URL.
+    try t.expect(std.mem.indexOf(u8, block, "file:///home/u/p/a%20b.png") != null);
+}
+
+test "read: no OSC 8 when hyperlinks are off" {
+    const block = try render(t.allocator, .{
+        .name = "read",
+        .args = "{\"file_path\":\"/home/u/p/pic.png\"}",
+        .result = "ok",
+    }, .{ .width = 60, .home = "/home/u" });
+    defer t.allocator.free(block);
+    try t.expect(std.mem.indexOf(u8, block, "\x1b]8;") == null);
+    try t.expect(std.mem.indexOf(u8, block, FG_ACCENT ++ "~/p/pic.png") != null);
 }
 
 test "read: expanded shows the content, an error shows its first lines" {

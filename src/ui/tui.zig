@@ -4655,10 +4655,11 @@ pub const TUI = struct {
                 }
             }
         }
-        // Image protocol capability (pi getCapabilities): cached once. tmux,
-        // non-image terminals and the e2e PTY all resolve to `.none`, so the
-        // read-of-image result falls back to a text indicator there.
-        const image_caps = image.detect(environ);
+        // Terminal capabilities (pi getCapabilities): cached once. tmux,
+        // non-image terminals and the e2e PTY all resolve to `.none` images,
+        // so the read-of-image result falls back to a text indicator there;
+        // hyperlink support gates OSC 8 file links in tool paths.
+        const image_caps = image.detect(environ, io);
         // Wheel feel (pi: wheelScrollLines "auto"): a local macOS terminal
         // delivers already-accelerated, one-line-at-a-time events.
         const over_ssh = std.process.Environ.getPosix(environ, "SSH_CONNECTION") != null or
@@ -6269,6 +6270,69 @@ pub const TUI = struct {
     /// Release: no movement = click (toggle the tool block under the
     /// pointer); movement = the selection is done, copy it (pi:
     /// copyOnSelect). Returns true to redraw.
+    /// The OSC 8 hyperlink URL at a screen cell, from the transcript row's
+    /// rendered text (pi getOsc8LinkAtColumn over previousScreen[y]). The
+    /// doc lines keep their escapes, so the active link at the clicked
+    /// visible column is recovered by walking the line: escapes carry the
+    /// open/close URLs; a visible cell consumes one column.
+    fn osc8LinkAt(self: *TUI, col: usize, row: usize) ?[]const u8 {
+        if (row >= self.transcript_h) return null;
+        // doc_lines slices point into scrollback block memory: a block
+        // re-render (e.g. the previous click toggling a tool block) frees
+        // them. Rebuild the cache first unless it is provably current —
+        // same freshness keys as refreshDocCache's skip condition.
+        if (self.doc_cache_gen != self.transcript_gen or
+            self.doc_cache_w != self.width or
+            self.doc_cache_th != self.thinking_hidden or
+            self.doc_cache_ex != self.tools_expanded)
+        {
+            self.refreshDocCache() catch return null;
+        }
+        const doc_row = self.sv.scroll_top + row;
+        // Only committed scrollback rows (blockAt's guard): the live tail's
+        // cache rows churn every frame and need not stay valid.
+        if (doc_row >= self.doc_lines.items.len) return null;
+        const line = self.doc_lines.items[doc_row];
+        var active: ?[]const u8 = null;
+        var cur_col: usize = 0;
+        var i: usize = 0;
+        while (i < line.len) {
+            if (line[i] == 0x1b) {
+                const e = overlay.escapeEnd(line, i);
+                const seq = line[i..e];
+                // OSC 8: \x1b]8;;<url>\x1b\\ opens (non-empty url),
+                // \x1b]8;;\x1b\\ closes (empty url).
+                if (seq.len >= 7 and seq[1] == ']' and std.mem.eql(u8, seq[2..5], "8;;")) {
+                    const body = seq[5 .. seq.len - 2];
+                    active = if (body.len == 0) null else body;
+                }
+                i = e;
+                continue;
+            }
+            const end = wmod.nextCharEnd(line, i);
+            const w = wmod.visualWidth(line[i..end]);
+            // The clicked cell falls inside this grapheme?
+            if (col >= cur_col and col < cur_col + @max(w, 1)) return active;
+            cur_col += @max(w, 1);
+            i = end;
+        }
+        return null;
+    }
+
+    /// Open a URL/path with the OS opener (pi openBrowser: `open` on macOS,
+    /// rundll32 on Windows, xdg-open elsewhere). Fire-and-forget, detached.
+    fn openUrlExternally(self: *TUI, target: []const u8) void {
+        const target_z = std.fmt.allocPrintSentinel(self.alloc, "{s}", .{target}, 0) catch return;
+        defer self.alloc.free(target_z);
+        const argv: []const []const u8 = switch (builtin.os.tag) {
+            .macos => &.{ "open", target_z },
+            .windows => &.{ "rundll32", "url.dll,FileProtocolHandler", target_z },
+            else => &.{ "xdg-open", target_z },
+        };
+        var child = std.process.spawn(self.io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
+        _ = child.wait(self.io) catch {};
+    }
+
     pub fn handleRelease(self: *TUI, col: usize, row: usize) bool {
         if (self.scrollbarRelease()) return true;
         const press = self.sel_press orelse return false;
@@ -6299,6 +6363,15 @@ pub const TUI = struct {
             return true;
         }
         if (is_click) {
+            // pi handleSelectionMouseEvent: a plain click on an OSC 8
+            // hyperlink opens it (getOsc8LinkAtColumn + openUrl = `open`
+            // on macOS). Before any click semantics: a path click opens
+            // the file in the OS default app (images land in Preview).
+            if (self.osc8LinkAt(col, row)) |url| {
+                self.render_mutex.unlock(self.io);
+                self.openUrlExternally(url);
+                return true;
+            }
             // pi: the click event is dispatched to the component under the
             // pointer — a tool block toggles its own expansion, a thinking
             // block (streaming or finished) collapses to "Thinking…".
@@ -7586,7 +7659,7 @@ pub const TUI = struct {
                     .name = st.name,
                     .args = st.args,
                     .pending = true,
-                }, .{ .width = self.width, .home = self.home_dir })) |block| {
+                }, .{ .width = self.width, .home = self.home_dir, .cwd = self.cwd_abs, .hyperlinks = self.image_caps.hyperlinks })) |block| {
                     defer self.alloc.free(block);
                     var rows: std.ArrayListUnmanaged([]u8) = .empty;
                     errdefer for (rows.items) |r| self.alloc.free(r);
@@ -9595,6 +9668,8 @@ pub const TUI = struct {
             .width = self.width,
             .expanded = e.effectiveExpanded(self.tools_expanded),
             .home = self.home_dir,
+            .cwd = self.cwd_abs,
+            .hyperlinks = self.image_caps.hyperlinks,
         }) catch return;
         // A read-of-image result appends its image (an encoded line + spacer
         // rows) or a one-line fallback indicator below the tool text.
@@ -9682,6 +9757,8 @@ pub const TUI = struct {
                         .width = self.width,
                         .expanded = e.effectiveExpanded(self.tools_expanded),
                         .home = self.home_dir,
+                        .cwd = self.cwd_abs,
+                        .hyperlinks = self.image_caps.hyperlinks,
                     }) catch break :blk null;
                     if (self.blockWithImage(rendered, e) catch null) |wi| {
                         self.alloc.free(rendered);

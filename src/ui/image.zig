@@ -18,31 +18,121 @@ const base64 = std.base64;
 /// Kitty, WezTerm). tmux strips image protocols, so it is always `none`.
 pub const Protocol = enum { none, kitty };
 
-/// Terminal capabilities, cached once (pi getCapabilities).
-pub const Caps = struct { images: Protocol };
+/// Terminal capabilities, cached once (pi getCapabilities): the image
+/// protocol plus OSC 8 hyperlink support (pi detectCapabilitiesFromEnvironment).
+pub const Caps = struct { images: Protocol, hyperlinks: bool = false };
 
-/// Detect the image protocol from the environment (pi
-/// detectCapabilitiesFromEnvironment).
-pub fn detect(environ: std.process.Environ) Caps {
-    if (std.process.Environ.getPosix(environ, "TMUX") != null) return .{ .images = .none };
-    const kitty = std.process.Environ.getPosix(environ, "KITTY_WINDOW_ID") != null;
-    const tp_raw = std.process.Environ.getPosix(environ, "TERM_PROGRAM");
-    var tp_buf: [64]u8 = undefined;
-    const tp: []const u8 = if (tp_raw) |t| blk: {
-        if (t.len <= tp_buf.len) {
-            _ = std.ascii.lowerString(tp_buf[0..t.len], t);
-            break :blk tp_buf[0..t.len];
-        }
-        break :blk t;
-    } else "";
-    if (kitty) return .{ .images = .kitty };
-    // Ghostty + WezTerm both implement the Kitty graphics protocol.
-    if (mem.indexOf(u8, tp, "ghostty") != null or mem.indexOf(u8, tp, "wezterm") != null or
-        mem.eql(u8, tp, "kitty"))
-    {
-        return .{ .images = .kitty };
+/// tmux only re-emits OSC 8 hyperlinks when its `client_termfeatures`
+/// lists `hyperlinks`; strip them otherwise (pi probeTmuxHyperlinks).
+/// Only ever runs inside tmux (TMUX set), where the command answers in
+/// milliseconds, so a plain read-to-EOF is safe.
+pub fn probeTmuxHyperlinks(environ: std.process.Environ, io: std.Io) bool {
+    if (std.process.Environ.getPosix(environ, "TMUX") == null) return false;
+    var argv = [_][]const u8{ "tmux", "display-message", "-p", "#{client_termfeatures}" };
+    var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .ignore, .stdout = .pipe, .stderr = .ignore }) catch return false;
+    const stdout = child.stdout orelse {
+        child.kill(io);
+        return false;
+    };
+    const out = blk: {
+        var buf: [256]u8 = undefined;
+        var reader = stdout.reader(io, &buf);
+        break :blk std.Io.Reader.allocRemaining(&reader.interface, std.heap.page_allocator, std.Io.Limit.limited(4096)) catch {
+            child.kill(io);
+            return false;
+        };
+    };
+    defer std.heap.page_allocator.free(out);
+    child.stdout = null;
+    _ = child.wait(io) catch {};
+    const t = std.mem.trim(u8, out, " \n\r");
+    var it = std.mem.splitScalar(u8, t, ',');
+    while (it.next()) |f| {
+        if (mem.eql(u8, std.mem.trim(u8, f, " "), "hyperlinks")) return true;
     }
-    return .{ .images = .none };
+    return false;
+}
+
+/// Lowercase `s` into a caller stack buffer; long values pass through as-is.
+fn lowerInto(buf: *[64]u8, s: []const u8) []const u8 {
+    if (s.len <= buf.len) {
+        _ = std.ascii.lowerString(buf[0..s.len], s);
+        return buf[0..s.len];
+    }
+    return s;
+}
+
+/// Detect image protocol + OSC 8 hyperlink support from the environment
+/// (pi detectCapabilitiesFromEnvironment). tmux requires a live probe of
+/// `client_termfeatures`; screen does not forward OSC 8.
+pub fn detect(environ: std.process.Environ, io: std.Io) Caps {
+    var term_buf: [64]u8 = undefined;
+    const term = std.process.Environ.getPosix(environ, "TERM") orelse "";
+    const term_lc = lowerInto(&term_buf, term);
+    const in_tmux = std.process.Environ.getPosix(environ, "TMUX") != null or mem.startsWith(u8, term_lc, "tmux");
+    if (in_tmux) {
+        return .{ .images = .none, .hyperlinks = probeTmuxHyperlinks(environ, io) };
+    }
+    if (mem.startsWith(u8, term_lc, "screen")) return .{ .images = .none, .hyperlinks = false };
+    const kitty = std.process.Environ.getPosix(environ, "KITTY_WINDOW_ID") != null;
+    var tp_buf: [64]u8 = undefined;
+    const tp_raw = std.process.Environ.getPosix(environ, "TERM_PROGRAM");
+    const tp: []const u8 = if (tp_raw) |t| lowerInto(&tp_buf, t) else "";
+    const wezterm = std.process.Environ.getPosix(environ, "WEZTERM_PANE") != null;
+    const warp = std.process.Environ.getPosix(environ, "WARP_SESSION_ID") != null or
+        std.process.Environ.getPosix(environ, "WARP_TERMINAL_SESSION_UUID") != null;
+    const iterm = std.process.Environ.getPosix(environ, "ITERM_SESSION_ID") != null;
+    const wt = std.process.Environ.getPosix(environ, "WT_SESSION") != null;
+    // Ghostty + WezTerm + Kitty implement the Kitty graphics protocol;
+    // iTerm2 its own. All of these forward OSC 8 hyperlinks.
+    const images: Protocol = if (kitty or mem.indexOf(u8, tp, "ghostty") != null or
+        mem.indexOf(u8, tp, "wezterm") != null or mem.eql(u8, tp, "kitty")) .kitty
+    else if (iterm or mem.eql(u8, tp, "iterm.app")) .kitty
+    else .none;
+    const hyperlinks = kitty or wezterm or warp or iterm or wt or
+        mem.indexOf(u8, tp, "ghostty") != null or mem.indexOf(u8, tp, "kitty") != null or
+        mem.indexOf(u8, tp, "wezterm") != null or mem.eql(u8, tp, "iterm.app") or
+        mem.eql(u8, tp, "alacritty") or mem.eql(u8, tp, "vscode") or mem.eql(u8, tp, "zed");
+    return .{ .images = images, .hyperlinks = hyperlinks };
+}
+
+/// OSC 8 hyperlink (pi hyperlink): the URL rides in the escape, so the
+/// visible text stays clean. Terminals without OSC 8 swallow the sequence
+/// and show only the text. Ghostty/Kitty/WezTerm/iTerm2 make the text
+/// clickable — a `file://` URL opens the file in the OS default app.
+pub fn hyperlink(alloc: std.mem.Allocator, text: []const u8, url: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "\x1b]8;;");
+    try out.appendSlice(alloc, url);
+    try out.appendSlice(alloc, "\x1b\\");
+    try out.appendSlice(alloc, text);
+    try out.appendSlice(alloc, "\x1b]8;;\x1b\\");
+    return out.toOwnedSlice(alloc);
+}
+
+/// Percent-encode an absolute local path as a `file://` URL (pi
+/// pathToFileURL). Only characters that are legal in a path stay as-is.
+pub fn pathToFileUrl(alloc: std.mem.Allocator, abs_path: []const u8) ![]u8 {
+    var enc: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer enc.deinit(alloc);
+    const hex: []const u8 = "0123456789ABCDEF";
+    for (abs_path) |c| {
+        if (c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c >= '0' and c <= '9' or
+            c == '-' or c == '.' or c == '_' or c == '~' or c == '/' or c == ':' or c == '!')
+        {
+            try enc.append(alloc, c);
+        } else {
+            try enc.append(alloc, '%');
+            try enc.append(alloc, hex[(c >> 4) & 0xF]);
+            try enc.append(alloc, hex[c & 0xF]);
+        }
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "file://");
+    try out.appendSlice(alloc, enc.items);
+    return out.toOwnedSlice(alloc);
 }
 
 fn be16(p: []const u8) u16 {
@@ -582,3 +672,26 @@ test "placementOnly keeps controls, drops payload" {
     try std.testing.expectEqualStrings("\x1b_Ga=p,q=2,C=1,c=34,i=7,y=33,h=101,r=12\x1b\\", pc);
     try std.testing.expectError(error.NotAnImage, placementOnly(alloc, "hello"));
 }
+
+// ---- hyperlink tests (pi hyperlink/pathToFileURL/detectCapabilities) ----
+
+test "pathToFileUrl percent-encodes like pathToFileURL" {
+    const alloc = std.heap.page_allocator;
+    const a = try pathToFileUrl(alloc, "/tmp/a b.png");
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("file:///tmp/a%20b.png", a);
+    const b = try pathToFileUrl(alloc, "/Users/x/中文 图.jpg");
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("file:///Users/x/%E4%B8%AD%E6%96%87%20%E5%9B%BE.jpg", b);
+    const c = try pathToFileUrl(alloc, "C:/dir/file.txt");
+    defer alloc.free(c);
+    try std.testing.expectEqualStrings("file://C:/dir/file.txt", c);
+}
+
+test "hyperlink wraps text in OSC 8 open/close" {
+    const alloc = std.heap.page_allocator;
+    const h = try hyperlink(alloc, "~/x.png", "file:///x.png");
+    defer alloc.free(h);
+    try std.testing.expectEqualStrings("\x1b]8;;file:///x.png\x1b\\~/x.png\x1b]8;;\x1b\\", h);
+}
+
