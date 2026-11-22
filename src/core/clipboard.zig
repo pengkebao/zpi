@@ -15,6 +15,7 @@
 //! hands the model a file path it can Read (the read tool attaches images).
 
 const std = @import("std");
+const platform = @import("../platform.zig");
 const shell = @import("../tools/shell.zig");
 
 pub const ImageData = struct {
@@ -74,7 +75,7 @@ pub fn decodeOsascriptData(alloc: std.mem.Allocator, text: []const u8) ?[]u8 {
 
 /// True under WSL (interop with the Windows clipboard via powershell.exe).
 fn isWsl(environ: std.process.Environ) bool {
-    return std.process.Environ.getPosix(environ, "WSL_DISTRO_NAME") != null;
+    return platform.envGet(environ, "WSL_DISTRO_NAME") != null;
 }
 
 /// Run a PowerShell script capturing stdout (windows/WSL). `shell` is
@@ -104,7 +105,7 @@ pub fn readClipboardImage(alloc: std.mem.Allocator, io: std.Io, environ: std.pro
         .windows => {
             // Native Windows: PowerShell saves the clipboard image (if any)
             // to %TEMP%\zpi-clip.png; we read the file back as PNG bytes.
-            const temp = std.process.Environ.getPosix(environ, "TEMP") orelse "C:\\Windows\\Temp";
+            const temp = platform.envGet(environ, "TEMP") orelse "C:\\Windows\\Temp";
             const win_path = std.fmt.allocPrint(alloc, "{s}\\zpi-clipboard.png", .{temp}) catch return null;
             defer alloc.free(win_path);
             const script = std.fmt.allocPrint(alloc, "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $i = [System.Windows.Forms.Clipboard]::GetImage(); if ($i) {{ $i.Save('{s}', [System.Drawing.Imaging.ImageFormat]::Png); Write-Output ok }} else {{ Write-Output empty }}", .{win_path}) catch return null;

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("src/platform.zig");
 const config = @import("src/core/config.zig");
 const agent = @import("src/core/agent.zig");
 const ai = @import("src/ai/openai.zig");
@@ -25,10 +26,7 @@ const mcp = @import("src/core/mcp.zig");
 const tool_search = @import("src/tools/tool_search.zig");
 
 fn getCwdAlloc(alloc: std.mem.Allocator) ![]u8 {
-    var buf: [4096]u8 = undefined;
-    const p = std.c.getcwd(&buf, buf.len) orelse return error.CwdTooLong;
-    const end = std.mem.indexOfScalar(u8, p[0..buf.len], 0) orelse buf.len;
-    return alloc.dupe(u8, p[0..end]);
+    return platform.getCwdAlloc(alloc);
 }
 
 /// Split a comma-separated list into trimmed, non-empty substrings.
@@ -708,14 +706,15 @@ pub fn main(init: std.process.Init) !void {
     var trust_needs_prompt = false;
     var trust_saved_decision: ?bool = null;
     // Home dir (user-level skill discovery ~/.agents/skills + trust checks).
-    const home_dir_early = std.process.Environ.getPosix(init.minimal.environ, "HOME") orelse
-        std.process.Environ.getPosix(init.minimal.environ, "USERPROFILE");
-    if (std.process.Environ.getPosix(init.minimal.environ, "ZPI_DEBUG_BODY")) |p| {
+    const home_borrow = platform.envGet(init.minimal.environ, "HOME") orelse
+        platform.envGet(init.minimal.environ, "USERPROFILE");
+    const home_dir_early = if (home_borrow) |h| alloc.dupe(u8, h) catch null else null;
+    if (platform.envGet(init.minimal.environ, "ZPI_DEBUG_BODY")) |p| {
         ai.debug_body_path = p;
     }
     // SSE idle timeout (pi httpIdleTimeoutMs, default 300s): no bytes for this
     // long fails the stream and the provider retry loop retries. "0" disables.
-    if (std.process.Environ.getPosix(init.minimal.environ, "ZPI_HTTP_IDLE_TIMEOUT_MS")) |raw| {
+    if (platform.envGet(init.minimal.environ, "ZPI_HTTP_IDLE_TIMEOUT_MS")) |raw| {
         if (std.fmt.parseInt(i64, raw, 10)) |ms| {
             if (ms >= 0) stream_guard.idle_timeout_ms = ms;
         } else |_| {}
@@ -724,7 +723,7 @@ pub fn main(init: std.process.Init) !void {
     // the stream — keep-alive heartbeats (blank lines/comments) do NOT reset
     // it, so a proxy that stalls upstream while heartbeating cannot hide the
     // stall from the byte-level window. "0" disables.
-    if (std.process.Environ.getPosix(init.minimal.environ, "ZPI_HTTP_DATA_TIMEOUT_MS")) |raw| {
+    if (platform.envGet(init.minimal.environ, "ZPI_HTTP_DATA_TIMEOUT_MS")) |raw| {
         if (std.fmt.parseInt(i64, raw, 10)) |ms| {
             if (ms >= 0) stream_guard.data_timeout_ms = ms;
         } else |_| {}
@@ -744,16 +743,8 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // chdir so tools (read/bash/edit) resolve relative paths against --cwd.
-    if (builtin.os.tag != .windows) {
-        if (std.mem.indexOfScalar(u8, cwd_abs, 0) == null) {
-            const cwd_z = alloc.alloc(u8, cwd_abs.len + 1) catch null;
-            if (cwd_z) |z| {
-                @memcpy(z[0..cwd_abs.len], cwd_abs);
-                z[cwd_abs.len] = 0;
-                _ = std.c.chdir(@ptrCast(z.ptr));
-                alloc.free(z);
-            }
-        }
+    if (std.mem.indexOfScalar(u8, cwd_abs, 0) == null) {
+        platform.setCwd(cwd_abs);
     }
 
     // pi resolveProjectTrusted, non-interactive part: CLI override wins;

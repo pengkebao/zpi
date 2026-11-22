@@ -16,6 +16,7 @@
 //! file per record (fine for KB-scale sessions; appendFile is a later优化).
 
 const std = @import("std");
+const platform = @import("../platform.zig");
 const msg = @import("message.zig");
 const compact = @import("compaction.zig");
 
@@ -900,7 +901,7 @@ pub const Store = struct {
         // file behind (rename is atomic on POSIX). The tmp name includes
         // the pid so concurrent zpi instances never collide.
         var tmp_buf: [PATH_TMP_MAX]u8 = undefined;
-        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp.{d}", .{ self.path, std.c.getpid() }) catch {
+        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp.{d}", .{ self.path, platform.pid() }) catch {
             // Path too long for the stack buffer: fall back to direct write.
             std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.path, .data = self.file_buf.items }) catch {};
             return;

@@ -11,6 +11,7 @@
 //! OAuth, resources, and exposure modes are deferred.
 
 const std = @import("std");
+const platform = @import("../platform.zig");
 const tools = @import("../tools/registry.zig");
 const Io = std.Io;
 const File = std.Io.File;
@@ -359,15 +360,9 @@ fn connectStdio(self: *Server, cfg: ServerConfig) !void {
     // e.g. NODE_PATH pointing at a vendored node_modules.
     var env_map = std.process.Environ.Map.init(self.alloc);
     defer env_map.deinit();
-    const parent_env = std.mem.span(std.c.environ);
-    for (parent_env) |entry| {
-        if (entry) |e| {
-            const s = std.mem.span(e);
-            if (std.mem.indexOfScalar(u8, s, '=')) |eq| {
-                env_map.put(s[0..eq], s[eq + 1 ..]) catch return error.SpawnFailed;
-            }
-        }
-    }
+    // Inherit the parent environment (cross-platform: platform walks
+    // std.c.environ on POSIX and the PEB global block on Windows).
+    platform.copyEnvironToMap(&env_map) catch return error.SpawnFailed;
     for (cfg.env) |e| {
         env_map.put(e.key, e.value) catch return error.SpawnFailed;
     }

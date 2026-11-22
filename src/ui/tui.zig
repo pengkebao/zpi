@@ -40,18 +40,13 @@ const keybindings = @import("keybindings.zig");
 const ai = @import("../ai/openai.zig");
 const aiprovider = @import("../ai/provider.zig");
 const builtin = @import("builtin");
+const platform = @import("../platform.zig");
+const terminal = @import("terminal.zig");
+const keys_windows = if (builtin.os.tag == .windows) @import("keys_windows.zig") else struct {};
 
 /// Test-only import so the in-file tests can build a session (kept out of
 /// non-test builds: the tools registry pulls in every tool module).
 const tools_test = if (builtin.is_test) @import("../tools/registry.zig") else struct {};
-
-const TIOCGWINSZ: u32 = if (builtin.os.tag == .linux) 0x5413 else 0x40087468;
-
-/// libc tcflush is not exposed by Zig 0.17's std.c: flush pending INPUT
-/// (TCIFLUSH) on teardown so an in-flight DSR reply (`ESC[<row>;<col>R`)
-/// cannot leak into the shell prompt as visible garbage.
-extern "c" fn tcflush(fd: c_int, queue_selector: c_int) c_int;
-const TCIFLUSH: c_int = 0;
 
 /// Reasoning/thinking level — drives the editor border color (matches pi's theme).
 const ThinkingLevel = config.ThinkingLevel;
@@ -552,7 +547,6 @@ pub const TUI = struct {
     /// True while there is nothing to restore: before setupTerminal saved the
     /// termios, and after restoreTerminal put it back.
     term_restored: bool = true,
-    old_termios: std.posix.termios = undefined,
     sessions_dir: []const u8,
     cwd_abs: []const u8,
     cwd_display: []const u8,
@@ -2036,7 +2030,7 @@ pub const TUI = struct {
             }
         }
         const env = self.loginEnvOf(provider_id);
-        const env_set = env.len > 0 and std.process.Environ.getPosix(self.environ, env) != null;
+        const env_set = env.len > 0 and platform.envContains(self.environ, env);
         if (stored) {
             return std.fmt.bufPrint(buf, "{s} ✓ configured{s}", .{ success, reset }) catch "";
         }
@@ -3974,7 +3968,7 @@ pub const TUI = struct {
     /// repaint from scratch.
     fn suspendToBackground(self: *TUI) void {
         self.restoreTerminal();
-        std.posix.raise(std.posix.SIG.TSTP) catch {};
+        platform.suspendProcess();
         self.resumeTui();
     }
 
@@ -3982,11 +3976,11 @@ pub const TUI = struct {
     /// Suspends the TUI (leaves alt-screen, restores cooked mode), runs the
     /// editor on a temp file, then resumes and loads the result.
     fn openExternalEditor(self: *TUI) void {
-        const editor_cmd = std.process.Environ.getPosix(self.environ, "EDITOR") orelse
-            std.process.Environ.getPosix(self.environ, "VISUAL") orelse "vi";
+        const editor_cmd = platform.envGet(self.environ, "EDITOR") orelse
+            platform.envGet(self.environ, "VISUAL") orelse "vi";
 
         var path_buf: [64]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/tmp/zpi-prompt-{d}.md", .{std.c.getpid()}) catch return;
+        const path = std.fmt.bufPrint(&path_buf, "/tmp/zpi-prompt-{d}.md", .{platform.pid()}) catch return;
 
         // Write the current editor content to the temp file.
         const text = self.editor.getText() catch return;
@@ -4120,13 +4114,15 @@ pub const TUI = struct {
     /// dispatch — a mouse press split across reads must never be mistaken
     /// for a lone ESC (which aborts the turn).
     fn watchMain(self: *TUI) void {
-        const fd: std.posix.fd_t = 0;
-        const old = std.posix.tcgetattr(fd) catch return;
-        var timed = old;
-        timed.cc[keys.CC_VMIN] = 0;
-        timed.cc[keys.CC_VTIME] = 1; // 100ms poll so we see watch_stop
-        std.posix.tcsetattr(fd, .NOW, timed) catch {};
-        defer std.posix.tcsetattr(fd, .NOW, old) catch {};
+        if (builtin.os.tag != .windows) {
+            const fd: std.posix.fd_t = 0;
+            const old = std.posix.tcgetattr(fd) catch return;
+            var timed = old;
+            timed.cc[keys.CC_VMIN] = 0;
+            timed.cc[keys.CC_VTIME] = 1; // 100ms poll so we see watch_stop
+            std.posix.tcsetattr(fd, .NOW, timed) catch {};
+            defer std.posix.tcsetattr(fd, .NOW, old) catch {};
+        }
 
         var buf: [4096]u8 = undefined;
         var pend: [4096]u8 = undefined;
@@ -4138,7 +4134,7 @@ pub const TUI = struct {
         var last_frame_ms: i64 = 0;
         var redraw_pending = false;
         while (!self.watch_stop.load(.acquire)) {
-            const n = std.posix.read(fd, &buf) catch return;
+            const n = watchRead(&buf);
             if (n == 0) {
                 // Poll timeout: also the resize check for turns in flight —
                 // the main loop is inside runPrompt, not reading keys, so
@@ -4639,8 +4635,8 @@ pub const TUI = struct {
         // OSC 8 hyperlinks leak as raw text in environments that do not
         // forward them (tmux without passthrough); dumb terminals too.
         {
-            const term = std.process.Environ.getPosix(environ, "TERM") orelse "";
-            if (std.process.Environ.getPosix(environ, "TMUX") != null or
+            const term = platform.envGet(environ, "TERM") orelse "";
+            if (platform.envContains(environ, "TMUX") or
                 std.mem.startsWith(u8, term, "tmux") or std.mem.eql(u8, term, "dumb"))
             {
                 markdown.hyperlinks_enabled = false;
@@ -4663,9 +4659,9 @@ pub const TUI = struct {
         const image_caps = image.detect(environ, io);
         // Wheel feel (pi: wheelScrollLines "auto"): a local macOS terminal
         // delivers already-accelerated, one-line-at-a-time events.
-        const over_ssh = std.process.Environ.getPosix(environ, "SSH_CONNECTION") != null or
-            std.process.Environ.getPosix(environ, "SSH_CLIENT") != null or
-            std.process.Environ.getPosix(environ, "SSH_TTY") != null;
+        const over_ssh = platform.envContains(environ, "SSH_CONNECTION") or
+            platform.envContains(environ, "SSH_CLIENT") or
+            platform.envContains(environ, "SSH_TTY");
         var wheel = scroll_view.WheelScrollAccelerator{};
         wheel.accelerate = !scroll_view.WheelScrollAccelerator.terminalAcceleratesWheel(builtin.os.tag == .macos, over_ssh);
         var sv = scroll_view.ScrollView.init(true, .auto);
@@ -4700,7 +4696,6 @@ pub const TUI = struct {
             .sv = sv,
             .wheel = wheel,
             .term_restored = true,
-            .old_termios = undefined,
             .sessions_dir = sessions_dir,
             .cwd_abs = cwd_abs,
             .cwd_display = cwd_display,
@@ -4811,28 +4806,8 @@ pub const TUI = struct {
 
     /// Enter raw mode + alt-screen, hide the cursor.
     fn setupTerminal(self: *TUI) void {
-        const old = std.posix.tcgetattr(0) catch return;
-        var raw = old;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        // ISIG off: Ctrl+C arrives as a byte (we handle it via bindings); the
-        // SIGINT handler stays installed as a safety net for external kills.
-        raw.lflag.ISIG = false;
-        // IEXTEN off: otherwise macOS/Linux swallow Ctrl+O as VDISCARD
-        // (output discard toggle) and other lnext/flush keys.
-        raw.lflag.IEXTEN = false;
-        // ICRNL translates input \r -> \n. Must be off so Enter (\r) stays distinct
-        // from Ctrl+J (\n) — otherwise Enter is misread as a newline.
-        raw.iflag.ICRNL = false;
-        // IXON lets Ctrl+S/Ctrl+Q pause/resume output (swallowing the keys).
-        // Must be off so rebound submit keys like ctrl+s reach the app.
-        raw.iflag.IXON = false;
-        // OPOST: no output post-processing (we position the cursor explicitly).
-        raw.oflag.OPOST = false;
-        raw.cc[3] = 1; // VMIN
-        raw.cc[4] = 0; // VTIME
-        std.posix.tcsetattr(0, .NOW, raw) catch {};
-        self.old_termios = old;
+        terminal.enableVirtualTerminal();
+        terminal.enterRawMode();
         self.term_restored = false;
         self.measureSize();
         if (!self.regular) {
@@ -4896,7 +4871,7 @@ pub const TUI = struct {
         if (self.term_restored) return;
         // Drop any unread terminal replies (a DSR cursor report racing the
         // exit). Raw mode is still on: nothing echoes yet.
-        _ = tcflush(0, TCIFLUSH);
+        terminal.flushInput();
         // A query may still be unanswered: the reply can land LONG after
         // the last frame (a busy/background window answers late; the
         // foreground answers in <1 ms). While a query is in flight, READ
@@ -4910,17 +4885,12 @@ pub const TUI = struct {
         if (self.cpr_ever.load(.acquire)) {
             var waits: u32 = 0;
             while (self.cpr_in_flight.load(.acquire) and waits < 24) : (waits += 1) {
-                var fds: [1]std.posix.pollfd = .{.{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 }};
-                const ready = std.posix.poll(&fds, 28) catch break;
-                if (ready == 0) {
-                    _ = tcflush(0, TCIFLUSH);
+                var buf: [64]u8 = undefined;
+                const n = pollInput(&buf, 28);
+                if (n == 0) {
+                    terminal.flushInput();
                     continue;
                 }
-                if (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
-                if (fds[0].revents & std.posix.POLL.IN == 0) break;
-                var buf: [64]u8 = undefined;
-                const n = std.posix.read(0, &buf) catch break;
-                if (n == 0) break; // EOF: nothing more will ever arrive
                 // A CPR ends the wait; anything else (paste tails, other
                 // replies) is discarded and the wait continues.
                 if (keys.parseCpr(buf[0..n]) != null) break;
@@ -4951,11 +4921,11 @@ pub const TUI = struct {
         // Post-screen-teardown replies (the ?1049l/\x1b[<u window can ack
         // late in backgrounded terminals): still raw — flush + short
         // grace-drain with echo off, then the final flush.
-        _ = tcflush(0, TCIFLUSH);
+        terminal.flushInput();
         drainInputGrace();
-        _ = tcflush(0, TCIFLUSH);
+        terminal.flushInput();
         // Cooked mode LAST: from here the tty belongs to the shell.
-        std.posix.tcsetattr(0, .NOW, self.old_termios) catch {};
+        terminal.leaveRawMode();
         self.term_restored = true;
     }
 
@@ -4967,18 +4937,36 @@ pub const TUI = struct {
     /// imperceptible.
     fn drainInputGrace() void {
         var buf: [256]u8 = undefined;
-        var fds: [1]std.posix.pollfd = .{.{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 }};
         // The first wait covers a reply still in flight (terminals answer
         // a DSR in well under 20 ms; allow slack for a loaded machine).
-        var ready = std.posix.poll(&fds, 50) catch return;
-        while (ready != 0) {
-            if (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) return;
-            if (fds[0].revents & std.posix.POLL.IN == 0) break;
-            const n = std.posix.read(0, &buf) catch return;
-            if (n == 0) return; // EOF: nothing more will ever arrive
-            // Bursts keep draining; the quiet window ends the drain.
-            ready = std.posix.poll(&fds, 20) catch return;
+        if (pollInput(&buf, 50) == 0) return;
+        // Bursts keep draining; the quiet window ends the drain.
+        while (pollInput(&buf, 20) != 0) {}
+    }
+
+    /// Watcher read: on POSIX the fd-0 termios is VMIN=0/VTIME=1 (100 ms)
+    /// for the duration of watchMain, so a plain read times out; on Windows
+    /// the console has no termios — poll the input queue ourselves.
+    fn watchRead(buf: []u8) usize {
+        if (builtin.os.tag == .windows) {
+            return keys_windows.timedRead(buf, 100);
         }
+        return std.posix.read(0, buf) catch 0;
+    }
+
+    /// Read up to buf.len bytes of input, waiting at most `ms`. Cross-platform:
+    /// poll+read on POSIX, ReadConsoleA on Windows. 0 = nothing within the
+    /// window (or EOF/error).
+    fn pollInput(buf: []u8, ms: i32) usize {
+        if (builtin.os.tag == .windows) {
+            return keys_windows.readInputBytes(buf, @intCast(ms));
+        }
+        var fds: [1]std.posix.pollfd = .{.{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, ms) catch return 0;
+        if (ready == 0) return 0;
+        if (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) return 0;
+        if (fds[0].revents & std.posix.POLL.IN == 0) return 0;
+        return std.posix.read(0, buf) catch 0;
     }
 
     /// Query the real terminal size via TIOCGWINSZ. On failure (the fd is
@@ -4990,12 +4978,9 @@ pub const TUI = struct {
     /// to the previous frame's length — a stale footer row survived at the
     /// bottom of the screen).
     fn measureSize(self: *TUI) void {
-        var ws: std.posix.winsize = undefined;
-        var rc = std.c.ioctl(1, @as(i32, TIOCGWINSZ), &ws);
-        if (rc != 0) rc = std.c.ioctl(0, @as(i32, TIOCGWINSZ), &ws);
-        if (rc != 0) return;
-        if (ws.col >= 2) self.width = ws.col;
-        if (ws.row >= 3) self.height = ws.row;
+        const size = terminal.measureSize() orelse return;
+        self.width = size.cols;
+        self.height = size.rows;
     }
 
     fn writeRaw(self: *TUI, data: []const u8) void {
@@ -5021,7 +5006,7 @@ pub const TUI = struct {
     }
 
     fn envGet(self: *const TUI, name: []const u8) ?[]const u8 {
-        return std.process.Environ.getPosix(self.environ, name);
+        return platform.envGet(self.environ, name);
     }
 
     fn envTerm(self: *const TUI) ?[]const u8 {
@@ -8622,8 +8607,10 @@ pub const TUI = struct {
         const w = &out;
         defer out.deinit(self.alloc);
         var apple = false;
-        if (std.c.getenv("TERM_PROGRAM")) |tp| {
-            apple = std.mem.eql(u8, std.mem.sliceTo(tp, 0), "Apple_Terminal");
+        // TERM_PROGRAM is a macOS/Apple-terminal marker; on Windows the env
+        // value is irrelevant (the welcome header is the same either way).
+        if (platform.envGet(self.environ, "TERM_PROGRAM")) |tp| {
+            apple = std.mem.eql(u8, tp, "Apple_Terminal");
         }
         // Logo lines (top carries the version, bottom the first hint line —
         // pi withLogo(): hints start on the logo's second row).
@@ -10936,7 +10923,7 @@ pub const TUI = struct {
             // compact_done (the worker sets it from its own thread).
             self.key_reader.paste_alloc = self.alloc;
             self.key_reader.poll = self.sv.hide_at_ms != null or self.flash_msg != null or self.wheel_frame_pending or self.drag_frame_pending or self.compacting;
-            const key = self.key_reader.nextKey(0, self.io) catch break;
+            const key = self.key_reader.nextKey() catch break;
             // Compaction finished on its worker thread: render the result and
             // flush the queue (main thread only, like a normal turn end).
             // Checked before the .unknown tick: with no key input the loop

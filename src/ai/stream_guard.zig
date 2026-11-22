@@ -18,6 +18,22 @@
 //! session pointer is passed as opaque context and cast back here.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Comptime-dispatched so the POSIX body (std.c.shutdown) is never analyzed on
+/// Windows. Kept local (no ../platform.zig import) so `zig test` on this
+/// module — whose root is src/ai/ — does not pull in a file outside the module
+/// path.
+const ShutdownImpl = if (builtin.os.tag == .windows) struct {
+    pub fn close(h: std.Io.net.Socket.Handle) void {
+        // Phase 2: Winsock shutdown; the abort flag still unblocks the read.
+        _ = h;
+    }
+} else struct {
+    pub fn close(h: std.Io.net.Socket.Handle) void {
+        _ = std.c.shutdown(h, @intCast(std.posix.SHUT.RDWR));
+    }
+};
 
 /// SSE idle timeout in ms (pi httpIdleTimeoutMs, default 300_000): no bytes for
 /// this long → the stream fails and the provider retry loop retries. 0 disables.
@@ -44,7 +60,10 @@ pub fn Guard(Sess: type) type {
     return struct {
         const Self = @This();
         ctx: Sess = undefined,
-        fd: std.posix.fd_t = 0,
+        /// The open socket to shut down on abort/stall. null = no connection
+        /// yet (the guard starts before the socket opens; the fd is patched in
+        /// once the connection is established). Cross-platform handle type.
+        fd: ?std.Io.net.Socket.Handle = null,
         io: std.Io = undefined,
         idle_ms: i64 = 0,
         data_ms: i64 = 0,
@@ -58,8 +77,8 @@ pub fn Guard(Sess: type) type {
         thread: ?std.Thread = null,
 
         /// Start the watchdog. `session` is the concrete session pointer; `fd`
-        /// must stay open until `stop` is called.
-        pub fn start(self: *Self, session: Sess, fd: std.posix.fd_t, io: std.Io, idle_ms: i64, data_ms: i64) void {
+        /// must stay open until `stop` is called (null = no socket yet).
+        pub fn start(self: *Self, session: Sess, fd: ?std.Io.net.Socket.Handle, io: std.Io, idle_ms: i64, data_ms: i64) void {
             self.* = .{ .ctx = session, .fd = fd, .io = io, .idle_ms = idle_ms, .data_ms = data_ms };
             self.done.store(false, .release);
             self.thread = std.Thread.spawn(.{}, guardMain, .{self, session}) catch return;
@@ -123,12 +142,19 @@ pub fn Guard(Sess: type) type {
             return @intCast(std.math.divTrunc(i96, ns, 1_000_000) catch 0);
         }
 
-        fn shutdownFd(fd: std.posix.fd_t) void {
-            // fd 0 = "no socket yet" (the guard starts before the connection
-            // opens, the fd is patched in later): shutdown(0) would hit
-            // stdin — never do that.
-            if (fd == 0) return;
-            _ = std.c.shutdown(fd, @intCast(std.posix.SHUT.RDWR));
+        fn shutdownFd(fd: ?std.Io.net.Socket.Handle) void {
+            // null = "no socket yet" (the guard starts before the connection
+            // opens, the fd is patched in later).
+            const h = fd orelse return;
+            shutdownHandle(h);
+        }
+
+        /// Close the socket's read/write path so a blocked read() unblocks.
+        /// POSIX: shutdown(SHUT_RDWR). Windows: the socket handle is a Winsock
+        /// SOCKET; shutdown is deferred to Phase 2 (the abort flag still
+        /// unblocks the read on the next loop iteration).
+        fn shutdownHandle(h: std.Io.net.Socket.Handle) void {
+            ShutdownImpl.close(h);
         }
     };
 }

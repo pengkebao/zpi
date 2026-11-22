@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const keys_windows = if (builtin.os.tag == .windows) @import("keys_windows.zig") else struct {};
 
 // termios cc[] indices (differ by platform).
 pub const CC_VMIN: usize = if (builtin.os.tag == .linux) 6 else 16;
@@ -28,40 +29,69 @@ pub const MouseClick = struct {
 };
 
 
-// ---- SIGWINCH (terminal resize) ----
+// ---- Terminal resize notification (SIGWINCH on POSIX, WINDOW_BUFFER_SIZE
+// events on Windows) ----
 
-/// Set by the signal handler (one atomic store: async-signal-safe),
-/// consumed by KeyReader.fill after every poll. Module-level because signal
-/// handlers carry no context.
+/// Set by the resize source (one atomic store), consumed by KeyReader.fill
+/// after every poll. Module-level because signal handlers carry no context.
 var sigwinch_flag = std.atomic.Value(bool).init(false);
 
-/// The disposition SIGWINCH had before installWinchHandler, for restore.
-var old_winch_action: ?std.posix.Sigaction = null;
+const WinchWindows = struct {
+    /// No SIGWINCH on Windows: the console delivers WINDOW_BUFFER_SIZE
+    /// events, which keys_windows converts to a sigwinch flag.
+    pub fn installWinchHandler() void {}
+    pub fn restoreWinchHandler() void {
+        sigwinch_flag.store(false, .release);
+    }
+    /// Windows resize flag accessor (keys_windows writes it directly).
+    pub fn winchFlag() *std.atomic.Value(bool) {
+        return &sigwinch_flag;
+    }
+};
 
-fn onWinchSignal(_: std.posix.SIG) callconv(.c) void {
-    sigwinch_flag.store(true, .release);
-}
+const WinchPosix = struct {
+    /// The disposition SIGWINCH had before installWinchHandler, for restore.
+    var old_winch_action: ?std.posix.Sigaction = null;
 
-/// Deliver SIGWINCH to `onWinchSignal` (pi: process.stdout.on("resize")).
-/// Idempotent: setupTerminal runs again after the external editor.
+    fn onWinchSignal(_: std.posix.SIG) callconv(.c) void {
+        sigwinch_flag.store(true, .release);
+    }
+
+    /// Deliver SIGWINCH to `onWinchSignal` (pi: process.stdout.on("resize")).
+    /// Idempotent: setupTerminal runs again after the external editor.
+    pub fn installWinchHandler() void {
+        if (old_winch_action != null) return;
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onWinchSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.WINCH, &act, &old);
+        old_winch_action = old;
+    }
+
+    /// Put SIGWINCH back the way the process found it.
+    pub fn restoreWinchHandler() void {
+        const old = old_winch_action orelse return;
+        std.posix.sigaction(std.posix.SIG.WINCH, &old, null);
+        old_winch_action = null;
+        sigwinch_flag.store(false, .release);
+    }
+};
+
+const winch = if (builtin.os.tag == .windows) WinchWindows else WinchPosix;
+
 pub fn installWinchHandler() void {
-    if (old_winch_action != null) return;
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .handler = onWinchSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    var old: std.posix.Sigaction = undefined;
-    std.posix.sigaction(std.posix.SIG.WINCH, &act, &old);
-    old_winch_action = old;
+    winch.installWinchHandler();
+}
+pub fn restoreWinchHandler() void {
+    winch.restoreWinchHandler();
 }
 
-/// Put SIGWINCH back the way the process found it.
-pub fn restoreWinchHandler() void {
-    const old = old_winch_action orelse return;
-    std.posix.sigaction(std.posix.SIG.WINCH, &old, null);
-    old_winch_action = null;
-    sigwinch_flag.store(false, .release);
+/// Windows resize flag accessor (keys_windows writes it directly).
+pub fn winchFlag() *std.atomic.Value(bool) {
+    return &sigwinch_flag;
 }
 
 /// A parsed key event.
@@ -728,10 +758,11 @@ pub const KeyReader = struct {
     const FILL_POLL_MS: i32 = 33;
     const FillResult = enum { data, timeout, eof, signal };
 
-    /// Read the next key from `fd` (terminal in raw mode). Blocks until a key
-    /// is available. Drops release events and negotiation replies.
-    pub fn nextKey(self: *KeyReader, fd: std.posix.fd_t, io: std.Io) !Key {
-        _ = io;
+    /// Read the next key from the terminal (raw mode). Blocks until a key is
+    /// available. Drops release events and negotiation replies. (Cross-platform:
+    /// the read seam lives in `fill`, which dispatches to POSIX poll/read or the
+    /// Windows console API.)
+    pub fn nextKey(self: *KeyReader) !Key {
         while (true) {
             if (self.pending_len > 0) {
                 if (seqLenAt(self.pending[0..self.pending_len])) |len| {
@@ -745,7 +776,7 @@ pub const KeyReader = struct {
                     continue;
                 }
                 // Incomplete sequence at head: read more with a short timeout.
-                switch (self.fill(fd, true)) {
+                switch (self.fill(true)) {
                     .data => continue,
                     .timeout => {
                         if (self.pending_len == 1 and self.pending[0] == 27) {
@@ -765,7 +796,7 @@ pub const KeyReader = struct {
                     .signal => return .resize,
                 }
             }
-            switch (self.fill(fd, if (self.paste_buf != null) true else self.poll)) {
+            switch (self.fill(if (self.paste_buf != null) true else self.poll)) {
                 .data => {},
                 .eof => return error.EndOfStream,
                 .timeout => {
@@ -863,10 +894,22 @@ pub const KeyReader = struct {
     /// timed read is in flight. A set SIGWINCH flag wins over input so the
     /// next frame uses the new size (pi: the resize handler requestRender()s,
     /// and the render reads the live size).
-    fn fill(self: *KeyReader, fd: std.posix.fd_t, timed: bool) FillResult {
+    fn fill(self: *KeyReader, timed: bool) FillResult {
         _ = timed;
         if (sigwinch_flag.swap(false, .acq_rel)) return .signal;
-        var fds: [1]std.posix.pollfd = .{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (builtin.os.tag == .windows) {
+            // Console input: ReadConsoleA records → terminal-style bytes
+            // (keys_windows). No poll on Windows; Sleep bounds the wait.
+            var buf: [128]u8 = undefined;
+            const got = keys_windows.readInputBytes(&buf, FILL_POLL_MS);
+            if (sigwinch_flag.swap(false, .acq_rel)) return .signal;
+            if (got == 0) return .timeout;
+            if (self.pending_len + got > self.pending.len) return .timeout; // overflow guard
+            @memcpy(self.pending[self.pending_len..][0..got], buf[0..got]);
+            self.pending_len += got;
+            return .data;
+        }
+        var fds: [1]std.posix.pollfd = .{.{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 }};
         const ready = std.posix.poll(&fds, FILL_POLL_MS) catch return .eof;
         if (ready == 0) {
             // The handler may have fired while poll was sleeping.
@@ -876,7 +919,7 @@ pub const KeyReader = struct {
         if (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
             // Read once so a real EOF is distinguished from a transient error.
             var buf: [128]u8 = undefined;
-            const got = std.posix.read(fd, &buf) catch return .eof;
+            const got = std.posix.read(0, &buf) catch return .eof;
             if (got == 0) return .eof;
             if (self.pending_len + got > self.pending.len) return .timeout;
             @memcpy(self.pending[self.pending_len..][0..got], buf[0..got]);
@@ -885,7 +928,7 @@ pub const KeyReader = struct {
         }
         if (fds[0].revents & std.posix.POLL.IN == 0) return .timeout;
         var buf: [128]u8 = undefined;
-        const got = std.posix.read(fd, &buf) catch return .eof;
+        const got = std.posix.read(0, &buf) catch return .eof;
         if (got == 0) return .eof;
         if (self.pending_len + got > self.pending.len) return .timeout; // overflow guard
         @memcpy(self.pending[self.pending_len..][0..got], buf[0..got]);
@@ -1161,7 +1204,7 @@ test "cpr: cursor position report parses and does not swallow keys" {
     kr.paste_alloc = std.heap.page_allocator;
     @memcpy(kr.pending[0..8], "\x1b[24;80R");
     kr.pending_len = 8;
-    const k = try kr.nextKey(0, undefined);
+    const k = try kr.nextKey();
     // The reply was consumed wholesale (pending drained).
     try std.testing.expectEqual(@as(usize, 0), kr.pending_len);
     _ = k; // consumed_reply path returns .unknown

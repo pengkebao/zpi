@@ -15,6 +15,7 @@
 //! their credentials from auth.json / environment variables.
 
 const std = @import("std");
+const platform = @import("../platform.zig");
 const compact = @import("compaction.zig");
 const command_tools = @import("../tools/command_tools.zig");
 
@@ -900,7 +901,7 @@ fn resolveValue(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, environ: 
         return alloc.dupe(u8, trimmed);
     }
     if (raw[0] == '$') {
-        if (std.process.Environ.getPosix(environ, raw[1..])) |v| {
+        if (platform.envGet(environ, raw[1..])) |v| {
             return alloc.dupe(u8, std.mem.sliceTo(v, 0));
         }
         return "";
@@ -914,11 +915,11 @@ fn resolveValue(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, environ: 
 /// Compute the base dir without loading models (for CLI subcommands like
 /// `mcp list` that don't need a model configured).
 pub fn baseDir(alloc: std.mem.Allocator, environ: std.process.Environ) ![]u8 {
-    const env_dir = std.process.Environ.getPosix(environ, "PI_CODING_AGENT_DIR") orelse
-        std.process.Environ.getPosix(environ, "RPI_CODING_AGENT_DIR");
+    const env_dir = platform.envGet(environ, "PI_CODING_AGENT_DIR") orelse
+        platform.envGet(environ, "RPI_CODING_AGENT_DIR");
     if (env_dir) |dir| return alloc.dupe(u8, std.mem.sliceTo(dir, 0));
-    const home = std.process.Environ.getPosix(environ, "HOME") orelse
-        std.process.Environ.getPosix(environ, "USERPROFILE") orelse return error.NoHome;
+    const home = platform.envGet(environ, "HOME") orelse
+        platform.envGet(environ, "USERPROFILE") orelse return error.NoHome;
     return std.fs.path.join(alloc, &.{ std.mem.sliceTo(home, 0), ".pi", "agent" });
 }
 
@@ -930,14 +931,14 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
     errdefer cfg.deinit(alloc);
 
     // 1. Determine base dir
-    const env_dir = std.process.Environ.getPosix(environ, "PI_CODING_AGENT_DIR") orelse
-        std.process.Environ.getPosix(environ, "RPI_CODING_AGENT_DIR");
+    const env_dir = platform.envGet(environ, "PI_CODING_AGENT_DIR") orelse
+        platform.envGet(environ, "RPI_CODING_AGENT_DIR");
     if (env_dir) |dir| {
         cfg.base_dir = try alloc.dupe(u8, std.mem.sliceTo(dir, 0));
     } else {
         // Windows has no HOME; USERPROFILE is the equivalent.
-        const home = std.process.Environ.getPosix(environ, "HOME") orelse
-            std.process.Environ.getPosix(environ, "USERPROFILE") orelse return error.NoHome;
+        const home = platform.envGet(environ, "HOME") orelse
+            platform.envGet(environ, "USERPROFILE") orelse return error.NoHome;
         cfg.base_dir = try std.fs.path.join(alloc, &.{ std.mem.sliceTo(home, 0), ".pi", "agent" });
     }
 
@@ -1049,7 +1050,7 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
             }
             if (key.len == 0) {
                 if (cat_for_env.envVar(pid)) |env_name| {
-                    if (std.process.Environ.getPosix(environ, env_name)) |v| {
+                    if (platform.envGet(environ, env_name)) |v| {
                         key = try alloc.dupe(u8, std.mem.sliceTo(v, 0));
                     }
                 }
@@ -1168,7 +1169,7 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                 }
                 if (key.len == 0) {
                     if (Catalog.str(po, "env")) |env_name| {
-                        if (std.process.Environ.getPosix(environ, env_name)) |v| {
+                        if (platform.envGet(environ, env_name)) |v| {
                             key = try alloc.dupe(u8, std.mem.sliceTo(v, 0));
                         }
                     }
@@ -1222,7 +1223,7 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, environ: std.process.Environ) 
                     if (c.baseUrl(cfg.default_provider.?)) |bb| {
                         base = bb;
                         if (c.envVar(cfg.default_provider.?)) |env_name| {
-                            if (std.process.Environ.getPosix(environ, env_name)) |v| {
+                            if (platform.envGet(environ, env_name)) |v| {
                                 key = std.mem.sliceTo(v, 0);
                             }
                         }

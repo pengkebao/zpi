@@ -8,18 +8,16 @@
 //! single-process so the lockfile step is omitted.
 
 const std = @import("std");
+const platform = @import("../platform.zig");
 
 pub const TrustRequiringResources = [_][]const u8{
     "settings.json", "mcp.json",    "extensions", "skills",
     "prompts",       "themes",      "SYSTEM.md",  "APPEND_SYSTEM.md",
 };
 
-/// Process cwd (Zig 0.17: no std.fs.cwd(); std.c.getcwd works everywhere).
+/// Process cwd (Zig 0.17: no std.fs.cwd(); platform.getCwdAlloc is cross-platform).
 fn processCwd(alloc: std.mem.Allocator) ![]u8 {
-    var buf: [4096]u8 = undefined;
-    const p = std.c.getcwd(&buf, buf.len) orelse return error.CwdTooLong;
-    const end = std.mem.indexOfScalar(u8, p[0..buf.len], 0) orelse buf.len;
-    return alloc.dupe(u8, p[0..end]);
+    return platform.getCwdAlloc(alloc);
 }
 
 /// Canonical absolute path (pi normalizeCwd). pi uses realpath; zpi uses a

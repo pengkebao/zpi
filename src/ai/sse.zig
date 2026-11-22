@@ -125,7 +125,7 @@ pub fn postSse(
     // connect → send → receiveHead → SSE body; stop() runs at scope end.
     const Guard = stream_guard.Guard(@TypeOf(session));
     var guard: Guard = .{};
-    guard.start(session, 0, client.io, stream_guard.idle_timeout_ms, stream_guard.data_timeout_ms);
+    guard.start(session, null, client.io, stream_guard.idle_timeout_ms, stream_guard.data_timeout_ms);
     defer guard.stop();
 
     var request = client.request(.POST, uri, .{

@@ -11,6 +11,7 @@
 //! back up (pi's fullRender image branch). The diff engine must treat that
 //! line specially — see tui.zig diffRender.
 const std = @import("std");
+const platform = @import("../platform.zig");
 const mem = std.mem;
 const base64 = std.base64;
 
@@ -27,7 +28,7 @@ pub const Caps = struct { images: Protocol, hyperlinks: bool = false };
 /// Only ever runs inside tmux (TMUX set), where the command answers in
 /// milliseconds, so a plain read-to-EOF is safe.
 pub fn probeTmuxHyperlinks(environ: std.process.Environ, io: std.Io) bool {
-    if (std.process.Environ.getPosix(environ, "TMUX") == null) return false;
+    if (!platform.envContains(environ, "TMUX")) return false;
     var argv = [_][]const u8{ "tmux", "display-message", "-p", "#{client_termfeatures}" };
     var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .ignore, .stdout = .pipe, .stderr = .ignore }) catch return false;
     const stdout = child.stdout orelse {
@@ -66,23 +67,27 @@ fn lowerInto(buf: *[64]u8, s: []const u8) []const u8 {
 /// (pi detectCapabilitiesFromEnvironment). tmux requires a live probe of
 /// `client_termfeatures`; screen does not forward OSC 8.
 pub fn detect(environ: std.process.Environ, io: std.Io) Caps {
+    // Cross-platform env reads (std's getPosix is POSIX-only in 0.17).
+    const term_alloc = platform.envGetAlloc(std.heap.page_allocator, environ, "TERM");
+    defer if (term_alloc) |t| platform.freeEnv(std.heap.page_allocator, t);
     var term_buf: [64]u8 = undefined;
-    const term = std.process.Environ.getPosix(environ, "TERM") orelse "";
+    const term = term_alloc orelse "";
     const term_lc = lowerInto(&term_buf, term);
-    const in_tmux = std.process.Environ.getPosix(environ, "TMUX") != null or mem.startsWith(u8, term_lc, "tmux");
+    const in_tmux = platform.envContains(environ, "TMUX") or mem.startsWith(u8, term_lc, "tmux");
     if (in_tmux) {
         return .{ .images = .none, .hyperlinks = probeTmuxHyperlinks(environ, io) };
     }
     if (mem.startsWith(u8, term_lc, "screen")) return .{ .images = .none, .hyperlinks = false };
-    const kitty = std.process.Environ.getPosix(environ, "KITTY_WINDOW_ID") != null;
+    const kitty = platform.envContains(environ, "KITTY_WINDOW_ID");
     var tp_buf: [64]u8 = undefined;
-    const tp_raw = std.process.Environ.getPosix(environ, "TERM_PROGRAM");
-    const tp: []const u8 = if (tp_raw) |t| lowerInto(&tp_buf, t) else "";
-    const wezterm = std.process.Environ.getPosix(environ, "WEZTERM_PANE") != null;
-    const warp = std.process.Environ.getPosix(environ, "WARP_SESSION_ID") != null or
-        std.process.Environ.getPosix(environ, "WARP_TERMINAL_SESSION_UUID") != null;
-    const iterm = std.process.Environ.getPosix(environ, "ITERM_SESSION_ID") != null;
-    const wt = std.process.Environ.getPosix(environ, "WT_SESSION") != null;
+    const tp_alloc = platform.envGetAlloc(std.heap.page_allocator, environ, "TERM_PROGRAM");
+    defer if (tp_alloc) |t| platform.freeEnv(std.heap.page_allocator, t);
+    const tp: []const u8 = if (tp_alloc) |t| lowerInto(&tp_buf, t) else "";
+    const wezterm = platform.envContains(environ, "WEZTERM_PANE");
+    const warp = platform.envContains(environ, "WARP_SESSION_ID") or
+        platform.envContains(environ, "WARP_TERMINAL_SESSION_UUID");
+    const iterm = platform.envContains(environ, "ITERM_SESSION_ID");
+    const wt = platform.envContains(environ, "WT_SESSION");
     // Ghostty + WezTerm + Kitty implement the Kitty graphics protocol;
     // iTerm2 its own. All of these forward OSC 8 hyperlinks.
     const images: Protocol = if (kitty or mem.indexOf(u8, tp, "ghostty") != null or

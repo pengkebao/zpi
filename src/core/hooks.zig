@@ -279,10 +279,8 @@ fn runScript(
 }
 
 fn ssNowMs(io: std.Io) u64 {
-    var ts: std.posix.timespec = undefined;
-    _ = io;
-    std.posix.clock_gettime(.REALTIME, &ts) catch return 0;
-    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+    const ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+    return @intCast(std.math.divTrunc(i96, ns, 1_000_000) catch 0);
 }
 
 /// Run every matching entry for a section. Returns the Outcome; blocking
