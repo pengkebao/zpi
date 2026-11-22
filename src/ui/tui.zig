@@ -2925,6 +2925,7 @@ pub const TUI = struct {
             }
         }
         self.replaySession();
+        self.setTerminalTitle();
     }
 
     /// Same-store view rebuild after a branch cut.
@@ -5000,6 +5001,23 @@ pub const TUI = struct {
     fn writeRaw(self: *TUI, data: []const u8) void {
         const stdout = std.Io.File.stdout();
         stdout.writeStreamingAll(self.io, data) catch {};
+    }
+
+    /// Terminal window/tab title (pi interactive-mode.js: "π - <cwd>" /
+    /// "π - <session> - <cwd>" via OSC 0). zpi: "zpi - <dir>" so a tab
+    /// is identifiable by project; "/name" adds the session name.
+    fn setTerminalTitle(self: *TUI) void {
+        const base = std.fs.path.basename(self.cwd_abs);
+        const name: ?[]const u8 = if (self.session.store) |st| st.sessionName() else null;
+        const title: []const u8 = if (name) |n| blk: {
+            break :blk std.fmt.allocPrint(self.alloc, "zpi - {s} - {s}", .{ n, base }) catch return;
+        } else blk: {
+            break :blk std.fmt.allocPrint(self.alloc, "zpi - {s}", .{base}) catch return;
+        };
+        defer self.alloc.free(title);
+        self.writeRaw("\x1b]0;");
+        self.writeRaw(title);
+        self.writeRaw("\x07");
     }
 
     fn envGet(self: *const TUI, name: []const u8) ?[]const u8 {
@@ -10557,6 +10575,7 @@ pub const TUI = struct {
                 self.addMessage("usage: /name <name>");
             } else {
                 st.setName(arg);
+                self.setTerminalTitle();
                 self.note("\x1b[90msession named: {s}\x1b[0m", .{arg});
             }
             self.redraw();
@@ -10878,6 +10897,7 @@ pub const TUI = struct {
     pub fn run(self: *TUI) !void {
         self.setupTerminal();
         defer self.restoreTerminal();
+        self.setTerminalTitle();
         self.refreshGitBranch();
 
         // The startup header lives at the top of the document (added by

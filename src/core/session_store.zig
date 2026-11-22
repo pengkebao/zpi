@@ -1679,6 +1679,11 @@ pub const Store = struct {
         return n;
     }
 
+    /// The user-assigned display name (set via /name), or null when unset.
+    pub fn sessionName(self: *const Store) ?[]const u8 {
+        return self.name;
+    }
+
     /// Set (or rename) the session name; persists a session_info entry.
     pub fn setName(self: *Store, name: []const u8) void {
         self.recordSessionInfo(name);
