@@ -194,7 +194,7 @@ zig run bench_markdown.zig  # markdown 渲染基准
 - [ ] 会话分享 / 导出
 - [x] 主题体系（多主题选择器，`/themes` + `~/.pi/agent/themes/`）
 - [ ] Windows 终端支持
-- [ ] skills 校验诊断（`[Skill warnings]` 启动节）
+- [x] skills 校验诊断（`[Skill warnings]` 启动节）
 
 ## License
 
