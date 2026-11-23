@@ -299,6 +299,31 @@ fn handleSignal(sig: std.c.SIG) callconv(.c) void {
     agent.requestAbort();
 }
 
+/// Startup phase timer: with ZPI_DEBUG=1, print how long each phase took
+/// (to stderr, so it never pollutes TUI output). Used to diagnose slow
+/// starts (Windows: MCP connect, DNS, AV scans, trust scan).
+const StartupTimer = struct {
+    enabled: bool = false,
+    io: std.Io,
+
+    fn init(io: std.Io, environ: std.process.Environ) StartupTimer {
+        return .{ .enabled = platform.envContains(environ, "ZPI_DEBUG"), .io = io };
+    }
+
+    fn nowMs(self: *StartupTimer) i64 {
+        const ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        return @intCast(std.math.divTrunc(i96, ns, 1_000_000) catch 0);
+    }
+
+    fn mark(self: *StartupTimer, start: *i64, label: []const u8) void {
+        if (!self.enabled) return;
+        const now = self.nowMs();
+        const dt = now - start.*;
+        start.* = now;
+        std.debug.print("[startup] {s}: {d} ms\n", .{ label, dt });
+    }
+};
+
 fn installSignalHandlers() void {
     if (builtin.os.tag == .windows) return; // Phase K: Win32 console handler
     const act: std.posix.Sigaction = .{
@@ -440,6 +465,11 @@ pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
 
     installSignalHandlers();
+
+    // ZPI_DEBUG=1 → phase-by-phase startup timing on stderr (diagnoses slow
+    // starts: config, MCP connect, TUI init, first frame).
+    var startup = StartupTimer.init(io, init.minimal.environ);
+    var st_t0: i64 = startup.nowMs();
 
 
     var argv = std.array_list.Managed([]const u8).init(alloc);
@@ -694,6 +724,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Load config
     var cfg = try config.load(io, alloc, init.minimal.environ);
+    startup.mark(&st_t0, "argparse+config");
 
     // ---- Project trust (H4, pi project-trust.js) ----
     // Non-interactive resolution happens here (CLI override -> saved
@@ -1038,6 +1069,7 @@ pub fn main(init: std.process.Init) !void {
         mcp.Manager.setGlobal(mgr);
         mgr.rememberConfigs(cfgs);
         mgr.connectAll(cfgs);
+        startup.mark(&st_t0, "mcp connect (sync)");
         _ = mgr.registerTools(&registry);
         _ = mcp.registerResourceTools(mgr, &registry);
         mcp_mgr = mgr;
@@ -1549,6 +1581,7 @@ pub fn main(init: std.process.Init) !void {
         // Gate project discovery BEFORE the first dynamic-slash refresh.
         t.project_trusted = project_trusted;
         t.initLate();
+        startup.mark(&st_t0, "session+TUI init");
         // Load the persisted theme (settings "theme"); default dark when unset.
         t.applyThemeFromSettings();
         defer t.deinit();
@@ -1563,12 +1596,14 @@ pub fn main(init: std.process.Init) !void {
         // Persisted history → visible transcript (pi: renderInitialMessages
         // runs whenever the session has messages — continue/resume/--session).
         t.replaySession();
+        startup.mark(&st_t0, "replay session");
         // pi --resume (cli/session-picker.js): interactive mode presents the
         // session picker after the trust gate; the store swaps in on Enter
         // (Esc exits 0). main deliberately left session.store unset above.
         if (resume_mode and !print_mode) {
             t.beginStartupResume();
         }
+        startup.mark(&st_t0, "first frame + enter loop");
         t.run() catch |e| {
             std.debug.print("[TUI error: {s}]\n", .{@errorName(e)});
         };

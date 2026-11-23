@@ -1,11 +1,11 @@
 //! Terminal platform layer: raw mode, window size, input flushing.
 //!
 //! POSIX: termios (tcgetattr/tcsetattr), TIOCGWINSZ, tcflush.
-//! Windows: console mode (SetConsoleMode), GetConsoleScreenBufferInformation,
+//! Windows: console mode (SetConsoleMode), GetConsoleScreenBufferInfo,
 //! FlushConsoleInputBuffer. The TUI's ANSI output path is unchanged on both
-//! — Windows Terminal / conhost with VT mode enabled interpret the same
-//! escape sequences (VT enablement is done by the caller via
-//! `enableVirtualTerminal`).
+//! — conhost with VT mode enabled (via `enableVirtualTerminal`, which sets
+//! ENABLE_VIRTUAL_TERMINAL_PROCESSING on the output handle) and Windows
+//! Terminal interpret the same escape sequences.
 //!
 //! NOTE: Zig 0.14+ has no top-level `if (comptime) { }` blocks — platform
 //! selection is `pub const X = if (is_windows) Win else Posix;`.
@@ -51,10 +51,16 @@ const Windows = struct {
     extern "kernel32" fn SetConsoleMode(hConsoleHandle: windows.HANDLE, dwMode: u32) callconv(.winapi) c_int;
     extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: windows.HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) c_int;
     extern "kernel32" fn FlushConsoleInputBuffer(hConsoleInput: windows.HANDLE) callconv(.winapi) c_int;
-    extern "kernel32" fn SetConsoleDisplayMode(hConsole: windows.HANDLE, dwMode: u32, size: *COORD) callconv(.winapi) c_int;
 
     const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6;
     const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF4;
+    // Input mode flags (wincon.h): mouse/wheel events are only delivered
+    // when ENABLE_MOUSE_INPUT is set — raw mode is NOT zero, it is
+    // "mouse on, everything else off" (keys arrive unbuffered without
+    // ENABLE_LINE_INPUT either way).
+    const ENABLE_MOUSE_INPUT: u32 = 0x0010;
+    // Output mode flag: VT (ANSI escape) processing on the output handle.
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
 
     /// The console input mode before raw mode, for restore.
     var saved_mode: ?u32 = null;
@@ -64,10 +70,12 @@ const Windows = struct {
         var mode: u32 = 0;
         if (GetConsoleMode(h, &mode) == 0) return;
         saved_mode = mode;
-        // No line buffering / echo / window / mouse / quick-edit: every key
-        // arrives as a KEY_EVENT the app can read immediately (the raw-mode
-        // equivalent).
-        _ = SetConsoleMode(h, 0);
+        // No line buffering / echo / window / quick-edit: every key arrives
+        // as a KEY_EVENT the app can read immediately. Mouse input STAYS ON
+        // (ENABLE_MOUSE_INPUT): the app implements wheel scrolling and text
+        // selection from MOUSE_EVENTs, so clearing the mode to 0 would
+        // silently kill all wheel/pointer events.
+        _ = SetConsoleMode(h, ENABLE_MOUSE_INPUT);
     }
 
     pub fn leaveRawMode() void {
@@ -91,20 +99,20 @@ const Windows = struct {
         _ = FlushConsoleInputBuffer(h);
     }
 
-    /// Enable VT (ANSI escape) processing on stdout. conhost enables it by
-    /// default on Win10+; Windows Terminal always supports it. Idempotent.
+    /// Enable VT (ANSI escape) processing on stdout. Idempotent.
     ///
-    /// Uses SetConsoleDisplayMode(CONSOLE_DISPLAYMODE_EXTENDED = 1), which is
-    /// the cross-compile-safe equivalent of EnableVirtualTerminalProcessing
-    /// (the latter is missing from zig's mingw kernel32 import-lib stubs).
-    /// On Win10+ this turns on extended display mode (VT sequences); on older
-    /// systems it is a no-op that fails harmlessly.
+    /// Uses SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING) — the same
+    /// call EnableVirtualTerminalProcessing wraps (which is missing from
+    /// zig's mingw kernel32 import-lib stubs, so we set the flag directly).
+    /// conhost does NOT enable VT by default (garbage output until this is
+    /// called); Windows Terminal accepts VT regardless, so the call is a
+    /// harmless no-op there.
     pub fn enableVirtualTerminal() void {
         const h = GetStdHandle(STD_OUTPUT_HANDLE);
-        var info: CONSOLE_SCREEN_BUFFER_INFO = undefined;
-        if (GetConsoleScreenBufferInfo(h, &info) == 0) return;
-        var size = info.dwSize;
-        _ = SetConsoleDisplayMode(h, 1, &size);
+        var mode: u32 = 0;
+        if (GetConsoleMode(h, &mode) == 0) return;
+        if (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0) return;
+        _ = SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
 };
 

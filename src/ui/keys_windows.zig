@@ -62,7 +62,10 @@ const INPUT_RECORD = extern struct {
 
 extern "kernel32" fn GetStdHandle(nStdHandle: u32) callconv(.winapi) windows.HANDLE;
 extern "kernel32" fn GetNumberOfConsoleInputEvents(hInputHandle: windows.HANDLE, lpNumberOfEvents: *u32) callconv(.winapi) c_int;
-extern "kernel32" fn ReadConsoleA(hConsoleInput: windows.HANDLE, lpBuffer: ?*anyopaque, nNumberOfCharsToRead: u32, lpNumberOfCharsRead: *u32, lpReserved: ?*const anyopaque) callconv(.winapi) c_int;
+// ReadConsoleInputW reads structured INPUT_RECORDs (keyboard/mouse/resize).
+// NOTE: ReadConsoleA/W read a flat CHAR/WCHAR byte stream — using it with an
+// INPUT_RECORD buffer is a layout mismatch that corrupts every event.
+extern "kernel32" fn ReadConsoleInputW(hConsoleInput: windows.HANDLE, lpBuffer: *INPUT_RECORD, nNumberOfInputsToRead: u32, lpNumberOfInputsRead: *u32) callconv(.winapi) c_int;
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 
 const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6;
@@ -96,12 +99,16 @@ const RIGHT_ALT_PRESSED: u32 = 0x0002;
 const LEFT_CTRL_PRESSED: u32 = 0x0008;
 const RIGHT_CTRL_PRESSED: u32 = 0x0010;
 
-const MOUSE_MOVED: u32 = 0x0002;
+// Mouse event flags (wincon.h MOUSE_EVENT_RECORD.dwEventFlags): the console
+// API has NO press/release flag — button transitions are inferred by
+// diffing dwButtonState against the previous event's state.
+const MOUSE_MOVED: u32 = 0x0001;
 const MOUSE_WHEEL: u32 = 0x0004;
 const MOUSE_HWHEEL: u32 = 0x0100;
-const MOUSE_DOWN: u32 = 0x0001;
-const MOUSE_UP: u32 = 0x0002;
-const DOUBLE_CLICK: u32 = 0x0080;
+
+/// Left/middle/right held on the previous mouse event (button 0/1/2, 3 =
+/// none) — the console API reports no explicit press/release events.
+var last_btn: u8 = 3;
 
 fn eventToBytes(rec: *const INPUT_RECORD, out: []u8) usize {
     return switch (rec.EventType) {
@@ -178,29 +185,49 @@ fn eventToBytes(rec: *const INPUT_RECORD, out: []u8) usize {
         },
         MOUSE_EVENT_TYPE => {
             const me = rec.Event.MouseEvent;
-            var code: u8 = 1; // release
-            var btn: u8 = 3; // none
             const action: u32 = me.dwEventFlags;
-            if (action & MOUSE_MOVED != 0) {
-                btn = 3;
-            } else if (action & MOUSE_WHEEL != 0) {
-                code = 64; // wheel up (0x40 | 0)
-                btn = 0;
-                if (action & MOUSE_HWHEEL != 0) code = 65;
-            } else if (action & MOUSE_DOWN != 0) {
-                code = 0;
-                btn = switch (me.dwButtonState & 0x0007) {
+            var code: u8 = 0; // press/motion
+            var btn: u8 = 3; // none
+            if (action & (MOUSE_WHEEL | MOUSE_HWHEEL) != 0) {
+                // Wheel: SGR button code 64|direction (0=up, 1=down). The
+                // signed delta lives in the HIGH word of dwButtonState;
+                // negative = scroll down.
+                const delta = @as(i16, @intCast(me.dwButtonState >> 16));
+                code = 64;
+                btn = if (delta < 0) 1 else 0;
+            } else if (action & MOUSE_MOVED != 0) {
+                const now_btn: u8 = switch (me.dwButtonState & 0x0007) {
                     0x0001 => 0, // LEFT
                     0x0002 => 1, // MIDDLE
                     0x0004 => 2, // RIGHT
                     else => 3,
                 };
-            } else if (action & DOUBLE_CLICK != 0) {
-                code = 0;
-                btn = 3; // release-style double (rare; keep simple)
+                if (now_btn != last_btn) {
+                    // State changed: a button went down or up (the console
+                    // API has no explicit press/release events).
+                    if (now_btn != 3 and last_btn == 3) {
+                        code = 0; // press
+                        btn = now_btn;
+                    } else {
+                        code = 1; // release
+                        btn = if (now_btn != 3) now_btn else last_btn;
+                    }
+                } else {
+                    // No state change: plain motion. SGR motion bit 32 while
+                    // a button is held (drag); hover (no button) is 32|3.
+                    code = 32;
+                    btn = now_btn;
+                }
+                last_btn = now_btn;
+            } else {
+                return 0;
             }
             var b: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&b, "\x1b[<{};{};{}M", .{ code | btn, me.dwMousePosition.X, me.dwMousePosition.Y }) catch return 0;
+            // SGR terminators: 'M' = press/motion, 'm' = release.
+            const term = if (code == 1) "m" else "M";
+            // SGR cells are 1-based; the console API's dwMousePosition is
+            // 0-based (parseSgrMouse subtracts 1, so add it back here).
+            const s = std.fmt.bufPrint(&b, "\x1b[<{};{};{}{s}", .{ code | btn, me.dwMousePosition.X + 1, me.dwMousePosition.Y + 1, term }) catch return 0;
             if (s.len > out.len) return 0;
             @memcpy(out[0..s.len], s);
             return s.len;
@@ -227,7 +254,7 @@ pub fn readInputBytes(buf: []u8, poll_ms: u32) usize {
     var records: [64]INPUT_RECORD = undefined;
     const want = @min(count, @as(u32, 64));
     var got: u32 = 0;
-    if (ReadConsoleA(h, &records, want, &got, null) == 0) return 0;
+    if (ReadConsoleInputW(h, &records[0], want, &got) == 0) return 0;
     var out_len: usize = 0;
     for (records[0..got]) |*rec| {
         if (out_len >= buf.len) break;
@@ -256,7 +283,7 @@ pub fn drainInput(buf: []u8) usize {
     if (count == 0) return 0;
     var records: [64]INPUT_RECORD = undefined;
     var got: u32 = 0;
-    if (ReadConsoleA(h, &records, @min(count, 64), &got, null) == 0) return 0;
+    if (ReadConsoleInputW(h, &records[0], @min(count, 64), &got) == 0) return 0;
     var out_len: usize = 0;
     for (records[0..got]) |*rec| {
         if (out_len >= buf.len) break;
