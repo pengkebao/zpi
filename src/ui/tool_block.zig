@@ -63,6 +63,10 @@ pub const ToolView = struct {
     live_output: []const u8 = "",
     /// Wall time of the execution; null when unknown.
     duration_ms: ?u64 = null,
+    /// Millisecond timestamp when execution started (TUI clock, same base as
+    /// `now_ms`). While pending, the timer row is computed from it (pi
+    /// startToolTimer: state.startedAt = Date.now()).
+    started_ms: ?i64 = null,
 };
 
 pub const Options = struct {
@@ -78,6 +82,9 @@ pub const Options = struct {
     hyperlinks: bool = false,
     /// Display text of the expand keybinding, for the "to expand" hints.
     expand_key: []const u8 = "ctrl+o",
+    /// Current time on the TUI clock (same base as ToolView.started_ms),
+    /// for the live `Elapsed` timer row. Null disables the timer row.
+    now_ms: ?i64 = null,
 };
 
 /// Styled run of plain text. `style` is an SGR prefix; the renderer resets
@@ -230,10 +237,28 @@ fn renderBash(b: *Builder, view: ToolView, args: Args) !void {
             }
         }
     }
-    if (view.duration_ms) |ms| {
+    // Timer row (pi toolTimerText): `Elapsed X.Xs` while partial, redrawn
+    // every second, `Took X.Xs` once final. The final recorded duration
+    // wins; otherwise the renderer's own clock (now_ms - started_ms).
+    const timer_text: ?[]const u8 = blk: {
         var buf: [32]u8 = undefined;
+        if (view.pending) {
+            const s = view.started_ms orelse break :blk null;
+            const now = b.opts.now_ms orelse break :blk null;
+            if (now < s) break :blk null;
+            break :blk try std.fmt.allocPrint(b.arena, "Elapsed {s}", .{formatDuration(&buf, @intCast(now - s))});
+        } else if (view.duration_ms) |ms| {
+            break :blk try std.fmt.allocPrint(b.arena, "Took {s}", .{formatDuration(&buf, ms)});
+        } else if (view.started_ms) |s| {
+            const now = b.opts.now_ms orelse break :blk null;
+            if (now < s) break :blk null;
+            break :blk try std.fmt.allocPrint(b.arena, "Took {s}", .{formatDuration(&buf, @intCast(now - s))});
+        }
+        break :blk null;
+    };
+    if (timer_text) |timer| {
         try b.blank();
-        try b.text(FG_MUTED, try std.fmt.allocPrint(b.arena, "Took {s}", .{formatDuration(&buf, ms)}));
+        try b.text(FG_MUTED, timer);
     }
 }
 
@@ -1268,6 +1293,56 @@ test "bash pending card shows live output (partialResult)" {
     const bare = try render(alloc, .{ .name = "bash", .args = "{}", .pending = true }, .{ .width = 40 });
     defer alloc.free(bare);
     try t.expect(std.mem.indexOf(u8, bare, "beta") == null);
+}
+
+test "bash pending card shows a live Elapsed timer row" {
+    const alloc = std.testing.allocator;
+    // pending + started_ms + now_ms: `Elapsed` with now - started.
+    const live = try render(alloc, .{
+        .name = "bash",
+        .args = "{\"command\":\"sleep 5\"}",
+        .pending = true,
+        .started_ms = 1_000_000,
+    }, .{ .width = 40, .now_ms = 1_000_000 + 4_200 });
+    defer alloc.free(live);
+    try t.expect(std.mem.indexOf(u8, live, "Elapsed 4.2s") != null);
+    try t.expect(std.mem.indexOf(u8, live, "Took") == null);
+
+    // no now_ms: no timer row at all (the renderer has no clock).
+    const no_clock = try render(alloc, .{
+        .name = "bash",
+        .args = "{}",
+        .pending = true,
+        .started_ms = 1_000_000,
+    }, .{ .width = 40 });
+    defer alloc.free(no_clock);
+    try t.expect(std.mem.indexOf(u8, no_clock, "Elapsed") == null);
+}
+
+test "bash final card shows the recorded Took duration" {
+    const alloc = std.testing.allocator;
+    // A recorded duration wins over the renderer clock (pi: monotonic,
+    // survives reloads).
+    const done = try render(alloc, .{
+        .name = "bash",
+        .args = "{\"command\":\"echo hi\"}",
+        .result = "hi",
+        .duration_ms = 1_500,
+        .started_ms = 1_000_000,
+    }, .{ .width = 40, .now_ms = 1_000_000 + 9_999 });
+    defer alloc.free(done);
+    try t.expect(std.mem.indexOf(u8, done, "Took 1.5s") != null);
+    try t.expect(std.mem.indexOf(u8, done, "Elapsed") == null);
+
+    // No recorded duration: fall back to the renderer clock.
+    const no_dur = try render(alloc, .{
+        .name = "bash",
+        .args = "{}",
+        .result = "ok",
+        .started_ms = 1_000_000,
+    }, .{ .width = 40, .now_ms = 1_000_000 + 61_000 });
+    defer alloc.free(no_dur);
+    try t.expect(std.mem.indexOf(u8, no_dur, "Took 1m 1s") != null);
 }
 
 test "every box row spans the full width" {

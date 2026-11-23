@@ -419,6 +419,9 @@ pub const TUI = struct {
         is_error: bool = false,
         pending: bool = true,
         duration_ms: ?u64 = null,
+        /// TUI-clock timestamp when the call started (pi startToolTimer);
+        /// drives the live `Elapsed` row while pending.
+        started_ms: ?i64 = null,
         /// Index into `scrollback` of this call's block; null until rendered.
         block_idx: ?usize = null,
         /// Per-block expansion override (clicking the block toggles it);
@@ -475,6 +478,7 @@ pub const TUI = struct {
                 .is_error = self.is_error,
                 .pending = self.pending,
                 .duration_ms = self.duration_ms,
+                .started_ms = self.started_ms,
             };
         }
     };
@@ -868,6 +872,10 @@ pub const TUI = struct {
     /// Plain atomic is fine — a torn first reply only risks one extra
     /// (harmless, bounded) wait at exit.
     cpr_ever: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Last wall-ms the pending-tool `Elapsed` row was redrawn (pi: a 1s
+    /// setInterval invalidates the row; here the main-loop tick plays the
+    /// timer's role).
+    last_tool_timer_ms: i64 = 0,
     /// Main-loop wheel frame pacing (same idea as the watcher's throttle):
     /// a frame per wheel event costs one terminal round trip per line, which
     /// over a slow pipe makes fast pulls freeze, then burst.
@@ -8336,6 +8344,7 @@ pub const TUI = struct {
             .id = start.id,
             .name = start.name,
             .args = start.arguments,
+            .started_ms = ss.nowMs(self.io),
         };
         self.tool_calls.append(self.session.alloc, entry) catch {
             // Ownership came with the event; give it back on failure.
@@ -9668,6 +9677,13 @@ pub const TUI = struct {
 
     /// (Re-)render tool call `i` into its scrollback slot.
     fn renderToolBlockAt(self: *TUI, i: usize) void {
+        self.render_mutex.lock(self.io) catch return;
+        defer self.render_mutex.unlock(self.io);
+        self.renderToolBlockAtLocked(i);
+    }
+
+    /// renderToolBlockAt with the caller holding render_mutex.
+    fn renderToolBlockAtLocked(self: *TUI, i: usize) void {
         const e = &self.tool_calls.items[i];
         var block = tool_block.render(self.alloc, e.view(), .{
             .width = self.width,
@@ -9675,6 +9691,7 @@ pub const TUI = struct {
             .home = self.home_dir,
             .cwd = self.cwd_abs,
             .hyperlinks = self.image_caps.hyperlinks,
+            .now_ms = ss.nowMs(self.io),
         }) catch return;
         // A read-of-image result appends its image (an encoded line + spacer
         // rows) or a one-line fallback indicator below the tool text.
@@ -9683,11 +9700,6 @@ pub const TUI = struct {
             self.alloc.free(block);
             block = wi;
         }
-        self.render_mutex.lock(self.io) catch {
-            self.alloc.free(block);
-            return;
-        };
-        defer self.render_mutex.unlock(self.io);
         const src: BlockSrc = .{ .tool = i };
         if (e.block_idx) |idx| {
             const old = self.scrollback.items[idx];
@@ -9707,6 +9719,7 @@ pub const TUI = struct {
         }
         self.transcript_gen += 1;
     }
+
 
     /// Append a tool entry's image rows to a rendered block (pi Image
     /// component: the encoded line occupies `image_rows` visual rows, so it is
@@ -9764,6 +9777,7 @@ pub const TUI = struct {
                         .home = self.home_dir,
                         .cwd = self.cwd_abs,
                         .hyperlinks = self.image_caps.hyperlinks,
+                        .now_ms = ss.nowMs(self.io),
                     }) catch break :blk null;
                     if (self.blockWithImage(rendered, e) catch null) |wi| {
                         self.alloc.free(rendered);
@@ -10968,12 +10982,34 @@ pub const TUI = struct {
                 // pending work draws nothing: unconditional redraws here used
                 // to chatter the pipe byte-silently-but-constantly.
                 self.render_mutex.lock(self.io) catch continue;
-                const scrollbar_ticked = self.sv.tick(ss.nowMs(self.io));
+                const now_ms = ss.nowMs(self.io);
+                const scrollbar_ticked = self.sv.tick(now_ms);
                 const had_flash = self.flash_msg != null;
-                self.tickFlashLocked(ss.nowMs(self.io));
+                self.tickFlashLocked(now_ms);
                 const drag_ticked = self.drag_frame_pending;
                 self.drag_frame_pending = false;
-                const need = drag_ticked or self.wheel_frame_pending or scrollbar_ticked or
+                // Pending shell calls show a live `Elapsed X.Xs` row (pi
+                // toolTimerText's 1s interval). Redraw at most once a second
+                // when one exists; otherwise a tick with no work draws
+                // nothing (unconditional redraws here used to chatter the
+                // pipe byte-silently-but-constantly).
+                const tool_timer_ticked = blk: {
+                    var any = false;
+                    for (self.tool_calls.items) |e| {
+                        if (e.pending and (std.mem.eql(u8, e.name, "bash") or std.mem.eql(u8, e.name, "powershell"))) {
+                            any = true;
+                            break;
+                        }
+                    }
+                    if (!any) break :blk false;
+                    if (now_ms < self.last_tool_timer_ms or now_ms - self.last_tool_timer_ms < 1000) break :blk false;
+                    self.last_tool_timer_ms = now_ms;
+                    for (self.tool_calls.items, 0..) |e, i| {
+                        if (e.pending) self.renderToolBlockAtLocked(i);
+                    }
+                    break :blk true;
+                };
+                const need = drag_ticked or self.wheel_frame_pending or scrollbar_ticked or tool_timer_ticked or
                     (had_flash and self.flash_msg == null);
                 self.wheel_frame_pending = false;
                 if (need) self.redrawLocked();
