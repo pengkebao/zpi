@@ -664,6 +664,17 @@ pub fn isDeviceAttributesReply(seq: []const u8) bool {
     return true;
 }
 
+/// Is this a protocol reply the terminal emits in response to OUR query —
+/// a cursor-position report (DSR `ESC[6n` → `ESC[<row>;<col>R`), the Kitty
+/// flags reply, or a device-attributes reply? These are not user input and
+/// must be dropped by EVERY stdin reader (the main key reader AND the turn
+/// watcher): a CPR that slips through the watcher's dispatch lands in the
+/// replay-capture buffer and reappears in the editor as literal text
+/// ("[47;1R") when the turn ends.
+pub fn isNegotiationReply(seq: []const u8) bool {
+    return parseCpr(seq) != null or parseKittyFlagsReply(seq) != null or isDeviceAttributesReply(seq);
+}
+
 /// Cursor-position report (CPR): the reply to a DSR `ESC [ 6 n` query —
 /// `ESC [ <row> ; <col> R`, both 1-based. Requires params (a bare `ESC [ R`
 /// or `ESC [ 1 ; 2 R`-style modified function key is not a CPR — those stay
@@ -939,6 +950,24 @@ pub const KeyReader = struct {
 
 fn expectKey(actual: ?Key, expected: Key) !void {
     try std.testing.expectEqual(expected, actual.?);
+}
+
+test "isNegotiationReply: only our query replies, never user keys" {
+    // DSR cursor reports (the "[47;1R" leak source).
+    try std.testing.expect(isNegotiationReply("\x1b[47;1R"));
+    try std.testing.expect(isNegotiationReply("\x1b[24;80R"));
+    // Kitty flags + DA1 replies.
+    try std.testing.expect(isNegotiationReply("\x1b[?1u"));
+    try std.testing.expect(isNegotiationReply("\x1b[?62;c"));
+    // NOT replies: bare CSI R (F3 on some terminals), a mouse event, a
+    // kitty key, plain text, and the DSR query itself (outbound, but must
+    // not be misread as an inbound reply either).
+    try std.testing.expect(!isNegotiationReply("\x1b[R"));
+    try std.testing.expect(!isNegotiationReply("\x1b[<0;10;5M"));
+    try std.testing.expect(!isNegotiationReply("\x1b[13;2u"));
+    try std.testing.expect(!isNegotiationReply("[47;1R"));
+    try std.testing.expect(!isNegotiationReply("\x1b[6n"));
+    try std.testing.expect(!isNegotiationReply("a"));
 }
 
 test "parseKey single byte" {

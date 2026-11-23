@@ -4183,6 +4183,13 @@ pub const TUI = struct {
                 const len = keys.seqLenAt(pend[pos..pend_len]) orelse break; // incomplete tail
                 const seq = pend[pos .. pos + len];
                 pos += len;
+                // Protocol replies to OUR queries (DSR cursor report, Kitty
+                // flags, DA) are not user input — drop them. A CPR that
+                // slipped past the main loop (the watcher owns stdin while a
+                // turn runs) would otherwise be captured for replay and
+                // reappear in the editor as literal "[47;1R" when the turn
+                // ends.
+                if (keys.isNegotiationReply(seq)) continue;
                 if (seq.len == 1 and seq[0] == 0x1b) {
                     // pi onEscape while streaming: restoreQueuedMessagesTo
                     // Editor({abort:true}) — every queued message (steering
